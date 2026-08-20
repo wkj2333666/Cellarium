@@ -584,6 +584,7 @@ fn initial_density(spec: &SimulationSpec) -> f64 {
     match spec.rule {
         crate::sim::rule::Rule::Conway => 0.35,
         crate::sim::rule::Rule::Lenia { .. } => 0.25,
+        crate::sim::rule::Rule::Program(_) => 0.25,
     }
 }
 
@@ -651,6 +652,7 @@ pub fn rule_name(spec: &SimulationSpec) -> &'static str {
     match spec.rule {
         crate::sim::rule::Rule::Conway => "Conway",
         crate::sim::rule::Rule::Lenia { .. } => "Lenia/Orbium",
+        crate::sim::rule::Rule::Program(_) => "Custom program",
     }
 }
 

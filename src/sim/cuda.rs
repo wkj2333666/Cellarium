@@ -7,10 +7,13 @@ use cudarc::driver::{
 };
 use cudarc::nvrtc::{CompileError, Ptx, compile_ptx};
 
-use crate::sim::cuda_codegen::{CodegenError, generate_cuda_source};
+use crate::sim::cuda_codegen::{
+    CodegenError, generate_cuda_source, generate_program_cuda_source, program_kernel_data,
+};
 use crate::sim::expression::{KernelExpression, KernelExpressionError};
+use crate::sim::program::InputSource;
 use crate::sim::rule::{Rule, SimulationSpec};
-use crate::sim::world::World;
+use crate::sim::world::{ChannelWorld, World};
 
 #[derive(Debug, thiserror::Error)]
 pub enum BackendError {
@@ -28,16 +31,29 @@ pub enum BackendError {
     InvalidWorld,
 }
 
+struct ProgramCudaBuffers {
+    masks: CudaSlice<i32>,
+    offsets: CudaSlice<i32>,
+    widths: CudaSlice<i32>,
+    heights: CudaSlice<i32>,
+    anchor_x: CudaSlice<i32>,
+    anchor_y: CudaSlice<i32>,
+    channels: CudaSlice<i32>,
+    parameters: Vec<f32>,
+}
+
 pub struct CudaBackend {
     spec: SimulationSpec,
     stream: Arc<CudaStream>,
     function: CudaFunction,
     kernel: CudaSlice<f32>,
     kernel_mask: CudaSlice<i32>,
+    program: Option<ProgramCudaBuffers>,
     current: CudaSlice<f32>,
     next: CudaSlice<f32>,
     width: usize,
     height: usize,
+    channel_count: usize,
     tick: u64,
     device_name: String,
 }
@@ -99,13 +115,36 @@ fn load_cached_module(
 
 impl CudaBackend {
     pub fn new(spec: SimulationSpec, width: usize, height: usize) -> Result<Self, BackendError> {
+        Self::new_with_channels(spec, width, height, 1)
+    }
+
+    pub fn new_with_channels(
+        spec: SimulationSpec,
+        width: usize,
+        height: usize,
+        channel_count: usize,
+    ) -> Result<Self, BackendError> {
         if width == 0
             || height == 0
+            || channel_count == 0
             || width > i32::MAX as usize
             || height > i32::MAX as usize
             || width
                 .checked_mul(height)
+                .and_then(|cells| cells.checked_mul(channel_count))
                 .is_none_or(|cells| cells > u32::MAX as usize)
+        {
+            return Err(BackendError::InvalidWorld);
+        }
+        if channel_count != 1 && !matches!(spec.rule, Rule::Program(_)) {
+            return Err(BackendError::InvalidWorld);
+        }
+        if let Rule::Program(program) = &spec.rule
+            && program.inputs.iter().any(|input| match input.source {
+                InputSource::ChannelState { channel }
+                | InputSource::ChannelConvolution { channel, .. } => channel >= channel_count,
+                InputSource::State | InputSource::Convolution { .. } => false,
+            })
         {
             return Err(BackendError::InvalidWorld);
         }
@@ -113,17 +152,30 @@ impl CudaBackend {
         let context = shared_context()?;
         let stream = context.default_stream();
         let device_name = context.name()?;
-        let fallback_growth = KernelExpression::Constant(0.0);
-        let growth = spec.growth_expression().unwrap_or(&fallback_growth);
-        let generated = generate_cuda_source(growth)?;
+        let program_data = match &spec.rule {
+            Rule::Program(program) => Some(program_kernel_data(program)?),
+            Rule::Conway | Rule::Lenia { .. } => None,
+        };
+        let generated = match &spec.rule {
+            Rule::Program(program) => generate_program_cuda_source(program)?,
+            Rule::Conway | Rule::Lenia { .. } => {
+                let fallback_growth = KernelExpression::Constant(0.0);
+                let growth = spec.growth_expression().unwrap_or(&fallback_growth);
+                generate_cuda_source(growth)?
+            }
+        };
         let module = load_cached_module(&context, &generated.source)?;
         let function = module.load_function(generated.entry_point)?;
-        let kernel_values = if spec.kernel.values.is_empty() {
+        let kernel_values = if let Some(data) = &program_data {
+            data.values.clone()
+        } else if spec.kernel.values.is_empty() {
             vec![0.0]
         } else {
             spec.kernel.values.clone()
         };
-        let mask_values = if spec
+        let mask_values = if let Some(data) = &program_data {
+            data.masks.clone()
+        } else if spec
             .kernel
             .mask
             .as_ref()
@@ -140,7 +192,24 @@ impl CudaBackend {
         };
         let kernel = stream.clone_htod(&kernel_values)?;
         let kernel_mask = stream.clone_htod(&mask_values)?;
-        let cells = width * height;
+        let program = if let Some(data) = program_data {
+            Some(ProgramCudaBuffers {
+                masks: stream.clone_htod(&data.masks)?,
+                offsets: stream.clone_htod(&data.offsets)?,
+                widths: stream.clone_htod(&data.widths)?,
+                heights: stream.clone_htod(&data.heights)?,
+                anchor_x: stream.clone_htod(&data.anchor_x)?,
+                anchor_y: stream.clone_htod(&data.anchor_y)?,
+                channels: stream.clone_htod(&data.channels)?,
+                parameters: match &spec.rule {
+                    Rule::Program(program) => program.parameters.values().copied().collect(),
+                    Rule::Conway | Rule::Lenia { .. } => Vec::new(),
+                },
+            })
+        } else {
+            None
+        };
+        let cells = width * height * channel_count;
         let current = stream.alloc_zeros::<f32>(cells)?;
         let next = stream.alloc_zeros::<f32>(cells)?;
 
@@ -150,10 +219,12 @@ impl CudaBackend {
             function,
             kernel,
             kernel_mask,
+            program,
             current,
             next,
             width,
             height,
+            channel_count,
             tick: 0,
             device_name,
         })
@@ -169,45 +240,119 @@ impl CudaBackend {
 
     pub fn step(&mut self, world: &mut World) -> Result<(), BackendError> {
         assert_eq!(
+            self.channel_count, 1,
+            "scalar worlds require one CUDA channel"
+        );
+        assert_eq!(
             (world.width(), world.height()),
             (self.width, self.height),
             "CUDA buffers and world must have the same shape"
         );
         self.stream.memcpy_htod(world.cells(), &mut self.current)?;
-        let (mode, mu, sigma) = match self.spec.rule {
-            Rule::Conway => (0_i32, 0.0_f32, 1.0_f32),
-            Rule::Lenia { mu, sigma } => (1_i32, mu, sigma),
-        };
-        let kernel_width = self.spec.kernel.width as i32;
-        let kernel_height = self.spec.kernel.height as i32;
-        let kernel_anchor_x = self.spec.kernel.anchor_x as i32;
-        let kernel_anchor_y = self.spec.kernel.anchor_y as i32;
         let width = self.width as i32;
         let height = self.height as i32;
         let cell_count = self.width * self.height;
 
-        unsafe {
-            self.stream
-                .launch_builder(&self.function)
-                .arg(&mut self.next)
-                .arg(&self.current)
-                .arg(&self.kernel)
-                .arg(&width)
-                .arg(&height)
-                .arg(&kernel_width)
-                .arg(&kernel_height)
-                .arg(&kernel_anchor_x)
-                .arg(&kernel_anchor_y)
-                .arg(&self.kernel_mask)
-                .arg(&mode)
-                .arg(&self.spec.dt)
-                .arg(&mu)
-                .arg(&sigma)
-                .launch(LaunchConfig::for_num_elems(cell_count as u32))
-        }?;
+        match &self.spec.rule {
+            Rule::Program(_) => {
+                let program = self
+                    .program
+                    .as_ref()
+                    .expect("program buffers are initialized");
+                let mut launch = self.stream.launch_builder(&self.function);
+                launch
+                    .arg(&mut self.next)
+                    .arg(&self.current)
+                    .arg(&self.kernel)
+                    .arg(&program.masks)
+                    .arg(&program.offsets)
+                    .arg(&program.widths)
+                    .arg(&program.heights)
+                    .arg(&program.anchor_x)
+                    .arg(&program.anchor_y)
+                    .arg(&program.channels)
+                    .arg(&width)
+                    .arg(&height)
+                    .arg(&self.spec.dt);
+                for parameter in &program.parameters {
+                    launch.arg(parameter);
+                }
+                unsafe { launch.launch(LaunchConfig::for_num_elems(cell_count as u32)) }?;
+            }
+            Rule::Conway | Rule::Lenia { .. } => {
+                let (mode, mu, sigma) = match &self.spec.rule {
+                    Rule::Conway => (0_i32, 0.0_f32, 1.0_f32),
+                    Rule::Lenia { mu, sigma } => (1_i32, *mu, *sigma),
+                    Rule::Program(_) => unreachable!(),
+                };
+                let kernel_width = self.spec.kernel.width as i32;
+                let kernel_height = self.spec.kernel.height as i32;
+                let kernel_anchor_x = self.spec.kernel.anchor_x as i32;
+                let kernel_anchor_y = self.spec.kernel.anchor_y as i32;
+                unsafe {
+                    self.stream
+                        .launch_builder(&self.function)
+                        .arg(&mut self.next)
+                        .arg(&self.current)
+                        .arg(&self.kernel)
+                        .arg(&width)
+                        .arg(&height)
+                        .arg(&kernel_width)
+                        .arg(&kernel_height)
+                        .arg(&kernel_anchor_x)
+                        .arg(&kernel_anchor_y)
+                        .arg(&self.kernel_mask)
+                        .arg(&mode)
+                        .arg(&self.spec.dt)
+                        .arg(&mu)
+                        .arg(&sigma)
+                        .launch(LaunchConfig::for_num_elems(cell_count as u32))
+                }?;
+            }
+        }
         let updated = self.stream.clone_dtoh(&self.next)?;
         self.stream.synchronize()?;
         world.replace_cells(&updated);
+        std::mem::swap(&mut self.current, &mut self.next);
+        self.tick += 1;
+        Ok(())
+    }
+    pub fn step_channels(&mut self, world: &mut ChannelWorld) -> Result<(), BackendError> {
+        assert_eq!(self.channel_count, world.channels());
+        assert_eq!((world.width(), world.height()), (self.width, self.height));
+        if !matches!(self.spec.rule, Rule::Program(_)) {
+            return Err(BackendError::InvalidWorld);
+        }
+        let program = self
+            .program
+            .as_ref()
+            .expect("program buffers are initialized");
+        self.stream.memcpy_htod(world.cells(), &mut self.current)?;
+        let width = self.width as i32;
+        let height = self.height as i32;
+        let cell_count = self.width * self.height;
+        let mut launch = self.stream.launch_builder(&self.function);
+        launch
+            .arg(&mut self.next)
+            .arg(&self.current)
+            .arg(&self.kernel)
+            .arg(&program.masks)
+            .arg(&program.offsets)
+            .arg(&program.widths)
+            .arg(&program.heights)
+            .arg(&program.anchor_x)
+            .arg(&program.anchor_y)
+            .arg(&program.channels)
+            .arg(&width)
+            .arg(&height)
+            .arg(&self.spec.dt);
+        for parameter in &program.parameters {
+            launch.arg(parameter);
+        }
+        unsafe { launch.launch(LaunchConfig::for_num_elems(cell_count as u32)) }?;
+        let updated = self.stream.clone_dtoh(&self.next)?;
+        self.stream.synchronize()?;
+        world.replace_channel(0, &updated[..cell_count]);
         std::mem::swap(&mut self.current, &mut self.next);
         self.tick += 1;
         Ok(())
@@ -219,6 +364,8 @@ mod tests {
     use super::*;
     use crate::sim::cpu::CpuBackend;
     use crate::sim::kernel::{KernelDefinition, KernelValues, Normalization};
+    use crate::sim::parser::parse_expression;
+    use crate::sim::program::{RuleInput, RuleProgram};
     use crate::sim::rule::SimulationSpec;
     use crate::sim::world::World;
     use std::collections::BTreeMap;
@@ -233,6 +380,59 @@ mod tests {
             dt: 0.1,
             growth: SimulationSpec::lenia_orbium().growth,
         }
+    }
+
+    fn program_spec() -> SimulationSpec {
+        let identity = KernelDefinition {
+            name: "identity".to_string(),
+            width: 1,
+            height: 1,
+            anchor_x: 0,
+            anchor_y: 0,
+            mask: None,
+            normalization: Normalization::None,
+            parameters: BTreeMap::new(),
+            values: KernelValues::Explicit(vec![1.0]),
+        }
+        .build()
+        .unwrap();
+        let program = RuleProgram::new(
+            vec![
+                RuleInput::state("self"),
+                RuleInput::convolution("food", identity),
+            ],
+            BTreeMap::from([("gain".to_string(), 0.5)]),
+            parse_expression("(self + food) * gain").unwrap(),
+        )
+        .unwrap();
+        SimulationSpec::custom_program(program, 0.1)
+    }
+
+    fn channel_program_spec() -> SimulationSpec {
+        let identity = KernelDefinition {
+            name: "identity".to_string(),
+            width: 1,
+            height: 1,
+            anchor_x: 0,
+            anchor_y: 0,
+            mask: None,
+            normalization: Normalization::None,
+            parameters: BTreeMap::new(),
+            values: KernelValues::Explicit(vec![1.0]),
+        }
+        .build()
+        .unwrap();
+        let program = RuleProgram::new(
+            vec![
+                RuleInput::state("self"),
+                RuleInput::channel_state("signal", 1),
+                RuleInput::channel_convolution("neighbor", 1, identity),
+            ],
+            BTreeMap::from([("gain".to_string(), 0.25)]),
+            parse_expression("(self + signal + neighbor) * gain").unwrap(),
+        )
+        .unwrap();
+        SimulationSpec::custom_program(program, 0.1)
     }
 
     fn centered_square_kernel() -> KernelDefinition {
@@ -341,6 +541,44 @@ mod tests {
             .unwrap();
 
         identical_step_matches_cpu(spec, 19, 13);
+    }
+
+    #[test]
+    fn multi_input_program_step_matches_cpu_backend() {
+        if !cuda_available() {
+            return;
+        }
+        identical_step_matches_cpu(program_spec(), 19, 13);
+    }
+
+    #[test]
+    fn cross_channel_program_step_matches_cpu_backend() {
+        if !cuda_available() {
+            return;
+        }
+        let spec = channel_program_spec();
+        let mut cpu_world = ChannelWorld::new(19, 13, 2);
+        let mut gpu_world = ChannelWorld::new(19, 13, 2);
+        for y in 0..13 {
+            for x in 0..19 {
+                let value = ((x + 3 * y) % 11) as f32 / 10.0;
+                cpu_world.set(0, x, y, value);
+                cpu_world.set(1, x, y, 1.0 - value);
+                gpu_world.set(0, x, y, value);
+                gpu_world.set(1, x, y, 1.0 - value);
+            }
+        }
+        let mut cpu = CpuBackend::new(spec.clone());
+        let mut gpu = CudaBackend::new_with_channels(spec, 19, 13, 2).unwrap();
+        cpu.step_channels(&mut cpu_world).unwrap();
+        gpu.step_channels(&mut gpu_world).unwrap();
+        for (cpu_value, gpu_value) in cpu_world
+            .channel_cells(0)
+            .iter()
+            .zip(gpu_world.channel_cells(0))
+        {
+            assert!((cpu_value - gpu_value).abs() <= 1e-5);
+        }
     }
 
     #[test]

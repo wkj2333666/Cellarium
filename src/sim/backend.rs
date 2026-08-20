@@ -10,13 +10,13 @@ pub enum BackendKind {
 }
 
 pub enum SimulationBackend {
-    Cpu(CpuBackend),
+    Cpu(Box<CpuBackend>),
     Cuda(Box<CudaBackend>),
 }
 
 impl SimulationBackend {
     pub fn cpu(spec: SimulationSpec) -> Self {
-        Self::Cpu(CpuBackend::new(spec))
+        Self::Cpu(Box::new(CpuBackend::new(spec)))
     }
 
     pub fn cuda_or_cpu(spec: SimulationSpec, width: usize, height: usize) -> Self {
@@ -120,7 +120,7 @@ mod tests {
         selected_world.set(2, 2, 1.0);
         selected_world.set(2, 3, 1.0);
 
-        let mut cpu = SimulationBackend::Cpu(CpuBackend::new(SimulationSpec::conway()));
+        let mut cpu = SimulationBackend::Cpu(Box::new(CpuBackend::new(SimulationSpec::conway())));
         let mut selected = SimulationBackend::cuda_or_cpu(SimulationSpec::conway(), 5, 5);
         cpu.step(&mut cpu_world).unwrap();
         selected.step(&mut selected_world).unwrap();

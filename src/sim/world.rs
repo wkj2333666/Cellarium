@@ -7,6 +7,92 @@ pub struct World {
     next: Vec<f32>,
 }
 
+pub struct ChannelWorld {
+    width: usize,
+    height: usize,
+    channels: usize,
+    current: Vec<f32>,
+    next: Vec<f32>,
+}
+
+impl ChannelWorld {
+    pub fn new(width: usize, height: usize, channels: usize) -> Self {
+        assert!(
+            width > 0 && height > 0 && channels > 0,
+            "world dimensions must be positive"
+        );
+        let len = width * height * channels;
+        Self {
+            width,
+            height,
+            channels,
+            current: vec![0.0; len],
+            next: vec![0.0; len],
+        }
+    }
+
+    pub fn width(&self) -> usize {
+        self.width
+    }
+    pub fn height(&self) -> usize {
+        self.height
+    }
+    pub fn channels(&self) -> usize {
+        self.channels
+    }
+
+    pub fn get(&self, channel: usize, x: isize, y: isize) -> f32 {
+        self.current[self.index(channel, x, y)]
+    }
+
+    pub fn set(&mut self, channel: usize, x: isize, y: isize, value: f32) {
+        let index = self.index(channel, x, y);
+        self.current[index] = value;
+        self.next[index] = 0.0;
+    }
+
+    pub fn set_next(&mut self, channel: usize, x: isize, y: isize, value: f32) {
+        let index = self.index(channel, x, y);
+        self.next[index] = value;
+    }
+
+    pub fn swap_buffers(&mut self) {
+        std::mem::swap(&mut self.current, &mut self.next);
+    }
+
+    pub fn channel_cells(&self, channel: usize) -> &[f32] {
+        let range = self.channel_range(channel);
+        &self.current[range]
+    }
+
+    pub fn replace_channel(&mut self, channel: usize, values: &[f32]) {
+        assert_eq!(values.len(), self.width * self.height);
+        let range = self.channel_range(channel);
+        self.current[range.clone()].copy_from_slice(values);
+        self.next[range].fill(0.0);
+    }
+
+    pub(crate) fn cells(&self) -> &[f32] {
+        &self.current
+    }
+
+    fn index(&self, channel: usize, x: isize, y: isize) -> usize {
+        assert!(channel < self.channels, "channel index is out of range");
+        let width = self.width as isize;
+        let height = self.height as isize;
+        let wrapped_x = ((x % width) + width) % width;
+        let wrapped_y = ((y % height) + height) % height;
+        channel * self.width * self.height + (wrapped_y * width + wrapped_x) as usize
+    }
+
+    fn channel_range(&self, channel: usize) -> std::ops::Range<usize> {
+        assert!(channel < self.channels, "channel index is out of range");
+        let start = channel * self.width * self.height;
+        start..start + self.width * self.height
+    }
+}
+
+// Multi-channel simulation state lives alongside the legacy scalar world.
 impl World {
     pub fn new(width: usize, height: usize) -> Self {
         assert!(width > 0 && height > 0, "world dimensions must be positive");
@@ -118,5 +204,18 @@ mod tests {
         world.randomize(9, 1.0);
         world.clear();
         assert!(world.cells().iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn channel_world_keeps_independent_periodic_buffers() {
+        let mut world = ChannelWorld::new(3, 2, 2);
+        world.set(1, -1, 2, 0.75);
+        assert_eq!(world.get(1, 2, 0), 0.75);
+        assert_eq!(world.get(0, 2, 0), 0.0);
+        world.set_next(0, 0, 0, 0.4);
+        world.set_next(1, -1, 2, 0.75);
+        world.swap_buffers();
+        assert_eq!(world.get(0, 0, 0), 0.4);
+        assert_eq!(world.get(1, 2, 0), 0.75);
     }
 }

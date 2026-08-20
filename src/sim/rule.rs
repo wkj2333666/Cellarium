@@ -3,6 +3,7 @@ use std::collections::BTreeSet;
 use crate::sim::expression::KernelExpression;
 use crate::sim::kernel::{KernelDefinition, KernelValues, Normalization, ring_definition};
 use crate::sim::parser::{ParseError, parse_and_validate};
+use crate::sim::program::{RuleProgram, RuleProgramError};
 
 pub use crate::sim::kernel::Kernel;
 
@@ -10,6 +11,7 @@ pub use crate::sim::kernel::Kernel;
 pub enum Rule {
     Conway,
     Lenia { mu: f32, sigma: f32 },
+    Program(RuleProgram),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -60,6 +62,19 @@ impl SimulationSpec {
         self.growth = Some(parse_and_validate(source, &growth_symbols())?);
         Ok(())
     }
+
+    pub fn custom_program(program: RuleProgram, dt: f32) -> Self {
+        let kernel = program
+            .primary_kernel()
+            .cloned()
+            .unwrap_or_else(empty_kernel);
+        Self {
+            rule: Rule::Program(program),
+            kernel,
+            dt,
+            growth: None,
+        }
+    }
 }
 
 fn growth_symbols() -> BTreeSet<String> {
@@ -83,6 +98,8 @@ pub enum RuleConfigError {
     GrowthUnsupported,
     #[error(transparent)]
     Parse(#[from] ParseError),
+    #[error(transparent)]
+    Program(#[from] RuleProgramError),
 }
 
 fn empty_kernel() -> Kernel {

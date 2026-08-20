@@ -1,8 +1,9 @@
 use std::collections::BTreeMap;
 
 use crate::sim::expression::{ExpressionContext, KernelExpressionError, evaluate};
+use crate::sim::program::RuleProgram;
 use crate::sim::rule::{Rule, SimulationSpec};
-use crate::sim::world::World;
+use crate::sim::world::{ChannelWorld, World};
 
 pub struct CpuBackend {
     spec: SimulationSpec,
@@ -23,11 +24,69 @@ impl CpuBackend {
     }
 
     pub fn step(&mut self, world: &mut World) -> Result<(), KernelExpressionError> {
-        match self.spec.rule {
+        match &self.spec.rule {
             Rule::Conway => self.step_conway(world),
-            Rule::Lenia { mu, sigma } => self.step_lenia(world, mu, sigma)?,
+            Rule::Lenia { mu, sigma } => self.step_lenia(world, *mu, *sigma)?,
+            Rule::Program(program) => self.step_program(world, program)?,
         }
         self.tick += 1;
+        Ok(())
+    }
+
+    pub fn step_channels(&mut self, world: &mut ChannelWorld) -> Result<(), KernelExpressionError> {
+        let Rule::Program(program) = &self.spec.rule else {
+            return Err(KernelExpressionError::NonFinite);
+        };
+        let mut values = BTreeMap::new();
+        for y in 0..world.height() as isize {
+            for x in 0..world.width() as isize {
+                program.populate_channel_inputs(world, x, y, &mut values);
+                let update = evaluate(
+                    &program.update,
+                    &ExpressionContext {
+                        x: 0.0,
+                        y: 0.0,
+                        radius: 0.0,
+                        distance: 0.0,
+                        parameters: &values,
+                    },
+                )?;
+                let current = world.get(0, x, y);
+                world.set_next(0, x, y, (current + self.spec.dt * update).clamp(0.0, 1.0));
+            }
+        }
+        world.swap_buffers();
+        self.tick += 1;
+        Ok(())
+    }
+
+    fn step_program(
+        &self,
+        world: &mut World,
+        program: &RuleProgram,
+    ) -> Result<(), KernelExpressionError> {
+        let mut values = BTreeMap::new();
+        for y in 0..world.height() as isize {
+            for x in 0..world.width() as isize {
+                program.populate_inputs(world, x, y, &mut values);
+                let update = evaluate(
+                    &program.update,
+                    &ExpressionContext {
+                        x: 0.0,
+                        y: 0.0,
+                        radius: 0.0,
+                        distance: 0.0,
+                        parameters: &values,
+                    },
+                )?;
+                world.set_next(
+                    x,
+                    y,
+                    (world.get(x, y) + self.spec.dt * update).clamp(0.0, 1.0),
+                );
+            }
+        }
+        world.swap_buffers();
         Ok(())
     }
 
