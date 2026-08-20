@@ -6,6 +6,7 @@ pub mod experiment;
 pub mod expression;
 pub mod kernel;
 pub mod kernel_file;
+pub mod lattice_file;
 pub mod parser;
 pub mod program;
 pub mod program_file;

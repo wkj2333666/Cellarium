@@ -106,7 +106,26 @@ pub enum ExperimentError {
     Encode(String),
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct CompatibilityReport {
+    pub supported: bool,
+    pub issues: Vec<String>,
+}
+
 impl ExperimentFile {
+    pub fn compatibility(&self) -> CompatibilityReport {
+        match self.validate() {
+            Ok(()) => CompatibilityReport {
+                supported: true,
+                issues: Vec::new(),
+            },
+            Err(error) => CompatibilityReport {
+                supported: false,
+                issues: vec![error.to_string()],
+            },
+        }
+    }
+
     pub fn from_parts(
         metadata: ExperimentMetadata,
         spec: SimulationSpec,
@@ -401,5 +420,22 @@ mod tests {
         assert_eq!(loaded.format_version, EXPERIMENT_FORMAT_VERSION);
         assert_eq!(loaded.metadata, ExperimentMetadata::default());
         assert!(matches!(loaded.rule, ExperimentRule::Conway));
+    }
+
+    #[test]
+    fn compatibility_report_explains_unsupported_experiment_versions() {
+        let mut file = ExperimentFile::from_parts(
+            ExperimentMetadata::default(),
+            SimulationSpec::conway(),
+            &World::new(1, 1),
+            1,
+        )
+        .unwrap();
+        assert!(file.compatibility().supported);
+
+        file.format_version = 9;
+        let report = file.compatibility();
+        assert!(!report.supported);
+        assert!(report.issues.iter().any(|issue| issue.contains("version")));
     }
 }

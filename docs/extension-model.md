@@ -18,6 +18,10 @@ The compatibility rules are deliberately conservative:
 4. Backend selection remains an implementation detail. The same experiment can
    be rebuilt on CPU or CUDA without changing its serialized rule.
 
+Callers that need to inspect an asset without constructing it can use the
+`CompatibilityReport` API. It returns a supported flag plus human-readable
+issues, which is suitable for a preset browser or import preview.
+
 The `ExperimentMetadata` fields (`name`, `description`, `author`, and `tags`)
 are descriptive and safe to preserve across migrations. External tools should
 write RON using the public data types and should not depend on private backend
