@@ -8,4 +8,5 @@ pub mod kernel_file;
 pub mod parser;
 pub mod program;
 pub mod rule;
+pub mod topology;
 pub mod world;
