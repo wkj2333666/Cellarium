@@ -1,4 +1,8 @@
+use std::collections::BTreeSet;
+
+use crate::sim::expression::KernelExpression;
 use crate::sim::kernel::{KernelDefinition, KernelValues, Normalization, ring_definition};
+use crate::sim::parser::{ParseError, parse_and_validate};
 
 pub use crate::sim::kernel::Kernel;
 
@@ -13,6 +17,7 @@ pub struct SimulationSpec {
     pub rule: Rule,
     pub kernel: Kernel,
     pub dt: f32,
+    pub(crate) growth: Option<KernelExpression>,
 }
 
 impl SimulationSpec {
@@ -21,6 +26,7 @@ impl SimulationSpec {
             rule: Rule::Conway,
             kernel: empty_kernel(),
             dt: 1.0,
+            growth: None,
         }
     }
 
@@ -34,8 +40,49 @@ impl SimulationSpec {
                 .build()
                 .expect("the built-in ring kernel is valid"),
             dt: 0.1,
+            growth: Some(default_growth_expression()),
         }
     }
+
+    pub fn growth_expression(&self) -> Option<&KernelExpression> {
+        self.growth.as_ref()
+    }
+
+    pub fn with_growth_expression(mut self, source: &str) -> Result<Self, RuleConfigError> {
+        self.set_growth_expression(source)?;
+        Ok(self)
+    }
+
+    pub fn set_growth_expression(&mut self, source: &str) -> Result<(), RuleConfigError> {
+        if !matches!(self.rule, Rule::Lenia { .. }) {
+            return Err(RuleConfigError::GrowthUnsupported);
+        }
+        self.growth = Some(parse_and_validate(source, &growth_symbols())?);
+        Ok(())
+    }
+}
+
+fn growth_symbols() -> BTreeSet<String> {
+    ["mu", "potential", "sigma"]
+        .into_iter()
+        .map(str::to_string)
+        .collect()
+}
+
+fn default_growth_expression() -> KernelExpression {
+    parse_and_validate(
+        "2 * exp(-((potential - mu) / sigma) ^ 2) - 1",
+        &growth_symbols(),
+    )
+    .expect("the built-in growth expression is valid")
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum RuleConfigError {
+    #[error("growth expressions are only supported by continuous rules")]
+    GrowthUnsupported,
+    #[error(transparent)]
+    Parse(#[from] ParseError),
 }
 
 fn empty_kernel() -> Kernel {
@@ -89,5 +136,22 @@ mod tests {
             }
         );
         assert_eq!(spec.dt, 0.1);
+    }
+
+    #[test]
+    fn growth_expression_can_be_replaced_without_rebuilding_the_program() {
+        let spec = SimulationSpec::lenia_orbium()
+            .with_growth_expression("clamp(potential - mu, -1, 1) / sigma")
+            .unwrap();
+
+        assert_eq!(
+            crate::sim::parser::format_expression(spec.growth_expression().unwrap()),
+            "clamp(potential - mu, -1, 1) / sigma"
+        );
+        assert!(
+            SimulationSpec::lenia_orbium()
+                .with_growth_expression("unknown + potential")
+                .is_err()
+        );
     }
 }

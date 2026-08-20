@@ -183,6 +183,36 @@ impl App {
         }
     }
 
+    pub fn set_growth_expression(&mut self, source: &str) -> bool {
+        let mut candidate = self.spec.clone();
+        if let Err(error) = candidate.set_growth_expression(source) {
+            self.kernel_error = None;
+            self.backend_error = Some(error.to_string());
+            return false;
+        }
+
+        let result = SimulationBackend::strict_for_kind(
+            self.backend.kind(),
+            candidate.clone(),
+            self.world.width(),
+            self.world.height(),
+        );
+        match result {
+            Ok(backend) => {
+                self.spec = candidate;
+                self.backend = backend;
+                self.backend_error = None;
+                self.kernel_error = None;
+                true
+            }
+            Err(error) => {
+                self.kernel_error = None;
+                self.backend_error = Some(error.to_string());
+                false
+            }
+        }
+    }
+
     pub fn handle_command(&mut self, command: Command) {
         match command {
             Command::TogglePause => self.paused = !self.paused,
@@ -929,6 +959,29 @@ mod tests {
         assert!(!app.backend_name().is_empty());
         app.handle_command(Command::Step);
         assert_eq!(app.tick(), 1);
+    }
+
+    #[test]
+    fn growth_expression_edits_rebuild_the_backend_transactionally() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 4, 3);
+        app.world_mut().replace_cells(&[0.2; 12]);
+
+        assert!(app.set_growth_expression("0.5"));
+        assert!(app.step());
+        assert!(
+            app.world()
+                .cells()
+                .iter()
+                .all(|value| (*value - 0.25).abs() < 1e-6)
+        );
+        let before = app.world().cells().to_vec();
+        let tick = app.tick();
+
+        assert!(!app.set_growth_expression("unknown + potential"));
+
+        assert_eq!(app.world().cells(), before);
+        assert_eq!(app.tick(), tick);
+        assert!(app.backend_error().is_some());
     }
 
     #[test]

@@ -1,6 +1,7 @@
 pub mod backend;
 pub mod cpu;
 pub mod cuda;
+pub mod cuda_codegen;
 pub mod expression;
 pub mod kernel;
 pub mod kernel_file;

@@ -1,3 +1,6 @@
+use std::collections::BTreeMap;
+
+use crate::sim::expression::{ExpressionContext, KernelExpressionError, evaluate};
 use crate::sim::rule::{Rule, SimulationSpec};
 use crate::sim::world::World;
 
@@ -19,12 +22,13 @@ impl CpuBackend {
         self.tick
     }
 
-    pub fn step(&mut self, world: &mut World) {
+    pub fn step(&mut self, world: &mut World) -> Result<(), KernelExpressionError> {
         match self.spec.rule {
             Rule::Conway => self.step_conway(world),
-            Rule::Lenia { mu, sigma } => self.step_lenia(world, mu, sigma),
+            Rule::Lenia { mu, sigma } => self.step_lenia(world, mu, sigma)?,
         }
         self.tick += 1;
+        Ok(())
     }
 
     fn step_conway(&self, world: &mut World) {
@@ -47,7 +51,21 @@ impl CpuBackend {
         world.swap_buffers();
     }
 
-    fn step_lenia(&self, world: &mut World, mu: f32, sigma: f32) {
+    fn step_lenia(
+        &self,
+        world: &mut World,
+        mu: f32,
+        sigma: f32,
+    ) -> Result<(), KernelExpressionError> {
+        let growth_expression = self
+            .spec
+            .growth_expression()
+            .expect("continuous rules always have a validated growth expression");
+        let mut parameters = BTreeMap::from([
+            ("mu".to_string(), mu),
+            ("potential".to_string(), 0.0),
+            ("sigma".to_string(), sigma),
+        ]);
         for y in 0..world.height() as isize {
             for x in 0..world.width() as isize {
                 let mut potential = 0.0;
@@ -68,13 +86,25 @@ impl CpuBackend {
                         }
                     }
                 }
-                let ratio = (potential - mu) / sigma;
-                let growth = 2.0 * (-(ratio * ratio)).exp() - 1.0;
+                *parameters
+                    .get_mut("potential")
+                    .expect("the potential input was initialized") = potential;
+                let growth = evaluate(
+                    growth_expression,
+                    &ExpressionContext {
+                        x: 0.0,
+                        y: 0.0,
+                        radius: 0.0,
+                        distance: 0.0,
+                        parameters: &parameters,
+                    },
+                )?;
                 let next = (world.get(x, y) + self.spec.dt * growth).clamp(0.0, 1.0);
                 world.set_next(x, y, next);
             }
         }
         world.swap_buffers();
+        Ok(())
     }
 }
 
@@ -93,6 +123,7 @@ mod tests {
             },
             kernel: definition.build().expect("test kernel is valid"),
             dt: 0.1,
+            growth: SimulationSpec::lenia_orbium().growth,
         }
     }
 
@@ -167,13 +198,13 @@ mod tests {
         world.set(2, 3, 1.0);
         let mut backend = CpuBackend::new(SimulationSpec::conway());
 
-        backend.step(&mut world);
+        backend.step(&mut world).unwrap();
         assert_eq!(world.get(1, 2), 1.0);
         assert_eq!(world.get(2, 2), 1.0);
         assert_eq!(world.get(3, 2), 1.0);
         assert_eq!(backend.tick(), 1);
 
-        backend.step(&mut world);
+        backend.step(&mut world).unwrap();
         assert_eq!(world.get(2, 1), 1.0);
         assert_eq!(world.get(2, 2), 1.0);
         assert_eq!(world.get(2, 3), 1.0);
@@ -186,7 +217,7 @@ mod tests {
         world.set(2, 3, 1.0);
         world.set(4, 3, 1.0);
         let mut backend = CpuBackend::new(SimulationSpec::conway());
-        backend.step(&mut world);
+        backend.step(&mut world).unwrap();
 
         assert_eq!(world.get(3, 3), 1.0);
         assert_eq!(world.get(3, 4), 1.0);
@@ -199,7 +230,7 @@ mod tests {
         world.randomize(123, 0.25);
         let mut backend = CpuBackend::new(SimulationSpec::lenia_orbium());
 
-        backend.step(&mut world);
+        backend.step(&mut world).unwrap();
         assert_eq!(backend.tick(), 1);
         assert!(
             world
@@ -208,6 +239,42 @@ mod tests {
                 .all(|value| (0.0..=1.0).contains(value))
         );
         assert!(world.cells().iter().any(|value| *value > 0.0));
+    }
+
+    #[test]
+    fn edited_growth_expression_is_evaluated_by_the_cpu_backend() {
+        let spec = SimulationSpec::lenia_orbium()
+            .with_growth_expression("0.5")
+            .unwrap();
+        let mut world = World::new(3, 2);
+        world.replace_cells(&[0.2; 6]);
+        let mut backend = CpuBackend::new(spec);
+
+        backend.step(&mut world).unwrap();
+
+        assert!(
+            world
+                .cells()
+                .iter()
+                .all(|value| (*value - 0.25).abs() < 1e-6)
+        );
+        assert_eq!(backend.tick(), 1);
+    }
+
+    #[test]
+    fn invalid_runtime_growth_does_not_commit_the_step() {
+        let spec = SimulationSpec::lenia_orbium()
+            .with_growth_expression("1 / (potential - potential)")
+            .unwrap();
+        let mut world = World::new(3, 2);
+        world.replace_cells(&[0.2; 6]);
+        let before = world.cells().to_vec();
+        let mut backend = CpuBackend::new(spec);
+
+        assert!(backend.step(&mut world).is_err());
+
+        assert_eq!(world.cells(), before);
+        assert_eq!(backend.tick(), 0);
     }
 
     #[test]
@@ -223,7 +290,7 @@ mod tests {
         world.set(2, 1, 1.0);
         let mut backend = CpuBackend::new(kernel_spec(centered_square_kernel()));
 
-        backend.step(&mut world);
+        backend.step(&mut world).unwrap();
 
         assert_close(world.get(2, 1), 1.0);
         assert_close(world.get(1, 1), 0.071_929_2);
@@ -239,7 +306,7 @@ mod tests {
         world.set(2, 1, 1.0);
         let mut backend = CpuBackend::new(kernel_spec(non_square_kernel()));
 
-        backend.step(&mut world);
+        backend.step(&mut world).unwrap();
 
         assert_close(world.get(2, 1), 1.0);
         assert_close(world.get(0, 1), 0.065_759_8);
@@ -255,7 +322,7 @@ mod tests {
         world.set(2, 1, 1.0);
         let mut backend = CpuBackend::new(kernel_spec(asymmetric_masked_kernel()));
 
-        backend.step(&mut world);
+        backend.step(&mut world).unwrap();
 
         assert_close(world.get(3, 1), 0.076_049_7);
         assert_close(world.get(2, 1), 1.0);
@@ -270,7 +337,7 @@ mod tests {
         world.set(2, 1, 1.0);
         let mut backend = CpuBackend::new(kernel_spec(unnormalized_kernel()));
 
-        backend.step(&mut world);
+        backend.step(&mut world).unwrap();
 
         assert_close(world.get(1, 1), 0.0);
         assert_close(world.get(2, 1), 0.921_079_9);

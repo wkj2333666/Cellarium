@@ -1,10 +1,14 @@
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaSlice, CudaStream, DriverError, LaunchConfig, PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError, LaunchConfig,
+    PushKernelArg,
 };
-use cudarc::nvrtc::{CompileError, compile_ptx};
+use cudarc::nvrtc::{CompileError, Ptx, compile_ptx};
 
+use crate::sim::cuda_codegen::{CodegenError, generate_cuda_source};
+use crate::sim::expression::{KernelExpression, KernelExpressionError};
 use crate::sim::rule::{Rule, SimulationSpec};
 use crate::sim::world::World;
 
@@ -14,6 +18,12 @@ pub enum BackendError {
     Driver(#[from] DriverError),
     #[error("CUDA compilation error: {0}")]
     Compile(#[from] CompileError),
+    #[error("rule evaluation error: {0}")]
+    RuleEvaluation(#[from] KernelExpressionError),
+    #[error("CUDA code generation error: {0}")]
+    Codegen(#[from] CodegenError),
+    #[error("the runtime compilation cache is unavailable")]
+    CompilationCachePoisoned,
     #[error("world dimensions must fit a CUDA launch")]
     InvalidWorld,
 }
@@ -32,67 +42,60 @@ pub struct CudaBackend {
     device_name: String,
 }
 
-const CUDA_SOURCE: &str = r#"
-extern "C" __device__ int cellarium_wrap(int value, int size) {
-    int wrapped = value % size;
-    return wrapped < 0 ? wrapped + size : wrapped;
+static PTX_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
+static MODULE_CACHE: OnceLock<Mutex<HashMap<String, Arc<CudaModule>>>> = OnceLock::new();
+static CUDA_CONTEXT: OnceLock<Arc<CudaContext>> = OnceLock::new();
+const MAX_RUNTIME_CACHE_ENTRIES: usize = 32;
+
+fn shared_context() -> Result<Arc<CudaContext>, BackendError> {
+    if let Some(context) = CUDA_CONTEXT.get() {
+        return Ok(context.clone());
+    }
+    let context = CudaContext::new(0)?;
+    let _ = CUDA_CONTEXT.set(context.clone());
+    Ok(CUDA_CONTEXT.get().cloned().unwrap_or(context))
 }
 
-extern "C" __global__ void cellarium_step(
-    float* next,
-    const float* current,
-    const float* kernel,
-    int width,
-    int height,
-    int kernel_width,
-    int kernel_height,
-    int kernel_anchor_x,
-    int kernel_anchor_y,
-    const int* kernel_mask,
-    int mode,
-    float dt,
-    float mu,
-    float sigma
-) {
-    int linear = blockIdx.x * blockDim.x + threadIdx.x;
-    int cell_count = width * height;
-    if (linear >= cell_count) return;
-
-    int x = linear % width;
-    int y = linear / width;
-    if (mode == 0) {
-        int neighbors = 0;
-        for (int dy = -1; dy <= 1; ++dy) {
-            for (int dx = -1; dx <= 1; ++dx) {
-                if (dx == 0 && dy == 0) continue;
-                int nx = cellarium_wrap(x + dx, width);
-                int ny = cellarium_wrap(y + dy, height);
-                neighbors += current[ny * width + nx] > 0.5f ? 1 : 0;
-            }
-        }
-        float self_state = current[linear];
-        bool alive = self_state > 0.5f;
-        bool survives = alive && (neighbors == 2 || neighbors == 3);
-        bool born = !alive && neighbors == 3;
-        next[linear] = (survives || born) ? 1.0f : 0.0f;
-    } else {
-        float potential = 0.0f;
-        for (int ky = 0; ky < kernel_height; ++ky) {
-            for (int kx = 0; kx < kernel_width; ++kx) {
-                int kernel_index = ky * kernel_width + kx;
-                if (kernel_mask[kernel_index] == 0) continue;
-                int nx = cellarium_wrap(x + kx - kernel_anchor_x, width);
-                int ny = cellarium_wrap(y + ky - kernel_anchor_y, height);
-                potential += kernel[kernel_index] * current[ny * width + nx];
-            }
-        }
-        float ratio = (potential - mu) / sigma;
-        float growth = 2.0f * expf(-(ratio * ratio)) - 1.0f;
-        float updated = current[linear] + dt * growth;
-        next[linear] = fminf(1.0f, fmaxf(0.0f, updated));
+fn evict_if_full<T>(cache: &mut HashMap<String, T>) {
+    if cache.len() >= MAX_RUNTIME_CACHE_ENTRIES
+        && let Some(key) = cache.keys().next().cloned()
+    {
+        cache.remove(&key);
     }
 }
-"#;
+
+fn compile_cached(source: &str) -> Result<Ptx, BackendError> {
+    let cache = PTX_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| BackendError::CompilationCachePoisoned)?;
+    if let Some(ptx) = cache.get(source) {
+        return Ok(Ptx::from_src(ptx.clone()));
+    }
+
+    let ptx = compile_ptx(source)?;
+    evict_if_full(&mut cache);
+    cache.insert(source.to_string(), ptx.to_src());
+    Ok(ptx)
+}
+
+fn load_cached_module(
+    context: &Arc<CudaContext>,
+    source: &str,
+) -> Result<Arc<CudaModule>, BackendError> {
+    let cache = MODULE_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut cache = cache
+        .lock()
+        .map_err(|_| BackendError::CompilationCachePoisoned)?;
+    if let Some(module) = cache.get(source) {
+        return Ok(module.clone());
+    }
+
+    let module = context.load_module(compile_cached(source)?)?;
+    evict_if_full(&mut cache);
+    cache.insert(source.to_string(), module.clone());
+    Ok(module)
+}
 
 impl CudaBackend {
     pub fn new(spec: SimulationSpec, width: usize, height: usize) -> Result<Self, BackendError> {
@@ -107,12 +110,14 @@ impl CudaBackend {
             return Err(BackendError::InvalidWorld);
         }
 
-        let context = CudaContext::new(0)?;
+        let context = shared_context()?;
         let stream = context.default_stream();
         let device_name = context.name()?;
-        let ptx = compile_ptx(CUDA_SOURCE)?;
-        let module = context.load_module(ptx)?;
-        let function = module.load_function("cellarium_step")?;
+        let fallback_growth = KernelExpression::Constant(0.0);
+        let growth = spec.growth_expression().unwrap_or(&fallback_growth);
+        let generated = generate_cuda_source(growth)?;
+        let module = load_cached_module(&context, &generated.source)?;
+        let function = module.load_function(generated.entry_point)?;
         let kernel_values = if spec.kernel.values.is_empty() {
             vec![0.0]
         } else {
@@ -226,6 +231,7 @@ mod tests {
             },
             kernel: definition.build().expect("test kernel is valid"),
             dt: 0.1,
+            growth: SimulationSpec::lenia_orbium().growth,
         }
     }
 
@@ -297,7 +303,7 @@ mod tests {
 
         let mut cpu = CpuBackend::new(spec.clone());
         let mut gpu = CudaBackend::new(spec, width, height).expect("CUDA device is available");
-        cpu.step(&mut cpu_world);
+        cpu.step(&mut cpu_world).unwrap();
         gpu.step(&mut gpu_world).unwrap();
 
         for (cpu_value, gpu_value) in cpu_world.cells().iter().zip(gpu_world.cells()) {
@@ -323,6 +329,83 @@ mod tests {
             return;
         }
         identical_step_matches_cpu(SimulationSpec::lenia_orbium(), 32, 24);
+    }
+
+    #[test]
+    fn edited_growth_expression_is_jit_compiled_and_matches_cpu_backend() {
+        if !cuda_available() {
+            return;
+        }
+        let spec = SimulationSpec::lenia_orbium()
+            .with_growth_expression("clamp((potential - mu) / sigma, -0.25, 0.25)")
+            .unwrap();
+
+        identical_step_matches_cpu(spec, 19, 13);
+    }
+
+    #[test]
+    fn runtime_compilation_cache_reuses_the_same_generated_source() {
+        if compile_ptx("extern \"C\" __global__ void probe() {}").is_err() {
+            return;
+        }
+        let generated = generate_cuda_source(&KernelExpression::Constant(0.123_456_7)).unwrap();
+        PTX_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .remove(&generated.source);
+
+        let first = compile_cached(&generated.source).unwrap().to_src();
+        assert!(
+            PTX_CACHE
+                .get()
+                .unwrap()
+                .lock()
+                .unwrap()
+                .contains_key(&generated.source)
+        );
+        let second = compile_cached(&generated.source).unwrap().to_src();
+
+        assert_eq!(first, second);
+    }
+
+    #[test]
+    fn runtime_module_cache_reuses_the_loaded_driver_module() {
+        let Ok(context) = shared_context() else {
+            return;
+        };
+        let generated = generate_cuda_source(&KernelExpression::Constant(0.234_567_8)).unwrap();
+        MODULE_CACHE
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap()
+            .remove(&generated.source);
+
+        let first = load_cached_module(&context, &generated.source).unwrap();
+        let second = load_cached_module(&context, &generated.source).unwrap();
+
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn nvrtc_errors_retain_the_user_expression_source_mapping() {
+        if compile_ptx("extern \"C\" __global__ void probe() {}").is_err() {
+            return;
+        }
+        let generated = generate_cuda_source(&KernelExpression::Constant(0.0)).unwrap();
+        let invalid = generated
+            .source
+            .replace("return 0.0f;", "return invalid @ token;");
+
+        let error = compile_cached(&invalid).unwrap_err();
+        let BackendError::Compile(CompileError::CompileError { log, .. }) = error else {
+            panic!("expected an NVRTC compiler diagnostic");
+        };
+
+        assert!(
+            log.to_string_lossy()
+                .contains("cellarium-growth-expression")
+        );
     }
 
     #[test]

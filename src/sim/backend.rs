@@ -64,7 +64,7 @@ impl SimulationBackend {
     pub fn step(&mut self, world: &mut World) -> Result<(), BackendError> {
         match self {
             Self::Cpu(backend) => {
-                backend.step(world);
+                backend.step(world)?;
                 Ok(())
             }
             Self::Cuda(backend) => backend.step(world),
