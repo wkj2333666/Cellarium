@@ -35,16 +35,15 @@ pub fn parse_and_validate(
 ) -> Result<KernelExpression, ParseError> {
     let (expression, parameter_positions) = Parser::new(source).parse_with_positions()?;
     if let Err(error) = validate_symbols(&expression, parameters) {
-        if let ParseError::UnknownParameter { name, .. } = &error {
-            if let Some((_, position)) = parameter_positions
+        if let ParseError::UnknownParameter { name, .. } = &error
+            && let Some((_, position)) = parameter_positions
                 .iter()
                 .find(|(candidate, _)| candidate == name)
-            {
-                return Err(ParseError::UnknownParameter {
-                    position: *position,
-                    name: name.clone(),
-                });
-            }
+        {
+            return Err(ParseError::UnknownParameter {
+                position: *position,
+                name: name.clone(),
+            });
         }
         return Err(error);
     }
@@ -87,10 +86,9 @@ pub fn fold_constants(expression: KernelExpression) -> KernelExpression {
             let lhs = fold_constants(*lhs);
             let rhs = fold_constants(*rhs);
             if let (KernelExpression::Constant(lhs), KernelExpression::Constant(rhs)) = (&lhs, &rhs)
+                && let Some(value) = fold_binary(op, *lhs, *rhs)
             {
-                if let Some(value) = fold_binary(op, *lhs, *rhs) {
-                    return KernelExpression::Constant(value);
-                }
+                return KernelExpression::Constant(value);
             }
             KernelExpression::Binary {
                 op,
@@ -662,11 +660,7 @@ fn format_binary_child(expression: &KernelExpression, parent: BinaryOp, rhs: boo
     };
     let needs_parentheses = child_precedence < parent_precedence
         || (child_precedence == parent_precedence
-            && if parent == BinaryOp::Power {
-                !rhs && !matches!(expression, KernelExpression::Unary { .. })
-            } else {
-                rhs
-            });
+            && if parent == BinaryOp::Power { !rhs } else { rhs });
     if needs_parentheses {
         format!("({formatted})")
     } else {
@@ -918,6 +912,10 @@ mod tests {
             "1 + 2 * (x - 3)"
         );
         assert_eq!(format_expression(&parse("2 ^ 3 ^ 2")), "2 ^ 3 ^ 2");
+        let negative_base = parse("(-2) ^ 2");
+        let formatted_negative_base = format_expression(&negative_base);
+        assert_eq!(formatted_negative_base, "(-2) ^ 2");
+        assert_eq!(parse(&formatted_negative_base), negative_base);
         assert_eq!(format_expression(&parse("-(x + 1)")), "-(x + 1)");
         assert_eq!(
             format_expression(&parse("clamp(abs(x), 0, 1)")),

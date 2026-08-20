@@ -108,10 +108,10 @@ impl TryFrom<KernelDefinition> for Kernel {
         }
 
         let cell_count = definition.width * definition.height;
-        if let Some(mask) = &definition.mask {
-            if mask.len() != cell_count {
-                return Err(KernelError::InvalidMaskLength);
-            }
+        if let Some(mask) = &definition.mask
+            && mask.len() != cell_count
+        {
+            return Err(KernelError::InvalidMaskLength);
         }
         if definition
             .parameters
@@ -128,10 +128,11 @@ impl TryFrom<KernelDefinition> for Kernel {
                 if explicit.len() != cell_count {
                     return Err(KernelError::InvalidValuesLength);
                 }
-                for index in 0..cell_count {
+                for (index, (value, explicit_value)) in values.iter_mut().zip(explicit).enumerate()
+                {
                     if included(index) {
-                        if explicit[index].is_finite() {
-                            values[index] = explicit[index];
+                        if explicit_value.is_finite() {
+                            *value = *explicit_value;
                         } else {
                             return Err(KernelError::NonFiniteValue);
                         }
@@ -139,7 +140,7 @@ impl TryFrom<KernelDefinition> for Kernel {
                 }
             }
             KernelValues::Expression(expression) => {
-                for index in 0..cell_count {
+                for (index, value) in values.iter_mut().enumerate() {
                     if !included(index) {
                         continue;
                     }
@@ -160,7 +161,7 @@ impl TryFrom<KernelDefinition> for Kernel {
                         distance: geometry.distance,
                         parameters: &definition.parameters,
                     };
-                    values[index] = evaluate(expression, &context)?;
+                    *value = evaluate(expression, &context)?;
                 }
             }
         }

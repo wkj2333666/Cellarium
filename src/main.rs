@@ -60,19 +60,18 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let mut args = args.into_iter();
-    while let Some(argument) = args.next() {
-        if argument != "--kernel" {
-            return Err("unexpected argument");
-        }
-
-        let path = args.next().ok_or("--kernel requires a path")?;
-        if args.next().is_some() {
-            return Err("unexpected argument");
-        }
-        return Ok(Some(PathBuf::from(path)));
+    let Some(argument) = args.next() else {
+        return Ok(None);
+    };
+    if argument != "--kernel" {
+        return Err("unexpected argument");
     }
 
-    Ok(None)
+    let path = args.next().ok_or("--kernel requires a path")?;
+    if args.next().is_some() {
+        return Err("unexpected argument");
+    }
+    Ok(Some(PathBuf::from(path)))
 }
 
 #[cfg(test)]
