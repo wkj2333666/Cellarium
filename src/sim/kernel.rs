@@ -3,7 +3,6 @@ use crate::sim::expression::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::ops::Deref;
 
 const MAX_KERNEL_AXIS: usize = 129;
 const MIN_NORMALIZATION_SUM: f32 = 1e-12;
@@ -50,7 +49,6 @@ pub struct Kernel {
     pub normalization: Normalization,
     pub parameters: BTreeMap<String, f32>,
     pub values: Vec<f32>,
-    legacy_shape: LegacyKernelShape,
 }
 
 impl Kernel {
@@ -62,19 +60,6 @@ impl Kernel {
             self.anchor_x,
             self.anchor_y,
         )
-    }
-}
-
-#[derive(Clone, Copy, Debug, PartialEq)]
-pub struct LegacyKernelShape {
-    pub(crate) radius: usize,
-}
-
-impl Deref for Kernel {
-    type Target = LegacyKernelShape;
-
-    fn deref(&self) -> &Self::Target {
-        &self.legacy_shape
     }
 }
 
@@ -193,16 +178,6 @@ impl TryFrom<KernelDefinition> for Kernel {
             }
         }
 
-        let legacy_shape = LegacyKernelShape {
-            radius: included_radius(
-                definition.mask.as_deref(),
-                definition.width,
-                definition.height,
-                definition.anchor_x,
-                definition.anchor_y,
-            ),
-        };
-
         Ok(Self {
             name: definition.name,
             width: definition.width,
@@ -213,7 +188,6 @@ impl TryFrom<KernelDefinition> for Kernel {
             normalization: definition.normalization,
             parameters: definition.parameters,
             values,
-            legacy_shape,
         })
     }
 }

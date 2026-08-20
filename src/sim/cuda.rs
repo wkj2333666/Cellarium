@@ -23,6 +23,7 @@ pub struct CudaBackend {
     stream: Arc<CudaStream>,
     function: CudaFunction,
     kernel: CudaSlice<f32>,
+    kernel_mask: CudaSlice<i32>,
     current: CudaSlice<f32>,
     next: CudaSlice<f32>,
     width: usize,
@@ -43,7 +44,11 @@ extern "C" __global__ void cellarium_step(
     const float* kernel,
     int width,
     int height,
-    int radius,
+    int kernel_width,
+    int kernel_height,
+    int kernel_anchor_x,
+    int kernel_anchor_y,
+    const int* kernel_mask,
     int mode,
     float dt,
     float mu,
@@ -72,12 +77,12 @@ extern "C" __global__ void cellarium_step(
         next[linear] = (survives || born) ? 1.0f : 0.0f;
     } else {
         float potential = 0.0f;
-        int kernel_size = radius * 2 + 1;
-        for (int ky = -radius; ky <= radius; ++ky) {
-            for (int kx = -radius; kx <= radius; ++kx) {
-                int nx = cellarium_wrap(x + kx, width);
-                int ny = cellarium_wrap(y + ky, height);
-                int kernel_index = (ky + radius) * kernel_size + kx + radius;
+        for (int ky = 0; ky < kernel_height; ++ky) {
+            for (int kx = 0; kx < kernel_width; ++kx) {
+                int kernel_index = ky * kernel_width + kx;
+                if (kernel_mask[kernel_index] == 0) continue;
+                int nx = cellarium_wrap(x + kx - kernel_anchor_x, width);
+                int ny = cellarium_wrap(y + ky - kernel_anchor_y, height);
                 potential += kernel[kernel_index] * current[ny * width + nx];
             }
         }
@@ -113,7 +118,23 @@ impl CudaBackend {
         } else {
             spec.kernel.values.clone()
         };
+        let mask_values = if spec
+            .kernel
+            .mask
+            .as_ref()
+            .is_some_and(|mask| !mask.is_empty())
+        {
+            spec.kernel
+                .mask
+                .iter()
+                .flatten()
+                .map(|active| i32::from(*active))
+                .collect()
+        } else {
+            vec![1; spec.kernel.values.len().max(1)]
+        };
         let kernel = stream.clone_htod(&kernel_values)?;
+        let kernel_mask = stream.clone_htod(&mask_values)?;
         let cells = width * height;
         let current = stream.alloc_zeros::<f32>(cells)?;
         let next = stream.alloc_zeros::<f32>(cells)?;
@@ -123,6 +144,7 @@ impl CudaBackend {
             stream,
             function,
             kernel,
+            kernel_mask,
             current,
             next,
             width,
@@ -151,7 +173,10 @@ impl CudaBackend {
             Rule::Conway => (0_i32, 0.0_f32, 1.0_f32),
             Rule::Lenia { mu, sigma } => (1_i32, mu, sigma),
         };
-        let radius = self.spec.kernel.radius as i32;
+        let kernel_width = self.spec.kernel.width as i32;
+        let kernel_height = self.spec.kernel.height as i32;
+        let kernel_anchor_x = self.spec.kernel.anchor_x as i32;
+        let kernel_anchor_y = self.spec.kernel.anchor_y as i32;
         let width = self.width as i32;
         let height = self.height as i32;
         let cell_count = self.width * self.height;
@@ -164,7 +189,11 @@ impl CudaBackend {
                 .arg(&self.kernel)
                 .arg(&width)
                 .arg(&height)
-                .arg(&radius)
+                .arg(&kernel_width)
+                .arg(&kernel_height)
+                .arg(&kernel_anchor_x)
+                .arg(&kernel_anchor_y)
+                .arg(&self.kernel_mask)
                 .arg(&mode)
                 .arg(&self.spec.dt)
                 .arg(&mu)
@@ -184,8 +213,77 @@ impl CudaBackend {
 mod tests {
     use super::*;
     use crate::sim::cpu::CpuBackend;
+    use crate::sim::kernel::{KernelDefinition, KernelValues, Normalization};
     use crate::sim::rule::SimulationSpec;
     use crate::sim::world::World;
+    use std::collections::BTreeMap;
+
+    fn kernel_spec(definition: KernelDefinition) -> SimulationSpec {
+        SimulationSpec {
+            rule: Rule::Lenia {
+                mu: 0.5,
+                sigma: 1.0,
+            },
+            kernel: definition.build().expect("test kernel is valid"),
+            dt: 0.1,
+        }
+    }
+
+    fn centered_square_kernel() -> KernelDefinition {
+        KernelDefinition {
+            name: "centered-square".to_string(),
+            width: 3,
+            height: 3,
+            anchor_x: 1,
+            anchor_y: 1,
+            mask: None,
+            normalization: Normalization::Sum,
+            parameters: BTreeMap::new(),
+            values: KernelValues::Explicit(vec![1.0; 9]),
+        }
+    }
+
+    fn non_square_kernel() -> KernelDefinition {
+        KernelDefinition {
+            name: "non-square".to_string(),
+            width: 5,
+            height: 3,
+            anchor_x: 2,
+            anchor_y: 1,
+            mask: None,
+            normalization: Normalization::Sum,
+            parameters: BTreeMap::new(),
+            values: KernelValues::Explicit(vec![1.0; 15]),
+        }
+    }
+
+    fn asymmetric_masked_kernel() -> KernelDefinition {
+        KernelDefinition {
+            name: "asymmetric-masked".to_string(),
+            width: 3,
+            height: 2,
+            anchor_x: 2,
+            anchor_y: 0,
+            mask: Some(vec![false, true, true, false, true, false]),
+            normalization: Normalization::Sum,
+            parameters: BTreeMap::new(),
+            values: KernelValues::Explicit(vec![0.0, 0.5, 1.0, 0.0, 2.0, 0.0]),
+        }
+    }
+
+    fn unnormalized_kernel() -> KernelDefinition {
+        KernelDefinition {
+            name: "unnormalized".to_string(),
+            width: 3,
+            height: 1,
+            anchor_x: 1,
+            anchor_y: 0,
+            mask: None,
+            normalization: Normalization::None,
+            parameters: BTreeMap::new(),
+            values: KernelValues::Explicit(vec![1.0, 2.0, 3.0]),
+        }
+    }
 
     fn cuda_available() -> bool {
         CudaBackend::new(SimulationSpec::conway(), 1, 1).is_ok()
@@ -225,6 +323,38 @@ mod tests {
             return;
         }
         identical_step_matches_cpu(SimulationSpec::lenia_orbium(), 32, 24);
+    }
+
+    #[test]
+    fn centered_square_step_matches_cpu_backend() {
+        if !cuda_available() {
+            return;
+        }
+        identical_step_matches_cpu(kernel_spec(centered_square_kernel()), 17, 11);
+    }
+
+    #[test]
+    fn non_square_step_matches_cpu_backend() {
+        if !cuda_available() {
+            return;
+        }
+        identical_step_matches_cpu(kernel_spec(non_square_kernel()), 17, 11);
+    }
+
+    #[test]
+    fn asymmetric_masked_step_matches_cpu_backend() {
+        if !cuda_available() {
+            return;
+        }
+        identical_step_matches_cpu(kernel_spec(asymmetric_masked_kernel()), 17, 11);
+    }
+
+    #[test]
+    fn unnormalized_step_matches_cpu_backend() {
+        if !cuda_available() {
+            return;
+        }
+        identical_step_matches_cpu(kernel_spec(unnormalized_kernel()), 17, 11);
     }
 
     #[test]

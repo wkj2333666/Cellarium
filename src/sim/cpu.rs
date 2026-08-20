@@ -48,17 +48,24 @@ impl CpuBackend {
     }
 
     fn step_lenia(&self, world: &mut World, mu: f32, sigma: f32) {
-        let radius = self.spec.kernel.radius as isize;
-
         for y in 0..world.height() as isize {
             for x in 0..world.width() as isize {
                 let mut potential = 0.0;
-                let mut kernel_index = 0;
-                for kernel_y in -radius..=radius {
-                    for kernel_x in -radius..=radius {
-                        potential += self.spec.kernel.values[kernel_index]
-                            * world.get(x + kernel_x, y + kernel_y);
-                        kernel_index += 1;
+                for kernel_y in 0..self.spec.kernel.height {
+                    for kernel_x in 0..self.spec.kernel.width {
+                        let kernel_index = kernel_y * self.spec.kernel.width + kernel_x;
+                        if self
+                            .spec
+                            .kernel
+                            .mask
+                            .as_ref()
+                            .is_none_or(|mask| mask[kernel_index])
+                        {
+                            let offset_x = kernel_x as isize - self.spec.kernel.anchor_x as isize;
+                            let offset_y = kernel_y as isize - self.spec.kernel.anchor_y as isize;
+                            potential += self.spec.kernel.values[kernel_index]
+                                * world.get(x + offset_x, y + offset_y);
+                        }
                     }
                 }
                 let ratio = (potential - mu) / sigma;
@@ -74,7 +81,83 @@ impl CpuBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::kernel::{KernelDefinition, KernelValues, Normalization};
     use crate::sim::world::World;
+    use std::collections::BTreeMap;
+
+    fn kernel_spec(definition: KernelDefinition) -> SimulationSpec {
+        SimulationSpec {
+            rule: Rule::Lenia {
+                mu: 0.5,
+                sigma: 1.0,
+            },
+            kernel: definition.build().expect("test kernel is valid"),
+            dt: 0.1,
+        }
+    }
+
+    fn centered_square_kernel() -> KernelDefinition {
+        KernelDefinition {
+            name: "centered-square".to_string(),
+            width: 3,
+            height: 3,
+            anchor_x: 1,
+            anchor_y: 1,
+            mask: None,
+            normalization: Normalization::Sum,
+            parameters: BTreeMap::new(),
+            values: KernelValues::Explicit(vec![1.0; 9]),
+        }
+    }
+
+    fn non_square_kernel() -> KernelDefinition {
+        KernelDefinition {
+            name: "non-square".to_string(),
+            width: 5,
+            height: 3,
+            anchor_x: 2,
+            anchor_y: 1,
+            mask: None,
+            normalization: Normalization::Sum,
+            parameters: BTreeMap::new(),
+            values: KernelValues::Explicit(vec![1.0; 15]),
+        }
+    }
+
+    fn asymmetric_masked_kernel() -> KernelDefinition {
+        KernelDefinition {
+            name: "asymmetric-masked".to_string(),
+            width: 3,
+            height: 2,
+            anchor_x: 2,
+            anchor_y: 0,
+            mask: Some(vec![false, true, true, false, true, false]),
+            normalization: Normalization::Sum,
+            parameters: BTreeMap::new(),
+            values: KernelValues::Explicit(vec![0.0, 0.5, 1.0, 0.0, 2.0, 0.0]),
+        }
+    }
+
+    fn unnormalized_kernel() -> KernelDefinition {
+        KernelDefinition {
+            name: "unnormalized".to_string(),
+            width: 3,
+            height: 1,
+            anchor_x: 1,
+            anchor_y: 0,
+            mask: None,
+            normalization: Normalization::None,
+            parameters: BTreeMap::new(),
+            values: KernelValues::Explicit(vec![1.0, 2.0, 3.0]),
+        }
+    }
+
+    fn assert_close(actual: f32, expected: f32) {
+        assert!(
+            (actual - expected).abs() <= 1e-6,
+            "actual {actual} differed from expected {expected}"
+        );
+    }
 
     #[test]
     fn conway_blinker_oscillates_and_counts_ticks() {
@@ -132,5 +215,66 @@ mod tests {
         let spec = SimulationSpec::conway();
         let backend = CpuBackend::new(spec.clone());
         assert!(matches!(backend.spec().rule, Rule::Conway));
+    }
+
+    #[test]
+    fn centered_square_kernel_uses_anchor_offsets() {
+        let mut world = World::new(6, 5);
+        world.set(2, 1, 1.0);
+        let mut backend = CpuBackend::new(kernel_spec(centered_square_kernel()));
+
+        backend.step(&mut world);
+
+        assert_close(world.get(2, 1), 1.0);
+        assert_close(world.get(1, 1), 0.071_929_2);
+        assert_close(world.get(3, 1), 0.071_929_2);
+        assert_close(world.get(2, 0), 0.071_929_2);
+        assert_close(world.get(2, 2), 0.071_929_2);
+        assert_close(world.get(0, 0), 0.055_760_2);
+    }
+
+    #[test]
+    fn non_square_kernel_traverses_actual_width_and_height() {
+        let mut world = World::new(7, 5);
+        world.set(2, 1, 1.0);
+        let mut backend = CpuBackend::new(kernel_spec(non_square_kernel()));
+
+        backend.step(&mut world);
+
+        assert_close(world.get(2, 1), 1.0);
+        assert_close(world.get(0, 1), 0.065_759_8);
+        assert_close(world.get(4, 1), 0.065_759_8);
+        assert_close(world.get(2, 0), 0.065_759_8);
+        assert_close(world.get(2, 2), 0.065_759_8);
+        assert_close(world.get(2, 4), 0.055_760_2);
+    }
+
+    #[test]
+    fn asymmetric_masked_kernel_skips_masked_offsets() {
+        let mut world = World::new(6, 4);
+        world.set(2, 1, 1.0);
+        let mut backend = CpuBackend::new(kernel_spec(asymmetric_masked_kernel()));
+
+        backend.step(&mut world);
+
+        assert_close(world.get(3, 1), 0.076_049_7);
+        assert_close(world.get(2, 1), 1.0);
+        assert_close(world.get(3, 0), 0.098_982_2);
+        assert_close(world.get(2, 2), 0.055_760_2);
+        assert_close(world.get(1, 1), 0.055_760_2);
+    }
+
+    #[test]
+    fn unnormalized_kernel_preserves_explicit_values() {
+        let mut world = World::new(6, 4);
+        world.set(2, 1, 1.0);
+        let mut backend = CpuBackend::new(kernel_spec(unnormalized_kernel()));
+
+        backend.step(&mut world);
+
+        assert_close(world.get(1, 1), 0.0);
+        assert_close(world.get(2, 1), 0.921_079_9);
+        assert_close(world.get(3, 1), 0.055_760_2);
+        assert_close(world.get(3, 0), 0.055_760_2);
     }
 }
