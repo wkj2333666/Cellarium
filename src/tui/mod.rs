@@ -48,12 +48,20 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App, display: &ViewportDisplay
 }
 
 pub fn status_text(app: &App, display: &ViewportDisplay) -> String {
+    status_text_with_error(app, display, app.backend_error())
+}
+
+fn status_text_with_error(
+    app: &App,
+    display: &ViewportDisplay,
+    backend_error: Option<&str>,
+) -> String {
     let (simulation_rate, render_rate) = app.rates();
     let world = app.world();
     let inspected = app
         .inspected()
         .map_or("—".to_string(), |value| format!("{value:.3}"));
-    format!(
+    let status = format!(
         "{} · {} · {} · tick {} · {}×{} · zoom {:.1}× · inspect {} · display {} · sim {:.1}/s · render {:.1}/s",
         app.backend_name(),
         crate::app::rule_name(app.spec()),
@@ -66,7 +74,12 @@ pub fn status_text(app: &App, display: &ViewportDisplay) -> String {
         display.protocol().label(),
         simulation_rate,
         render_rate,
-    )
+    );
+    if let Some(error) = backend_error {
+        format!("{status} · error {error}")
+    } else {
+        status
+    }
 }
 
 #[cfg(test)]
@@ -88,5 +101,17 @@ mod tests {
         assert!(status.contains("render 47.0/s"));
         assert!(status.contains("8×8"));
         assert!(status.contains("display half-block fallback"));
+    }
+
+    #[test]
+    fn status_includes_backend_errors() {
+        let app = App::new(SimulationSpec::lenia_orbium(), 8, 8);
+        let status = status_text_with_error(
+            &app,
+            &ViewportDisplay::HalfBlock,
+            Some("CUDA driver error: device reset"),
+        );
+
+        assert!(status.contains("error CUDA driver error: device reset"));
     }
 }

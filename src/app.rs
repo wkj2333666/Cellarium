@@ -62,6 +62,10 @@ impl App {
         self.backend.tick()
     }
 
+    pub fn backend_error(&self) -> Option<&str> {
+        self.backend_error.as_deref()
+    }
+
     pub fn backend_kind(&self) -> BackendKind {
         self.backend.kind()
     }
@@ -104,10 +108,16 @@ impl App {
         self.frame_size = Some(frame_size);
     }
 
-    pub fn step(&mut self) {
+    pub fn step(&mut self) -> bool {
         match self.backend.step(&mut self.world) {
-            Ok(()) => self.backend_error = None,
-            Err(error) => self.backend_error = Some(error.to_string()),
+            Ok(()) => {
+                self.backend_error = None;
+                true
+            }
+            Err(error) => {
+                self.backend_error = Some(error.to_string());
+                false
+            }
         }
     }
 
@@ -175,6 +185,9 @@ impl App {
         let Some(viewport) = self.viewport else {
             return false;
         };
+        if event.column < viewport.x || event.row < viewport.y {
+            return false;
+        }
         let mut local = event;
         local.column = event.column.saturating_sub(viewport.x);
         local.row = event.row.saturating_sub(viewport.y);
@@ -206,7 +219,7 @@ impl App {
                     .zoom_at(screen, frame_size[0], frame_size[1], factor);
             }
             crate::input::MouseAction::Pan { dx, dy } => {
-                self.camera.pan_screen([dx, dy * 2.0]);
+                self.camera.pan_screen([dx * scale[0], dy * scale[1]]);
             }
             crate::input::MouseAction::Inspect => self.inspect_world(world),
             crate::input::MouseAction::Paint => self.paint_world(world, 1.0),
@@ -248,6 +261,7 @@ impl RateMeter {
 
 pub fn run() -> std::io::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
+    let _terminal_guard = TerminalGuard;
     let mut stdout = std::io::stdout();
     crossterm::execute!(
         stdout,
@@ -256,20 +270,26 @@ pub fn run() -> std::io::Result<()> {
     )?;
     crossterm::execute!(stdout, crossterm::cursor::Hide)?;
 
-    let terminal_result = (|| {
+    (|| {
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let mut terminal = ratatui::Terminal::new(backend)?;
         run_loop(&mut terminal)
-    })();
+    })()
+}
 
-    crossterm::execute!(stdout, crossterm::cursor::Show)?;
-    crossterm::execute!(
-        stdout,
-        crossterm::event::DisableMouseCapture,
-        crossterm::terminal::LeaveAlternateScreen
-    )?;
-    crossterm::terminal::disable_raw_mode()?;
-    terminal_result
+struct TerminalGuard;
+
+impl Drop for TerminalGuard {
+    fn drop(&mut self) {
+        let mut stdout = std::io::stdout();
+        let _ = crossterm::execute!(stdout, crossterm::cursor::Show);
+        let _ = crossterm::execute!(
+            stdout,
+            crossterm::event::DisableMouseCapture,
+            crossterm::terminal::LeaveAlternateScreen
+        );
+        let _ = crossterm::terminal::disable_raw_mode();
+    }
 }
 
 fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
@@ -296,10 +316,14 @@ fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
             simulation_backlog += elapsed;
             let mut steps = 0;
             while simulation_backlog >= simulation_interval && steps < 8 {
-                app.step();
-                simulation_meter.record(now);
-                simulation_backlog -= simulation_interval;
-                steps += 1;
+                if app.step() {
+                    simulation_meter.record(now);
+                    simulation_backlog -= simulation_interval;
+                    steps += 1;
+                } else {
+                    simulation_backlog = Duration::ZERO;
+                    break;
+                }
             }
             if simulation_backlog > simulation_interval * 8 {
                 simulation_backlog = simulation_interval * 8;
@@ -360,6 +384,10 @@ pub fn rule_name(spec: &SimulationSpec) -> &'static str {
 mod tests {
     use super::*;
 
+    fn cuda_available() -> bool {
+        crate::sim::cuda::CudaBackend::new(SimulationSpec::conway(), 1, 1).is_ok()
+    }
+
     #[test]
     fn keyboard_commands_control_pause_step_and_world() {
         let mut app = App::new(SimulationSpec::conway(), 8, 8);
@@ -416,12 +444,16 @@ mod tests {
 
     #[test]
     fn app_uses_the_selected_backend_without_exposing_cuda_handles() {
+        if !cuda_available() {
+            return;
+        }
+
         let spec = SimulationSpec::conway();
         let backend = crate::sim::backend::SimulationBackend::cuda_or_cpu(spec.clone(), 8, 8);
         let mut app = App::with_backend(spec, 8, 8, backend);
 
         assert_eq!(app.backend_kind(), crate::sim::backend::BackendKind::Cuda);
-        assert!(app.backend_name().contains("2080"));
+        assert!(!app.backend_name().is_empty());
         app.handle_command(Command::Step);
         assert_eq!(app.tick(), 1);
     }
@@ -466,5 +498,44 @@ mod tests {
 
         assert!(app.handle_mouse(event, &mut tracker));
         assert_eq!(app.inspected(), Some(0.75));
+    }
+
+    #[test]
+    fn mouse_events_outside_the_viewport_are_rejected_before_clamping() {
+        let mut app = App::new(SimulationSpec::conway(), 32, 16);
+        app.set_viewport(ratatui::layout::Rect::new(2, 1, 10, 10), [20, 20]);
+        let mut tracker = crate::input::MouseTracker::new();
+        let event = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 1,
+            row: 0,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        assert!(!app.handle_mouse(event, &mut tracker));
+        assert_eq!(app.inspected(), None);
+    }
+
+    #[test]
+    fn vertical_pan_uses_the_active_display_framebuffer_scale() {
+        let mut app = App::new(SimulationSpec::conway(), 32, 16);
+        app.set_viewport(ratatui::layout::Rect::new(0, 0, 10, 10), [60, 30]);
+        let mut tracker = crate::input::MouseTracker::new();
+        let down = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Middle),
+            column: 4,
+            row: 4,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let drag = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Middle),
+            column: 5,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        app.handle_mouse(down, &mut tracker);
+        assert!(app.handle_mouse(drag, &mut tracker));
+        assert_eq!(app.camera().center(), [10.0, 5.0]);
     }
 }

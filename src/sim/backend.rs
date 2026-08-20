@@ -65,16 +65,30 @@ mod tests {
     use crate::sim::rule::SimulationSpec;
     use crate::sim::world::World;
 
+    fn cuda_available() -> bool {
+        CudaBackend::new(SimulationSpec::conway(), 1, 1).is_ok()
+    }
+
     #[test]
     fn selects_cuda_when_available_and_reports_the_actual_backend() {
+        if !cuda_available() {
+            let backend = SimulationBackend::cuda_or_cpu(SimulationSpec::conway(), 8, 8);
+            assert!(matches!(backend, SimulationBackend::Cpu(_)));
+            return;
+        }
+
         let backend = SimulationBackend::cuda_or_cpu(SimulationSpec::conway(), 8, 8);
         assert!(matches!(backend, SimulationBackend::Cuda(_)));
         assert_eq!(backend.kind(), BackendKind::Cuda);
-        assert!(backend.device_name().contains("2080"));
+        assert!(!backend.device_name().is_empty());
     }
 
     #[test]
     fn delegates_conway_step_to_the_selected_backend() {
+        if !cuda_available() {
+            return;
+        }
+
         let mut cpu_world = World::new(5, 5);
         let mut selected_world = World::new(5, 5);
         cpu_world.set(2, 1, 1.0);

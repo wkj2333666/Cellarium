@@ -28,6 +28,9 @@ pub enum MouseAction {
 }
 
 pub fn translate_key(event: &KeyEvent) -> Option<Command> {
+    if event.kind == crossterm::event::KeyEventKind::Release {
+        return None;
+    }
     if event.modifiers.contains(KeyModifiers::CONTROL) {
         return (event.code == KeyCode::Char('c')).then_some(Command::Quit);
     }
@@ -140,6 +143,14 @@ mod tests {
     fn ctrl_c_also_quits() {
         let event = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(translate_key(&event), Some(Command::Quit));
+    }
+
+    #[test]
+    fn key_releases_are_ignored() {
+        let mut event = key(KeyCode::Char('q'));
+        event.kind = crossterm::event::KeyEventKind::Release;
+
+        assert_eq!(translate_key(&event), None);
     }
 
     #[test]

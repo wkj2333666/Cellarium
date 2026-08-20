@@ -37,13 +37,22 @@ impl ViewportDisplay {
         let term = std::env::var("TERM").unwrap_or_default();
         let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
         let sixel = std::env::var("SIXEL").unwrap_or_default();
-        Self::from_protocol(detect_protocol(&term, &term_program, &sixel))
+        let protocol = detect_protocol(&term, &term_program, &sixel);
+        Self::from_protocol_and_cell_size(protocol, cell_size_from_environment())
     }
 
-    fn from_protocol(protocol: DisplayProtocol) -> Self {
+    pub fn from_protocol_and_cell_size(
+        protocol: DisplayProtocol,
+        cell_size: Option<(u16, u16)>,
+    ) -> Self {
         if protocol == DisplayProtocol::HalfBlock {
             return Self::HalfBlock;
         }
+
+        let Some((width, height)) = cell_size.filter(|(width, height)| *width > 0 && *height > 0)
+        else {
+            return Self::HalfBlock;
+        };
 
         let picker_protocol = match protocol {
             DisplayProtocol::Kitty => ratatui_image::picker::ProtocolType::Kitty,
@@ -51,7 +60,10 @@ impl ViewportDisplay {
             DisplayProtocol::Iterm2 => ratatui_image::picker::ProtocolType::Iterm2,
             DisplayProtocol::HalfBlock => ratatui_image::picker::ProtocolType::Halfblocks,
         };
-        let mut picker = ratatui_image::picker::Picker::halfblocks();
+        #[allow(deprecated)]
+        let mut picker = ratatui_image::picker::Picker::from_fontsize(
+            ratatui_image::FontSize::new(width, height),
+        );
         picker.set_protocol_type(picker_protocol);
         Self::Pixel(picker)
     }
@@ -117,6 +129,28 @@ pub fn detect_protocol(term: &str, term_program: &str, sixel: &str) -> DisplayPr
     } else {
         DisplayProtocol::HalfBlock
     }
+}
+
+fn cell_size_from_environment() -> Option<(u16, u16)> {
+    if let (Some(width), Some(height)) = (
+        env_cell_dimension("CELLARIUM_CELL_WIDTH"),
+        env_cell_dimension("CELLARIUM_CELL_HEIGHT"),
+    ) {
+        return Some((width, height));
+    }
+
+    let size = crossterm::terminal::window_size().ok()?;
+    let width = size.width.checked_div(size.columns)?;
+    let height = size.height.checked_div(size.rows)?;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn env_cell_dimension(name: &str) -> Option<u16> {
+    std::env::var(name)
+        .ok()?
+        .parse::<u16>()
+        .ok()
+        .filter(|value| *value > 0)
 }
 
 pub fn framebuffer_to_dynamic_image(framebuffer: &Framebuffer) -> DynamicImage {
@@ -189,10 +223,26 @@ mod tests {
 
     #[test]
     fn viewport_display_uses_pixel_protocols_without_querying_stdio() {
-        let display = ViewportDisplay::from_protocol(DisplayProtocol::Sixel);
+        let display =
+            ViewportDisplay::from_protocol_and_cell_size(DisplayProtocol::Sixel, Some((10, 20)));
         assert_eq!(display.protocol(), DisplayProtocol::Sixel);
 
-        let display = ViewportDisplay::from_protocol(DisplayProtocol::HalfBlock);
+        let display =
+            ViewportDisplay::from_protocol_and_cell_size(DisplayProtocol::HalfBlock, None);
+        assert_eq!(display.protocol(), DisplayProtocol::HalfBlock);
+    }
+
+    #[test]
+    fn pixel_protocols_require_real_cell_dimensions() {
+        let display =
+            ViewportDisplay::from_protocol_and_cell_size(DisplayProtocol::Kitty, Some((8, 16)));
+        assert_eq!(display.protocol(), DisplayProtocol::Kitty);
+        assert_eq!(
+            display.framebuffer_size(ratatui::layout::Rect::new(0, 0, 10, 5)),
+            (80, 80)
+        );
+
+        let display = ViewportDisplay::from_protocol_and_cell_size(DisplayProtocol::Kitty, None);
         assert_eq!(display.protocol(), DisplayProtocol::HalfBlock);
     }
 
