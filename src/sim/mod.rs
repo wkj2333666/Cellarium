@@ -7,6 +7,7 @@ pub mod kernel;
 pub mod kernel_file;
 pub mod parser;
 pub mod program;
+pub mod program_file;
 pub mod rule;
 pub mod strategy;
 pub mod topology;

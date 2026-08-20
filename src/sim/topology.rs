@@ -1,17 +1,18 @@
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Basis2 {
     pub first: [f32; 2],
     pub second: [f32; 2],
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SiteSpec {
     pub name: String,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct NeighborTemplate {
     pub source_site: usize,
     pub target_site: usize,
@@ -19,26 +20,26 @@ pub struct NeighborTemplate {
     pub weight: f32,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct LatticeSpec {
     pub basis: Basis2,
     pub sites: Vec<SiteSpec>,
     pub neighborhoods: Vec<NeighborTemplate>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum DomainSpec {
     Rect { size: [u32; 2] },
     Mask { size: [u32; 2], active: Vec<bool> },
     Sparse { cells: Vec<[i32; 2]> },
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BoardSpec {
     pub domain: DomainSpec,
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum BoundarySpec {
     Open,
     Constant(f32),

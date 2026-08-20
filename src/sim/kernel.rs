@@ -38,7 +38,7 @@ impl KernelDefinition {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Kernel {
     pub name: String,
     pub width: usize,

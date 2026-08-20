@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 
 use crate::sim::expression::{
@@ -7,7 +8,7 @@ use crate::sim::kernel::Kernel;
 use crate::sim::parser::{ParseError, validate_symbols};
 use crate::sim::world::{ChannelWorld, World};
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum InputSource {
     State,
     ChannelState { channel: usize },
@@ -15,7 +16,7 @@ pub enum InputSource {
     ChannelConvolution { channel: usize, kernel: Kernel },
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RuleInput {
     pub name: String,
     pub source: InputSource,
@@ -51,7 +52,7 @@ impl RuleInput {
     }
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct RuleProgram {
     pub inputs: Vec<RuleInput>,
     pub parameters: BTreeMap<String, f32>,
