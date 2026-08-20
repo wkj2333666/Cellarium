@@ -1,4 +1,6 @@
-use crate::sim::kernel::{Kernel, KernelDefinition};
+use crate::sim::kernel::{
+    Kernel, KernelDefinition, KernelValues, Normalization, render_definition, ring_definition,
+};
 use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 
@@ -23,6 +25,11 @@ pub struct App {
     viewport: Option<Rect>,
     frame_size: Option<[usize; 2]>,
     backend_error: Option<String>,
+    kernel_error: Option<String>,
+    kernel_definitions: Vec<KernelDefinition>,
+    selected_kernel: usize,
+    selected_parameter: Option<String>,
+    kernel_preview_enabled: bool,
 }
 
 impl App {
@@ -40,6 +47,7 @@ impl App {
         let seed = 1_u64;
         world.randomize(seed, initial_density(&spec));
         let center = [width as f32 / 2.0, height as f32 / 2.0];
+        let (kernel_definitions, selected_kernel) = kernel_catalog(&spec);
         Self {
             spec: spec.clone(),
             backend,
@@ -53,6 +61,11 @@ impl App {
             viewport: None,
             frame_size: None,
             backend_error: None,
+            kernel_error: None,
+            kernel_definitions,
+            selected_kernel,
+            selected_parameter: None,
+            kernel_preview_enabled: false,
         }
     }
 
@@ -65,7 +78,9 @@ impl App {
     }
 
     pub fn backend_error(&self) -> Option<&str> {
-        self.backend_error.as_deref()
+        self.kernel_error
+            .as_deref()
+            .or(self.backend_error.as_deref())
     }
 
     pub fn backend_kind(&self) -> BackendKind {
@@ -74,6 +89,51 @@ impl App {
 
     pub fn backend_name(&self) -> &str {
         self.backend.device_name()
+    }
+
+    pub fn selected_kernel_name(&self) -> &str {
+        self.kernel_definitions
+            .get(self.selected_kernel)
+            .map_or("", |definition| definition.name.as_str())
+    }
+
+    pub fn selected_kernel_dimensions(&self) -> (usize, usize) {
+        self.kernel_definitions
+            .get(self.selected_kernel)
+            .map_or((0, 0), |definition| (definition.width, definition.height))
+    }
+
+    pub fn selected_kernel_anchor(&self) -> (usize, usize) {
+        self.kernel_definitions
+            .get(self.selected_kernel)
+            .map_or((0, 0), |definition| {
+                (definition.anchor_x, definition.anchor_y)
+            })
+    }
+
+    pub fn selected_kernel_radius(&self) -> usize {
+        self.kernel_definitions
+            .get(self.selected_kernel)
+            .map_or(0, definition_radius)
+    }
+
+    pub fn selected_kernel_normalization(&self) -> Normalization {
+        self.kernel_definitions
+            .get(self.selected_kernel)
+            .map_or(Normalization::None, |definition| definition.normalization)
+    }
+
+    pub fn selected_kernel_parameter(&self) -> Option<(String, f32)> {
+        let definition = self.kernel_definitions.get(self.selected_kernel)?;
+        let name = self.selected_parameter.as_deref()?;
+        definition
+            .parameters
+            .get(name)
+            .map(|value| (name.to_string(), *value))
+    }
+
+    pub fn kernel_preview_enabled(&self) -> bool {
+        self.kernel_preview_enabled
     }
 
     pub fn world(&self) -> &World {
@@ -144,10 +204,84 @@ impl App {
             }
             Command::Lenia => {
                 self.spec = SimulationSpec::lenia_orbium();
+                self.selected_kernel = self
+                    .kernel_definitions
+                    .iter()
+                    .position(|definition| definition.name == "ring")
+                    .unwrap_or(self.selected_kernel);
+                self.selected_parameter = None;
                 self.reset();
+            }
+            Command::NextKernel => {
+                self.selected_kernel = (self.selected_kernel + 1) % self.kernel_definitions.len();
+                self.selected_parameter = None;
+            }
+            Command::NextKernelParameter => self.cycle_kernel_parameter(),
+            Command::IncreaseKernelParameter => self.adjust_kernel_parameter(0.01),
+            Command::DecreaseKernelParameter => self.adjust_kernel_parameter(-0.01),
+            Command::RegenerateKernel => self.regenerate_kernel(),
+            Command::ToggleKernelPreview => {
+                self.kernel_preview_enabled = !self.kernel_preview_enabled;
             }
             Command::Quit => {}
         }
+    }
+
+    fn cycle_kernel_parameter(&mut self) {
+        let Some(definition) = self.kernel_definitions.get(self.selected_kernel) else {
+            self.selected_parameter = None;
+            return;
+        };
+        let names: Vec<_> = definition.parameters.keys().cloned().collect();
+        self.selected_parameter = if names.is_empty() {
+            None
+        } else {
+            let current = self
+                .selected_parameter
+                .as_deref()
+                .and_then(|name| names.iter().position(|candidate| candidate == name));
+            let next = current.map_or(0, |index| (index + 1) % names.len());
+            Some(names[next].clone())
+        };
+    }
+
+    fn adjust_kernel_parameter(&mut self, amount: f32) {
+        let Some(name) = self.selected_parameter.clone() else {
+            return;
+        };
+        let Some(definition) = self.kernel_definitions.get_mut(self.selected_kernel) else {
+            return;
+        };
+        let Some(value) = definition.parameters.get_mut(&name) else {
+            return;
+        };
+        let adjusted = *value + amount;
+        if adjusted.is_finite() {
+            *value = adjusted;
+            self.kernel_error = None;
+        } else {
+            self.kernel_error = Some("Kernel parameter must remain finite".to_string());
+        }
+    }
+
+    fn regenerate_kernel(&mut self) {
+        let Some(definition) = self.kernel_definitions.get(self.selected_kernel) else {
+            self.kernel_error = Some("No kernel definition is selected".to_string());
+            return;
+        };
+        let kernel = match definition.build() {
+            Ok(kernel) => kernel,
+            Err(error) => {
+                self.kernel_error = Some(format!("Kernel regeneration failed: {error}"));
+                return;
+            }
+        };
+        let mut next_spec = self.spec.clone();
+        next_spec.kernel = kernel;
+        let next_backend = self.backend_for_spec(&next_spec);
+        self.spec = next_spec;
+        self.backend = next_backend;
+        self.kernel_error = None;
     }
 
     fn reset(&mut self) {
@@ -157,10 +291,14 @@ impl App {
     }
 
     fn recreate_backend(&self) -> SimulationBackend {
+        self.backend_for_spec(&self.spec)
+    }
+
+    fn backend_for_spec(&self, spec: &SimulationSpec) -> SimulationBackend {
         match self.backend.kind() {
-            BackendKind::Cpu => SimulationBackend::cpu(self.spec.clone()),
+            BackendKind::Cpu => SimulationBackend::cpu(spec.clone()),
             BackendKind::Cuda => SimulationBackend::cuda_or_cpu(
-                self.spec.clone(),
+                spec.clone(),
                 self.world.width(),
                 self.world.height(),
             ),
@@ -273,10 +411,17 @@ pub fn run_with_kernel(kernel: KernelDefinition) -> std::io::Result<()> {
 
 fn app_for_kernel(kernel: KernelDefinition) -> std::io::Result<App> {
     let mut spec = SimulationSpec::lenia_orbium();
-    spec.kernel = Kernel::try_from(kernel)
+    spec.kernel = Kernel::try_from(kernel.clone())
         .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?;
     let backend = SimulationBackend::cuda_or_cpu(spec.clone(), 256, 256);
-    Ok(App::with_backend(spec, 256, 256, backend))
+    let mut app = App::with_backend(spec, 256, 256, backend);
+    if app.selected_kernel == 2 {
+        app.kernel_definitions[2] = kernel;
+    } else {
+        app.kernel_definitions.push(kernel);
+        app.selected_kernel = app.kernel_definitions.len() - 1;
+    }
+    Ok(app)
 }
 
 fn run_app(app: App) -> std::io::Result<()> {
@@ -390,6 +535,66 @@ fn initial_density(spec: &SimulationSpec) -> f64 {
     }
 }
 
+fn kernel_catalog(spec: &SimulationSpec) -> (Vec<KernelDefinition>, usize) {
+    let ring = ring_definition(13, 0.5, 0.5);
+    let render = render_definition(ring.width, ring.height);
+    let mut definitions = vec![ring, render];
+    let selected = if spec.kernel.name == "render" {
+        1
+    } else if spec.kernel.name == "ring" || spec.kernel.name == "none" {
+        0
+    } else {
+        definitions.push(definition_from_kernel(&spec.kernel));
+        2
+    };
+    (definitions, selected)
+}
+
+fn definition_from_kernel(kernel: &Kernel) -> KernelDefinition {
+    KernelDefinition {
+        name: kernel.name.clone(),
+        width: kernel.width,
+        height: kernel.height,
+        anchor_x: kernel.anchor_x,
+        anchor_y: kernel.anchor_y,
+        mask: kernel.mask.clone(),
+        normalization: kernel.normalization,
+        parameters: kernel.parameters.clone(),
+        values: KernelValues::Explicit(kernel.values.clone()),
+    }
+}
+
+fn definition_radius(definition: &KernelDefinition) -> usize {
+    if definition.width == 0
+        || definition.height == 0
+        || definition.anchor_x >= definition.width
+        || definition.anchor_y >= definition.height
+    {
+        return 0;
+    }
+    let Some(mask) = definition.mask.as_deref() else {
+        return (definition.width - 1 - definition.anchor_x)
+            .max(definition.anchor_x)
+            .max(definition.height - 1 - definition.anchor_y)
+            .max(definition.anchor_y);
+    };
+    if mask.len() != definition.width * definition.height {
+        return 0;
+    }
+    mask.iter()
+        .enumerate()
+        .filter(|(_, active)| **active)
+        .map(|(index, _)| {
+            let x = index % definition.width;
+            let y = index / definition.width;
+            (x as isize - definition.anchor_x as isize)
+                .abs()
+                .max((y as isize - definition.anchor_y as isize).abs())
+        })
+        .max()
+        .unwrap_or(0) as usize
+}
+
 pub fn rule_name(spec: &SimulationSpec) -> &'static str {
     match spec.rule {
         crate::sim::rule::Rule::Conway => "Conway",
@@ -404,6 +609,23 @@ mod tests {
 
     fn cuda_available() -> bool {
         crate::sim::cuda::CudaBackend::new(SimulationSpec::conway(), 1, 1).is_ok()
+    }
+
+    fn custom_definition() -> KernelDefinition {
+        KernelDefinition {
+            name: "custom".to_string(),
+            width: 2,
+            height: 1,
+            anchor_x: 1,
+            anchor_y: 0,
+            mask: None,
+            normalization: Normalization::None,
+            parameters: std::collections::BTreeMap::from([
+                ("zeta".to_string(), 4.0),
+                ("alpha".to_string(), 2.0),
+            ]),
+            values: KernelValues::Explicit(vec![2.0, 4.0]),
+        }
     }
 
     #[test]
@@ -425,6 +647,83 @@ mod tests {
         assert_eq!(app.spec().kernel.width, 2);
         assert_eq!(app.spec().kernel.height, 1);
         assert_eq!(app.spec().kernel.values, vec![2.0, 4.0]);
+    }
+
+    #[test]
+    fn kernel_catalog_cycles_presets_and_preserves_custom() {
+        let mut app = app_for_kernel(custom_definition()).unwrap();
+
+        assert_eq!(app.kernel_definitions.len(), 3);
+        assert_eq!(app.selected_kernel_name(), "custom");
+        assert_eq!(app.selected_kernel_dimensions(), (2, 1));
+        assert_eq!(app.selected_kernel_anchor(), (1, 0));
+        assert_eq!(app.selected_kernel_radius(), 1);
+        assert_eq!(app.selected_kernel_normalization(), Normalization::None);
+        assert_eq!(app.selected_kernel_parameter(), None);
+
+        app.handle_command(Command::NextKernel);
+        assert_eq!(app.selected_kernel_name(), "ring");
+        app.handle_command(Command::NextKernel);
+        assert_eq!(app.selected_kernel_name(), "render");
+        app.handle_command(Command::NextKernel);
+        assert_eq!(app.selected_kernel_name(), "custom");
+    }
+
+    #[test]
+    fn kernel_parameters_cycle_in_sorted_name_order() {
+        let mut app = app_for_kernel(custom_definition()).unwrap();
+
+        app.handle_command(Command::NextKernelParameter);
+        assert_eq!(
+            app.selected_kernel_parameter(),
+            Some(("alpha".to_string(), 2.0))
+        );
+        app.handle_command(Command::NextKernelParameter);
+        assert_eq!(
+            app.selected_kernel_parameter(),
+            Some(("zeta".to_string(), 4.0))
+        );
+        app.handle_command(Command::NextKernelParameter);
+        assert_eq!(
+            app.selected_kernel_parameter(),
+            Some(("alpha".to_string(), 2.0))
+        );
+    }
+
+    #[test]
+    fn parameter_edits_change_the_selected_definition_only() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 8, 8);
+        app.handle_command(Command::NextKernelParameter);
+
+        app.handle_command(Command::IncreaseKernelParameter);
+        app.handle_command(Command::IncreaseKernelParameter);
+        app.handle_command(Command::DecreaseKernelParameter);
+
+        assert_eq!(
+            app.selected_kernel_parameter(),
+            Some(("center".to_string(), 0.51))
+        );
+        assert_eq!(app.spec().kernel.parameters["center"], 0.5);
+    }
+
+    #[test]
+    fn non_finite_parameter_results_are_rejected() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 8, 8);
+        app.selected_parameter = Some("width".to_string());
+        app.kernel_definitions[0]
+            .parameters
+            .insert("width".to_string(), f32::NAN);
+
+        app.handle_command(Command::DecreaseKernelParameter);
+
+        assert!(
+            app.selected_kernel_parameter()
+                .is_some_and(|(_, value)| value.is_nan())
+        );
+        assert!(
+            app.backend_error()
+                .is_some_and(|error| error.contains("finite"))
+        );
     }
 
     #[test]
@@ -461,6 +760,70 @@ mod tests {
 
         first.handle_command(Command::Reset);
         assert_eq!(first.world().cells(), second.world().cells());
+    }
+
+    #[test]
+    fn successful_regeneration_rebuilds_the_active_kernel_and_backend() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 8, 8);
+        app.handle_command(Command::Step);
+        app.handle_command(Command::NextKernelParameter);
+        app.handle_command(Command::IncreaseKernelParameter);
+
+        app.handle_command(Command::RegenerateKernel);
+
+        assert_eq!(app.spec().kernel.name, "ring");
+        assert_eq!(app.spec().kernel.parameters["center"], 0.51);
+        assert_eq!(app.tick(), 0);
+        assert_eq!(app.backend_error(), None);
+    }
+
+    #[test]
+    fn catalog_selection_regenerates_the_requested_definition() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 8, 8);
+        app.handle_command(Command::NextKernel);
+
+        app.handle_command(Command::RegenerateKernel);
+
+        assert_eq!(app.spec().kernel.name, "render");
+        assert_eq!(app.selected_kernel_name(), "render");
+        assert_eq!(app.selected_kernel_parameter(), None);
+        assert_eq!(app.tick(), 0);
+    }
+
+    #[test]
+    fn invalid_regeneration_preserves_the_previous_kernel_and_backend() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 8, 8);
+        app.handle_command(Command::Step);
+        let previous_kernel = app.spec().kernel.clone();
+        let previous_world = app.world().cells().to_vec();
+        app.kernel_definitions[0]
+            .parameters
+            .insert("width".to_string(), 0.0);
+
+        app.handle_command(Command::RegenerateKernel);
+
+        assert_eq!(app.spec().kernel, previous_kernel);
+        assert_eq!(app.world().cells(), previous_world);
+        assert_eq!(app.tick(), 1);
+        assert!(
+            app.backend_error()
+                .is_some_and(|error| error.contains("kernel"))
+        );
+    }
+
+    #[test]
+    fn kernel_preview_state_is_independent_from_simulation_pause_state() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 8, 8);
+
+        assert!(!app.kernel_preview_enabled());
+        app.handle_command(Command::ToggleKernelPreview);
+        assert!(app.kernel_preview_enabled());
+        assert!(!app.paused());
+
+        app.handle_command(Command::TogglePause);
+        app.handle_command(Command::ToggleKernelPreview);
+        assert!(!app.kernel_preview_enabled());
+        assert!(app.paused());
     }
 
     #[test]

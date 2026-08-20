@@ -3,7 +3,7 @@ use crate::render::display::ViewportDisplay;
 use crate::render::raster::rasterize_world;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 pub fn draw(frame: &mut ratatui::Frame, app: &mut App, display: &ViewportDisplay) {
     let outer = frame.area();
@@ -28,6 +28,10 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App, display: &ViewportDisplay
         display.render(frame, viewport, &framebuffer);
     }
 
+    if app.kernel_preview_enabled() {
+        render_kernel_preview(frame, app, outer);
+    }
+
     let status = Line::from(vec![
         Span::styled(
             status_text(app, display),
@@ -45,6 +49,188 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App, display: &ViewportDisplay
         Paragraph::new(status).style(Style::default().bg(Color::Rgb(12, 18, 32))),
         chunks[1],
     );
+}
+
+fn render_kernel_preview(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    let content_width = area.width.saturating_sub(2).min(64) as usize;
+    let content_height = area.height.saturating_sub(2).min(16) as usize;
+    let lines = kernel_preview_lines(app, content_width, content_height);
+    if lines.is_empty() || area.width < 2 || area.height < 2 {
+        return;
+    }
+
+    let text_width = lines
+        .iter()
+        .map(|line| line.chars().count())
+        .max()
+        .unwrap_or_default()
+        .saturating_add(2) as u16;
+    let width = text_width.min(area.width);
+    let height = (lines.len() as u16).saturating_add(2).min(area.height);
+    let x = area.x + (area.width - width) / 2;
+    let y = area.y + (area.height - height) / 2;
+    let area = ratatui::layout::Rect::new(x, y, width, height);
+
+    let block = Block::default()
+        .title(" Kernel ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(150, 190, 255)));
+    let text = lines.into_iter().map(Line::from).collect::<Vec<_>>();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Paragraph::new(text)
+            .block(block)
+            .style(Style::default().bg(Color::Rgb(10, 15, 28))),
+        area,
+    );
+}
+
+fn kernel_preview_lines(app: &App, max_width: usize, max_height: usize) -> Vec<String> {
+    if max_width == 0 || max_height == 0 {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    let dimensions = app.selected_kernel_dimensions();
+    let anchor = app.selected_kernel_anchor();
+    lines.push(truncate_chars(
+        &format!(
+            "Kernel {} {}×{}",
+            app.selected_kernel_name(),
+            dimensions.0,
+            dimensions.1
+        ),
+        max_width,
+    ));
+    lines.push(truncate_chars(
+        &format!(
+            "anchor ({},{}) · radius {}",
+            anchor.0,
+            anchor.1,
+            app.selected_kernel_radius()
+        ),
+        max_width,
+    ));
+    lines.push(truncate_chars(
+        &format!(
+            "normalization {}",
+            normalization_label(app.selected_kernel_normalization())
+        ),
+        max_width,
+    ));
+    lines.push(truncate_chars(
+        &app.selected_kernel_parameter()
+            .map_or("parameter —".to_string(), |(name, value)| {
+                format!("parameter {name} {value:.3}")
+            }),
+        max_width,
+    ));
+
+    let kernel = &app.spec().kernel;
+    let active_values = active_kernel_values(kernel);
+    let value_range = if active_values.is_empty() {
+        (0.0, 0.0)
+    } else {
+        (
+            active_values.iter().copied().fold(f32::INFINITY, f32::min),
+            active_values
+                .iter()
+                .copied()
+                .fold(f32::NEG_INFINITY, f32::max),
+        )
+    };
+    lines.push(truncate_chars(
+        &format!(
+            "value range {:.3}–{:.3} · active {}",
+            value_range.0,
+            value_range.1,
+            active_values.len()
+        ),
+        max_width,
+    ));
+
+    let sample_rows = max_height
+        .saturating_sub(lines.len() + 2)
+        .min(4)
+        .min(kernel.height);
+    if sample_rows > 0 {
+        let sample_width = max_width
+            .saturating_sub("sample ".len())
+            .min(12)
+            .min(kernel.width);
+        let maximum = active_values
+            .iter()
+            .fold(0.0_f32, |maximum, value| maximum.max(value.abs()));
+        for sample_y in 0..sample_rows {
+            let y = sample_index(sample_y, sample_rows, kernel.height);
+            let mut sample = String::from("sample ");
+            for sample_x in 0..sample_width {
+                let x = sample_index(sample_x, sample_width, kernel.width);
+                let value = kernel.values[y * kernel.width + x];
+                sample.push(sample_symbol(value.abs(), maximum));
+            }
+            lines.push(truncate_chars(&sample, max_width));
+        }
+    }
+
+    lines.push(truncate_chars(
+        "[K] kernel  [Tab] param  [V] close",
+        max_width,
+    ));
+    lines.push(truncate_chars("[+/-] edit  [G] regenerate", max_width));
+    lines.truncate(max_height);
+    lines
+}
+
+fn active_kernel_values(kernel: &crate::sim::kernel::Kernel) -> Vec<f32> {
+    kernel.mask.as_ref().map_or(kernel.values.clone(), |mask| {
+        kernel
+            .values
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| mask.get(*index).is_some_and(|active| *active))
+            .map(|(_, value)| *value)
+            .collect()
+    })
+}
+
+fn sample_index(sample: usize, sample_count: usize, source_count: usize) -> usize {
+    if sample_count <= 1 || source_count <= 1 {
+        0
+    } else {
+        sample * (source_count - 1) / (sample_count - 1)
+    }
+}
+
+fn sample_symbol(value: f32, maximum: f32) -> char {
+    if maximum <= 0.0 {
+        return '·';
+    }
+    let ratio = value / maximum;
+    if ratio >= 0.75 {
+        '█'
+    } else if ratio >= 0.5 {
+        '▓'
+    } else if ratio >= 0.25 {
+        '▒'
+    } else {
+        '░'
+    }
+}
+
+fn normalization_label(normalization: crate::sim::kernel::Normalization) -> &'static str {
+    match normalization {
+        crate::sim::kernel::Normalization::None => "none",
+        crate::sim::kernel::Normalization::Sum => "sum",
+    }
+}
+
+fn truncate_chars(value: &str, maximum: usize) -> String {
+    if value.chars().count() <= maximum {
+        value.to_string()
+    } else {
+        value.chars().take(maximum).collect()
+    }
 }
 
 pub fn status_text(app: &App, display: &ViewportDisplay) -> String {
@@ -101,6 +287,27 @@ mod tests {
         assert!(status.contains("render 47.0/s"));
         assert!(status.contains("8×8"));
         assert!(status.contains("display half-block fallback"));
+    }
+
+    #[test]
+    fn kernel_preview_is_bounded_and_includes_metadata_sample_and_hints() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 8, 8);
+        app.handle_command(crate::input::Command::NextKernelParameter);
+        let lines = kernel_preview_lines(&app, 44, 12);
+        let text = lines.join("\n");
+
+        assert!(lines.len() <= 12);
+        assert!(lines.iter().all(|line| line.chars().count() <= 44));
+        assert!(text.contains("ring 27×27"));
+        assert!(text.contains("anchor (13,13)"));
+        assert!(text.contains("radius 12"));
+        assert!(text.contains("normalization sum"));
+        assert!(text.contains("parameter center 0.500"));
+        assert!(text.contains("value range"));
+        assert!(text.contains("active 517"));
+        assert!(text.contains("sample"));
+        assert!(text.contains("[K] kernel  [Tab] param"));
+        assert!(text.contains("[+/-] edit  [G] regenerate"));
     }
 
     #[test]

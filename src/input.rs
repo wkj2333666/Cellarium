@@ -10,6 +10,12 @@ pub enum Command {
     Clear,
     Conway,
     Lenia,
+    NextKernel,
+    NextKernelParameter,
+    IncreaseKernelParameter,
+    DecreaseKernelParameter,
+    RegenerateKernel,
+    ToggleKernelPreview,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -42,6 +48,12 @@ pub fn translate_key(event: &KeyEvent) -> Option<Command> {
         KeyCode::Char('c') => Some(Command::Clear),
         KeyCode::Char('1') => Some(Command::Conway),
         KeyCode::Char('2') => Some(Command::Lenia),
+        KeyCode::Char('k') => Some(Command::NextKernel),
+        KeyCode::Tab => Some(Command::NextKernelParameter),
+        KeyCode::Char('+') | KeyCode::Char('=') => Some(Command::IncreaseKernelParameter),
+        KeyCode::Char('-') | KeyCode::Char('_') => Some(Command::DecreaseKernelParameter),
+        KeyCode::Char('g') => Some(Command::RegenerateKernel),
+        KeyCode::Char('v') => Some(Command::ToggleKernelPreview),
         KeyCode::Char('q') | KeyCode::Esc => Some(Command::Quit),
         _ => None,
     }
@@ -136,6 +148,38 @@ mod tests {
         assert_eq!(
             translate_key(&key(KeyCode::Char('2'))),
             Some(Command::Lenia)
+        );
+        assert_eq!(
+            translate_key(&key(KeyCode::Char('k'))),
+            Some(Command::NextKernel)
+        );
+        assert_eq!(
+            translate_key(&key(KeyCode::Tab)),
+            Some(Command::NextKernelParameter)
+        );
+        assert_eq!(
+            translate_key(&key(KeyCode::Char('+'))),
+            Some(Command::IncreaseKernelParameter)
+        );
+        assert_eq!(
+            translate_key(&key(KeyCode::Char('='))),
+            Some(Command::IncreaseKernelParameter)
+        );
+        assert_eq!(
+            translate_key(&key(KeyCode::Char('-'))),
+            Some(Command::DecreaseKernelParameter)
+        );
+        assert_eq!(
+            translate_key(&key(KeyCode::Char('_'))),
+            Some(Command::DecreaseKernelParameter)
+        );
+        assert_eq!(
+            translate_key(&key(KeyCode::Char('g'))),
+            Some(Command::RegenerateKernel)
+        );
+        assert_eq!(
+            translate_key(&key(KeyCode::Char('v'))),
+            Some(Command::ToggleKernelPreview)
         );
     }
 
