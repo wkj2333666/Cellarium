@@ -8,11 +8,13 @@ use cudarc::driver::{
 use cudarc::nvrtc::{CompileError, Ptx, compile_ptx};
 
 use crate::sim::cuda_codegen::{
-    CodegenError, generate_cuda_source, generate_program_cuda_source, program_kernel_data,
+    CodegenError, generate_cuda_source, generate_program_cuda_source,
+    generate_topology_cuda_source, program_kernel_data,
 };
 use crate::sim::expression::{KernelExpression, KernelExpressionError};
 use crate::sim::program::InputSource;
 use crate::sim::rule::{Rule, SimulationSpec};
+use crate::sim::topology::CompiledTopology;
 use crate::sim::world::{ChannelWorld, World};
 
 #[derive(Debug, thiserror::Error)]
@@ -29,6 +31,8 @@ pub enum BackendError {
     CompilationCachePoisoned,
     #[error("world dimensions must fit a CUDA launch")]
     InvalidWorld,
+    #[error("compiled topology has inconsistent CSR arrays")]
+    InvalidTopology,
 }
 
 struct ProgramCudaBuffers {
@@ -40,6 +44,17 @@ struct ProgramCudaBuffers {
     anchor_y: CudaSlice<i32>,
     channels: CudaSlice<i32>,
     parameters: Vec<f32>,
+}
+
+pub struct CudaTopologyBackend {
+    stream: Arc<CudaStream>,
+    function: CudaFunction,
+    offsets: CudaSlice<u32>,
+    neighbors: CudaSlice<u32>,
+    weights: CudaSlice<f32>,
+    current: CudaSlice<f32>,
+    next: CudaSlice<f32>,
+    count: usize,
 }
 
 pub struct CudaBackend {
@@ -111,6 +126,66 @@ fn load_cached_module(
     evict_if_full(&mut cache);
     cache.insert(source.to_string(), module.clone());
     Ok(module)
+}
+
+impl CudaTopologyBackend {
+    pub fn new(topology: &CompiledTopology) -> Result<Self, BackendError> {
+        let count = topology.site_count();
+        if count == 0
+            || topology.offsets.len() != count + 1
+            || topology.offsets.first().copied() != Some(0)
+            || topology.offsets.last().copied().map(|value| value as usize)
+                != Some(topology.neighbors.len())
+            || topology.weights.len() != topology.neighbors.len()
+            || topology
+                .neighbors
+                .iter()
+                .any(|neighbor| *neighbor as usize >= count)
+            || topology.weights.iter().any(|weight| !weight.is_finite())
+        {
+            return Err(BackendError::InvalidTopology);
+        }
+        let context = shared_context()?;
+        let stream = context.default_stream();
+        let generated = generate_topology_cuda_source();
+        let module = load_cached_module(&context, &generated.source)?;
+        let function = module.load_function(generated.entry_point)?;
+        Ok(Self {
+            offsets: stream.clone_htod(&topology.offsets)?,
+            neighbors: stream.clone_htod(&topology.neighbors)?,
+            weights: stream.clone_htod(&topology.weights)?,
+            current: stream.alloc_zeros(count)?,
+            next: stream.alloc_zeros(count)?,
+            stream,
+            function,
+            count,
+        })
+    }
+
+    pub fn step(&mut self, state: &mut [f32], dt: f32) -> Result<(), BackendError> {
+        if state.len() != self.count || !dt.is_finite() {
+            return Err(BackendError::InvalidTopology);
+        }
+        self.stream.memcpy_htod(state, &mut self.current)?;
+        let count = self.count as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.function)
+                .arg(&mut self.next)
+                .arg(&self.current)
+                .arg(&self.offsets)
+                .arg(&self.neighbors)
+                .arg(&self.weights)
+                .arg(&dt)
+                .arg(&count)
+                .launch(LaunchConfig::for_num_elems(count))
+        }?;
+        let updated = self.stream.clone_dtoh(&self.next)?;
+        self.stream.synchronize()?;
+        state.copy_from_slice(&updated);
+        std::mem::swap(&mut self.current, &mut self.next);
+        Ok(())
+    }
 }
 
 impl CudaBackend {
@@ -367,6 +442,10 @@ mod tests {
     use crate::sim::parser::parse_expression;
     use crate::sim::program::{RuleInput, RuleProgram};
     use crate::sim::rule::SimulationSpec;
+    use crate::sim::topology::{
+        Basis2, BoardSpec, BoundarySpec, DomainSpec, LatticeSpec, NeighborTemplate, SiteSpec,
+        compile_topology,
+    };
     use crate::sim::world::World;
     use std::collections::BTreeMap;
 
@@ -578,6 +657,51 @@ mod tests {
             .zip(gpu_world.channel_cells(0))
         {
             assert!((cpu_value - gpu_value).abs() <= 1e-5);
+        }
+    }
+
+    #[test]
+    fn generic_csr_topology_step_matches_cpu_reference() {
+        if !cuda_available() {
+            return;
+        }
+        let topology = compile_topology(
+            &LatticeSpec {
+                basis: Basis2 {
+                    first: [1.0, 0.0],
+                    second: [0.0, 1.0],
+                },
+                sites: vec![SiteSpec {
+                    name: "cell".to_string(),
+                }],
+                neighborhoods: vec![NeighborTemplate {
+                    source_site: 0,
+                    target_site: 0,
+                    cell_offset: [1, 0],
+                    weight: 0.75,
+                }],
+            },
+            &BoardSpec {
+                domain: DomainSpec::Rect { size: [4, 1] },
+            },
+            &BoundarySpec::Periodic,
+        )
+        .unwrap();
+        let mut actual = vec![0.1, 0.2, 0.3, 0.4];
+        let original = actual.clone();
+        let mut expected = original.clone();
+        for site in 0..topology.site_count() {
+            let start = topology.offsets[site] as usize;
+            let end = topology.offsets[site + 1] as usize;
+            let total = (start..end)
+                .map(|edge| topology.weights[edge] * original[topology.neighbors[edge] as usize])
+                .sum::<f32>();
+            expected[site] = (original[site] + 0.5 * total).clamp(0.0, 1.0);
+        }
+        let mut gpu = CudaTopologyBackend::new(&topology).unwrap();
+        gpu.step(&mut actual, 0.5).unwrap();
+        for (actual, expected) in actual.iter().zip(expected) {
+            assert!((actual - expected).abs() <= 1e-6);
         }
     }
 

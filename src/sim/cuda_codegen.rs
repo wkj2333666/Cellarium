@@ -280,6 +280,13 @@ pub fn generate_program_cuda_source(
     })
 }
 
+pub fn generate_topology_cuda_source() -> GeneratedCudaSource {
+    GeneratedCudaSource {
+        source: TOPOLOGY_CUDA_TEMPLATE.to_string(),
+        entry_point: "cellarium_topology_step",
+    }
+}
+
 fn cuda_float(value: f32) -> Result<String, CodegenError> {
     if !value.is_finite() {
         return Err(CodegenError::NonFiniteConstant);
@@ -394,6 +401,26 @@ extern "C" __global__ void cellarium_step(
     /*__PROGRAM_INPUTS__*/
     float update = cellarium_update(/*__PROGRAM_CALL_ARGS__*/);
     next[linear] = fminf(1.0f, fmaxf(0.0f, current[linear] + dt * update));
+}
+"#;
+
+const TOPOLOGY_CUDA_TEMPLATE: &str = r#"
+extern "C" __global__ void cellarium_topology_step(
+    float* next,
+    const float* current,
+    const unsigned int* offsets,
+    const unsigned int* neighbors,
+    const float* weights,
+    float dt,
+    unsigned int count
+) {
+    unsigned int site = blockIdx.x * blockDim.x + threadIdx.x;
+    if (site >= count) return;
+    float total = 0.0f;
+    for (unsigned int edge = offsets[site]; edge < offsets[site + 1]; ++edge) {
+        total += weights[edge] * current[neighbors[edge]];
+    }
+    next[site] = fminf(1.0f, fmaxf(0.0f, current[site] + dt * total));
 }
 "#;
 
