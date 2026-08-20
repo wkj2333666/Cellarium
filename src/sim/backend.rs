@@ -26,6 +26,20 @@ impl SimulationBackend {
         }
     }
 
+    pub fn strict_for_kind(
+        kind: BackendKind,
+        spec: SimulationSpec,
+        width: usize,
+        height: usize,
+    ) -> Result<Self, BackendError> {
+        match kind {
+            BackendKind::Cpu => Ok(Self::cpu(spec)),
+            BackendKind::Cuda => {
+                CudaBackend::new(spec, width, height).map(|backend| Self::Cuda(Box::new(backend)))
+            }
+        }
+    }
+
     pub fn kind(&self) -> BackendKind {
         match self {
             Self::Cpu(_) => BackendKind::Cpu,
@@ -81,6 +95,14 @@ mod tests {
         assert!(matches!(backend, SimulationBackend::Cuda(_)));
         assert_eq!(backend.kind(), BackendKind::Cuda);
         assert!(!backend.device_name().is_empty());
+    }
+
+    #[test]
+    fn strict_backend_construction_does_not_fall_back_from_cuda() {
+        let result =
+            SimulationBackend::strict_for_kind(BackendKind::Cuda, SimulationSpec::conway(), 0, 0);
+
+        assert!(matches!(result, Err(BackendError::InvalidWorld)));
     }
 
     #[test]

@@ -278,10 +278,32 @@ impl App {
         };
         let mut next_spec = self.spec.clone();
         next_spec.kernel = kernel;
-        let next_backend = self.backend_for_spec(&next_spec);
+        let next_backend = SimulationBackend::strict_for_kind(
+            self.backend.kind(),
+            next_spec.clone(),
+            self.world.width(),
+            self.world.height(),
+        )
+        .map_err(|error| error.to_string());
+        self.commit_regenerated_kernel(next_spec, next_backend);
+    }
+
+    fn commit_regenerated_kernel(
+        &mut self,
+        next_spec: SimulationSpec,
+        next_backend: Result<SimulationBackend, String>,
+    ) -> bool {
+        let next_backend = match next_backend {
+            Ok(backend) => backend,
+            Err(error) => {
+                self.kernel_error = Some(format!("Kernel backend regeneration failed: {error}"));
+                return false;
+            }
+        };
         self.spec = next_spec;
         self.backend = next_backend;
         self.kernel_error = None;
+        true
     }
 
     fn reset(&mut self) {
@@ -775,6 +797,55 @@ mod tests {
         assert_eq!(app.spec().kernel.parameters["center"], 0.51);
         assert_eq!(app.tick(), 0);
         assert_eq!(app.backend_error(), None);
+    }
+
+    #[test]
+    fn successful_cuda_regeneration_preserves_the_cuda_backend_kind() {
+        if !cuda_available() {
+            return;
+        }
+
+        let spec = SimulationSpec::lenia_orbium();
+        let backend = SimulationBackend::cuda_or_cpu(spec.clone(), 8, 8);
+        let mut app = App::with_backend(spec, 8, 8, backend);
+        app.handle_command(Command::Step);
+        app.handle_command(Command::NextKernelParameter);
+        app.handle_command(Command::IncreaseKernelParameter);
+
+        app.handle_command(Command::RegenerateKernel);
+
+        assert_eq!(app.backend_kind(), BackendKind::Cuda);
+        assert_eq!(app.spec().kernel.parameters["center"], 0.51);
+        assert_eq!(app.tick(), 0);
+        assert_eq!(app.backend_error(), None);
+    }
+
+    #[test]
+    fn failed_backend_regeneration_preserves_the_previous_state() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 8, 8);
+        app.handle_command(Command::Step);
+        let previous_kernel = app.spec().kernel.clone();
+        let previous_world = app.world().cells().to_vec();
+        let mut next_spec = app.spec().clone();
+        next_spec
+            .kernel
+            .parameters
+            .insert("center".to_string(), 0.51);
+
+        let committed = app.commit_regenerated_kernel(
+            next_spec,
+            Err("forced CUDA construction failure".to_string()),
+        );
+
+        assert!(!committed);
+        assert_eq!(app.spec().kernel, previous_kernel);
+        assert_eq!(app.world().cells(), previous_world);
+        assert_eq!(app.backend_kind(), BackendKind::Cpu);
+        assert_eq!(app.tick(), 1);
+        assert!(
+            app.backend_error()
+                .is_some_and(|error| error.contains("forced CUDA construction failure"))
+        );
     }
 
     #[test]

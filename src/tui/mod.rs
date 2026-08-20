@@ -5,6 +5,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
+const MINIMUM_KERNEL_PREVIEW_ROWS: usize = 8;
+
 pub fn draw(frame: &mut ratatui::Frame, app: &mut App, display: &ViewportDisplay) {
     let outer = frame.area();
     let chunks = ratatui::layout::Layout::vertical([
@@ -86,7 +88,7 @@ fn render_kernel_preview(frame: &mut ratatui::Frame, app: &App, area: ratatui::l
 }
 
 fn kernel_preview_lines(app: &App, max_width: usize, max_height: usize) -> Vec<String> {
-    if max_width == 0 || max_height == 0 {
+    if max_width == 0 || max_height < MINIMUM_KERNEL_PREVIEW_ROWS {
         return Vec::new();
     }
 
@@ -308,6 +310,35 @@ mod tests {
         assert!(text.contains("sample"));
         assert!(text.contains("[K] kernel  [Tab] param"));
         assert!(text.contains("[+/-] edit  [G] regenerate"));
+    }
+
+    #[test]
+    fn kernel_preview_at_the_minimum_height_includes_one_sample_and_both_hints() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 8, 8);
+        app.handle_command(crate::input::Command::NextKernelParameter);
+        let lines = kernel_preview_lines(&app, 44, 8);
+
+        assert_eq!(lines.len(), 8);
+        assert!(lines[0].contains("ring 27×27"));
+        assert!(lines[1].contains("anchor (13,13)"));
+        assert!(lines[2].contains("normalization sum"));
+        assert!(lines[3].contains("parameter center 0.500"));
+        assert!(lines[4].contains("value range"));
+        assert!(lines[5].starts_with("sample "));
+        assert!(lines[6].contains("[K] kernel"));
+        assert!(lines[7].contains("[G] regenerate"));
+    }
+
+    #[test]
+    fn kernel_preview_below_the_minimum_height_is_suppressed() {
+        let app = App::new(SimulationSpec::lenia_orbium(), 8, 8);
+
+        for max_height in 0..8 {
+            assert!(
+                kernel_preview_lines(&app, 44, max_height).is_empty(),
+                "height {max_height} must not render a partial preview"
+            );
+        }
     }
 
     #[test]
