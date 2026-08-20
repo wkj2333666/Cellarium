@@ -16,6 +16,8 @@ pub enum Command {
     DecreaseKernelParameter,
     RegenerateKernel,
     ToggleKernelPreview,
+    NextPanel,
+    ToggleExpressionEditor,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,6 +56,8 @@ pub fn translate_key(event: &KeyEvent) -> Option<Command> {
         KeyCode::Char('-') | KeyCode::Char('_') => Some(Command::DecreaseKernelParameter),
         KeyCode::Char('g') => Some(Command::RegenerateKernel),
         KeyCode::Char('v') => Some(Command::ToggleKernelPreview),
+        KeyCode::Char('t') => Some(Command::NextPanel),
+        KeyCode::Char('e') => Some(Command::ToggleExpressionEditor),
         KeyCode::Char('q') | KeyCode::Esc => Some(Command::Quit),
         _ => None,
     }
@@ -180,6 +184,22 @@ mod tests {
         assert_eq!(
             translate_key(&key(KeyCode::Char('v'))),
             Some(Command::ToggleKernelPreview)
+        );
+        assert_eq!(
+            translate_key(&key(KeyCode::Char('t'))),
+            Some(Command::NextPanel)
+        );
+        assert_eq!(
+            translate_key(&key(KeyCode::Char('e'))),
+            Some(Command::ToggleExpressionEditor)
+        );
+        assert_eq!(
+            translate_key(&key(KeyCode::Char('e'))),
+            Some(Command::ToggleExpressionEditor)
+        );
+        assert_eq!(
+            translate_key(&key(KeyCode::Char('t'))),
+            Some(Command::NextPanel)
         );
     }
 

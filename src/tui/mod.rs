@@ -14,20 +14,34 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App, display: &ViewportDisplay
         ratatui::layout::Constraint::Length(2),
     ])
     .split(outer);
+    let content = ratatui::layout::Layout::horizontal([
+        ratatui::layout::Constraint::Percentage(72),
+        ratatui::layout::Constraint::Min(28),
+    ])
+    .split(chunks[0]);
+    let viewport_area = if outer.width >= 96 {
+        content[0]
+    } else {
+        chunks[0]
+    };
 
     let block = Block::default()
         .title(" Cellarium — GPU Cellular Automata ")
         .borders(Borders::ALL)
         .border_style(Style::default().fg(Color::Rgb(96, 140, 220)));
-    let viewport = block.inner(chunks[0]);
+    let viewport = block.inner(viewport_area);
     let (frame_width, frame_height) = display.framebuffer_size(viewport);
     app.set_viewport(viewport, [frame_width, frame_height]);
 
     if viewport.width > 0 && viewport.height > 0 {
         let camera = *app.camera();
         let framebuffer = rasterize_world(app.world(), &camera, frame_width, frame_height);
-        frame.render_widget(block, chunks[0]);
+        frame.render_widget(block, viewport_area);
         display.render(frame, viewport, &framebuffer);
+    }
+
+    if outer.width >= 96 {
+        render_editor_panel(frame, app, content[1]);
     }
 
     if app.kernel_preview_enabled() {
@@ -227,6 +241,103 @@ fn normalization_label(normalization: crate::sim::kernel::Normalization) -> &'st
     }
 }
 
+fn editor_panel_lines(app: &App, max_width: usize, max_height: usize) -> Vec<String> {
+    if max_width == 0 || max_height == 0 {
+        return Vec::new();
+    }
+    let (simulation_rate, render_rate) = app.rates();
+    let performance = app.performance();
+    let world = app.world();
+    let mut lines = vec![
+        format!("{} WORLD", panel_marker(app, crate::app::Panel::Overview)),
+        format!("size {}×{} · scalar channel", world.width(), world.height()),
+        "boundary periodic · editable viewport".to_string(),
+        format!("{} RULE", panel_marker(app, crate::app::Panel::Rule)),
+        crate::app::rule_name(app.spec()).to_string(),
+        if app.expression_editing() {
+            format!("edit: {}", app.expression_buffer())
+        } else {
+            format!(
+                "expression: {} · [E] edit",
+                app.spec()
+                    .growth_expression()
+                    .map(crate::sim::parser::format_expression)
+                    .unwrap_or_else(|| "n/a".to_string())
+            )
+        },
+        format!("{} KERNEL", panel_marker(app, crate::app::Panel::Kernel)),
+        format!(
+            "{} {}×{} · anchor ({},{})",
+            app.selected_kernel_name(),
+            app.selected_kernel_dimensions().0,
+            app.selected_kernel_dimensions().1,
+            app.selected_kernel_anchor().0,
+            app.selected_kernel_anchor().1
+        ),
+        "[K] select · [G] regenerate · [V] preview".to_string(),
+        format!(
+            "{} TOPOLOGY",
+            panel_marker(app, crate::app::Panel::Topology)
+        ),
+        "square lattice · dense periodic CSR-ready".to_string(),
+        "custom lattice/domain editor available".to_string(),
+        "STATISTICS".to_string(),
+        format!("tick {} · sim {:.1}/s", app.tick(), simulation_rate),
+        format!(
+            "render {:.1}/s · inspect {:?}",
+            render_rate,
+            app.inspected()
+        ),
+        format!(
+            "step {:.2}/{:.2} ms · render {:.2}/{:.2} ms",
+            performance.last_step_ms,
+            performance.average_step_ms,
+            performance.last_render_ms,
+            performance.average_render_ms
+        ),
+        format!("{} ERRORS", panel_marker(app, crate::app::Panel::Errors)),
+        app.backend_error().unwrap_or("none").to_string(),
+        "[T] next panel · mouse targets viewport".to_string(),
+    ];
+    lines.truncate(max_height);
+    lines
+        .into_iter()
+        .map(|line| truncate_chars(&line, max_width))
+        .collect()
+}
+
+fn panel_marker(app: &App, panel: crate::app::Panel) -> &'static str {
+    if app.active_panel() == panel {
+        "▸"
+    } else {
+        " "
+    }
+}
+
+fn render_editor_panel(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
+    if area.width < 2 || area.height < 2 {
+        return;
+    }
+    let lines = editor_panel_lines(
+        app,
+        area.width.saturating_sub(2) as usize,
+        area.height.saturating_sub(2) as usize,
+    )
+    .into_iter()
+    .map(Line::from)
+    .collect::<Vec<_>>();
+    let block = Block::default()
+        .title(" Editor [T] next panel ")
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Rgb(110, 160, 220)));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .style(Style::default().bg(Color::Rgb(10, 15, 28))),
+        area,
+    );
+}
+
 fn truncate_chars(value: &str, maximum: usize) -> String {
     if value.chars().count() <= maximum {
         value.to_string()
@@ -351,5 +462,22 @@ mod tests {
         );
 
         assert!(status.contains("error CUDA driver error: device reset"));
+    }
+
+    #[test]
+    fn editor_panel_exposes_rule_kernel_topology_stats_and_errors() {
+        let app = App::new(SimulationSpec::lenia_orbium(), 8, 8);
+        let lines = editor_panel_lines(&app, 48, 32);
+        let text = lines.join("\n");
+
+        assert!(text.contains("WORLD"));
+        assert!(text.contains("RULE"));
+        assert!(text.contains("KERNEL"));
+        assert!(text.contains("TOPOLOGY"));
+        assert!(text.contains("STATISTICS"));
+        assert!(text.contains("ERRORS"));
+        assert!(text.contains("periodic"));
+        assert!(text.contains("Lenia/Orbium"));
+        assert!(lines.iter().all(|line| line.chars().count() <= 48));
     }
 }

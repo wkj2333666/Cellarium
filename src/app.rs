@@ -7,10 +7,43 @@ use std::time::{Duration, Instant};
 use crate::input::Command;
 use crate::render::camera::Camera;
 use crate::sim::backend::{BackendKind, SimulationBackend};
+use crate::sim::experiment::{ExperimentError, ExperimentFile, ExperimentMetadata};
 use crate::sim::rule::SimulationSpec;
 use crate::sim::world::World;
-use crossterm::event::{Event, MouseEvent};
+use crossterm::event::{Event, KeyCode, KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
+use std::path::Path;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Panel {
+    Overview,
+    Rule,
+    Kernel,
+    Topology,
+    Errors,
+}
+
+impl Panel {
+    fn next(self) -> Self {
+        match self {
+            Self::Overview => Self::Rule,
+            Self::Rule => Self::Kernel,
+            Self::Kernel => Self::Topology,
+            Self::Topology => Self::Errors,
+            Self::Errors => Self::Overview,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PerformanceStats {
+    pub last_step_ms: f64,
+    pub average_step_ms: f64,
+    pub step_samples: u64,
+    pub last_render_ms: f64,
+    pub average_render_ms: f64,
+    pub render_samples: u64,
+}
 
 pub struct App {
     spec: SimulationSpec,
@@ -30,6 +63,10 @@ pub struct App {
     selected_kernel: usize,
     selected_parameter: Option<String>,
     kernel_preview_enabled: bool,
+    active_panel: Panel,
+    expression_editing: bool,
+    expression_buffer: String,
+    performance: PerformanceStats,
 }
 
 impl App {
@@ -66,6 +103,10 @@ impl App {
             selected_kernel,
             selected_parameter: None,
             kernel_preview_enabled: false,
+            active_panel: Panel::Overview,
+            expression_editing: false,
+            expression_buffer: String::new(),
+            performance: PerformanceStats::default(),
         }
     }
 
@@ -136,6 +177,39 @@ impl App {
         self.kernel_preview_enabled
     }
 
+    pub fn active_panel(&self) -> Panel {
+        self.active_panel
+    }
+
+    pub fn expression_editing(&self) -> bool {
+        self.expression_editing
+    }
+
+    pub fn expression_buffer(&self) -> &str {
+        &self.expression_buffer
+    }
+
+    pub fn replace_expression_buffer(&mut self, value: impl Into<String>) {
+        self.expression_buffer = value.into();
+    }
+
+    pub fn handle_expression_key(&mut self, event: KeyEvent) {
+        match event.code {
+            KeyCode::Char(character) => self.expression_buffer.push(character),
+            KeyCode::Backspace => {
+                self.expression_buffer.pop();
+            }
+            KeyCode::Enter => {
+                let expression = self.expression_buffer.clone();
+                if self.set_growth_expression(&expression) {
+                    self.expression_editing = false;
+                }
+            }
+            KeyCode::Esc => self.expression_editing = false,
+            _ => {}
+        }
+    }
+
     pub fn world(&self) -> &World {
         &self.world
     }
@@ -152,6 +226,25 @@ impl App {
         &self.spec
     }
 
+    pub fn seed(&self) -> u64 {
+        self.seed
+    }
+
+    pub fn save_experiment(&self, path: impl AsRef<Path>) -> Result<(), ExperimentError> {
+        let file = ExperimentFile::from_parts(
+            ExperimentMetadata {
+                name: rule_name(&self.spec).to_string(),
+                description: "Cellarium experiment".to_string(),
+                author: "cellarium".to_string(),
+                tags: vec![rule_name(&self.spec).to_ascii_lowercase()],
+            },
+            self.spec.clone(),
+            &self.world,
+            self.seed,
+        )?;
+        crate::sim::experiment::save_experiment(path, &file)
+    }
+
     pub fn inspected(&self) -> Option<f32> {
         self.inspected
     }
@@ -165,13 +258,38 @@ impl App {
         (self.simulation_rate, self.render_rate)
     }
 
+    pub fn performance(&self) -> PerformanceStats {
+        self.performance
+    }
+
+    pub fn record_step_duration(&mut self, duration: Duration) {
+        record_duration(
+            duration,
+            &mut self.performance.last_step_ms,
+            &mut self.performance.average_step_ms,
+            &mut self.performance.step_samples,
+        );
+    }
+
+    pub fn record_render_duration(&mut self, duration: Duration) {
+        record_duration(
+            duration,
+            &mut self.performance.last_render_ms,
+            &mut self.performance.average_render_ms,
+            &mut self.performance.render_samples,
+        );
+    }
+
     pub fn set_viewport(&mut self, viewport: Rect, frame_size: [usize; 2]) {
         self.viewport = Some(viewport);
         self.frame_size = Some(frame_size);
     }
 
     pub fn step(&mut self) -> bool {
-        match self.backend.step(&mut self.world) {
+        let started = Instant::now();
+        let result = self.backend.step(&mut self.world);
+        self.record_step_duration(started.elapsed());
+        match result {
             Ok(()) => {
                 self.backend_error = None;
                 true
@@ -253,8 +371,26 @@ impl App {
             Command::ToggleKernelPreview => {
                 self.kernel_preview_enabled = !self.kernel_preview_enabled;
             }
+            Command::NextPanel => self.active_panel = self.active_panel.next(),
+            Command::ToggleExpressionEditor => self.toggle_expression_editor(),
             Command::Quit => {}
         }
+    }
+
+    fn toggle_expression_editor(&mut self) {
+        if self.expression_editing {
+            let expression = self.expression_buffer.clone();
+            if self.set_growth_expression(&expression) {
+                self.expression_editing = false;
+            }
+            return;
+        }
+        self.expression_buffer = self
+            .spec
+            .growth_expression()
+            .map(crate::sim::parser::format_expression)
+            .unwrap_or_default();
+        self.expression_editing = true;
     }
 
     fn cycle_kernel_parameter(&mut self) {
@@ -457,8 +593,24 @@ pub fn run() -> std::io::Result<()> {
     run_app(App::with_backend(spec, 256, 256, backend))
 }
 
+pub fn run_with_save(path: impl AsRef<Path>) -> std::io::Result<()> {
+    let spec = SimulationSpec::lenia_orbium();
+    let backend = SimulationBackend::cuda_or_cpu(spec.clone(), 256, 256);
+    run_app_with_save(
+        App::with_backend(spec, 256, 256, backend),
+        Some(path.as_ref()),
+    )
+}
+
 pub fn run_with_kernel(kernel: KernelDefinition) -> std::io::Result<()> {
     run_app(app_for_kernel(kernel)?)
+}
+
+pub fn run_with_kernel_and_save(
+    kernel: KernelDefinition,
+    path: impl AsRef<Path>,
+) -> std::io::Result<()> {
+    run_app_with_save(app_for_kernel(kernel)?, Some(path.as_ref()))
 }
 
 fn app_for_kernel(kernel: KernelDefinition) -> std::io::Result<App> {
@@ -476,7 +628,49 @@ fn app_for_kernel(kernel: KernelDefinition) -> std::io::Result<App> {
     Ok(app)
 }
 
+fn app_for_experiment(file: ExperimentFile) -> Result<App, ExperimentError> {
+    let built = file.build()?;
+    let mut world = World::new(built.world_size[0], built.world_size[1]);
+    world.replace_cells(&built.cells);
+    let backend = SimulationBackend::cuda_or_cpu(
+        built.spec.clone(),
+        built.world_size[0],
+        built.world_size[1],
+    );
+    let mut app = App::with_backend(
+        built.spec,
+        built.world_size[0],
+        built.world_size[1],
+        backend,
+    );
+    app.world = world;
+    app.seed = built.seed;
+    Ok(app)
+}
+
+pub fn run_with_experiment(file: ExperimentFile) -> std::io::Result<()> {
+    run_app(
+        app_for_experiment(file)
+            .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?,
+    )
+}
+
+pub fn run_with_experiment_and_save(
+    file: ExperimentFile,
+    path: impl AsRef<Path>,
+) -> std::io::Result<()> {
+    run_app_with_save(
+        app_for_experiment(file)
+            .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?,
+        Some(path.as_ref()),
+    )
+}
+
 fn run_app(app: App) -> std::io::Result<()> {
+    run_app_with_save(app, None)
+}
+
+fn run_app_with_save(app: App, save_path: Option<&Path>) -> std::io::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
     let _terminal_guard = TerminalGuard;
     let mut stdout = std::io::stdout();
@@ -490,7 +684,7 @@ fn run_app(app: App) -> std::io::Result<()> {
     (|| {
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let mut terminal = ratatui::Terminal::new(backend)?;
-        run_loop(app, &mut terminal)
+        run_loop(app, &mut terminal, save_path)
     })()
 }
 
@@ -509,7 +703,11 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn run_loop(mut app: App, terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
+fn run_loop(
+    mut app: App,
+    terminal: &mut ratatui::DefaultTerminal,
+    save_path: Option<&Path>,
+) -> std::io::Result<()> {
     let display = crate::render::display::ViewportDisplay::detect();
     let mut tracker = crate::input::MouseTracker::new();
     let mut simulation_meter = RateMeter::new(Duration::from_secs(1));
@@ -549,10 +747,12 @@ fn run_loop(mut app: App, terminal: &mut ratatui::DefaultTerminal) -> std::io::R
             render_meter.record(now);
             render_meter.refresh(now);
             let rates = (simulation_meter.rate(), render_meter.rate());
+            let render_started = Instant::now();
             terminal.draw(|frame| {
                 app.set_rates(rates.0, rates.1);
                 crate::tui::draw(frame, &mut app, &display);
             })?;
+            app.record_render_duration(render_started.elapsed());
             last_render = now;
         }
 
@@ -562,8 +762,15 @@ fn run_loop(mut app: App, terminal: &mut ratatui::DefaultTerminal) -> std::io::R
         if crossterm::event::poll(wait)? {
             match crossterm::event::read()? {
                 Event::Key(key) => {
+                    if app.expression_editing() {
+                        app.handle_expression_key(key);
+                        continue;
+                    }
                     if let Some(command) = crate::input::translate_key(&key) {
                         if command == Command::Quit {
+                            if let Some(path) = save_path {
+                                app.save_experiment(path).map_err(std::io::Error::other)?;
+                            }
                             break;
                         }
                         app.handle_command(command);
@@ -578,6 +785,13 @@ fn run_loop(mut app: App, terminal: &mut ratatui::DefaultTerminal) -> std::io::R
         }
     }
     Ok(())
+}
+
+fn record_duration(duration: Duration, last: &mut f64, average: &mut f64, samples: &mut u64) {
+    let millis = duration.as_secs_f64() * 1_000.0;
+    *last = millis;
+    *average = (*average * *samples as f64 + millis) / (*samples as f64 + 1.0);
+    *samples = samples.saturating_add(1);
 }
 
 fn initial_density(spec: &SimulationSpec) -> f64 {
@@ -680,6 +894,108 @@ mod tests {
             ]),
             values: KernelValues::Explicit(vec![2.0, 4.0]),
         }
+    }
+
+    #[test]
+    fn experiment_load_restores_seed_dimensions_and_cells() {
+        let mut world = World::new(3, 2);
+        world.replace_cells(&[0.0, 0.25, 0.5, 0.75, 1.0, 0.125]);
+        let mut file = crate::sim::experiment::ExperimentFile::from_parts(
+            crate::sim::experiment::ExperimentMetadata {
+                name: "fixture".to_string(),
+                ..Default::default()
+            },
+            SimulationSpec::conway(),
+            &world,
+            77,
+        )
+        .unwrap();
+        file.cells[0] = 0.9;
+
+        let app = app_for_experiment(file).unwrap();
+
+        assert_eq!((app.world().width(), app.world().height()), (3, 2));
+        assert_eq!(app.world().cells()[0], 0.9);
+        assert_eq!(app.seed(), 77);
+    }
+
+    #[test]
+    fn panel_navigation_cycles_editor_contexts() {
+        let mut app = App::new(SimulationSpec::conway(), 4, 4);
+        assert_eq!(app.active_panel(), Panel::Overview);
+
+        app.handle_command(Command::NextPanel);
+        assert_eq!(app.active_panel(), Panel::Rule);
+        app.handle_command(Command::NextPanel);
+        assert_eq!(app.active_panel(), Panel::Kernel);
+        app.handle_command(Command::NextPanel);
+        assert_eq!(app.active_panel(), Panel::Topology);
+        app.handle_command(Command::NextPanel);
+        assert_eq!(app.active_panel(), Panel::Errors);
+        app.handle_command(Command::NextPanel);
+        assert_eq!(app.active_panel(), Panel::Overview);
+    }
+
+    #[test]
+    fn expression_editor_commits_valid_input_and_keeps_invalid_input_editable() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 4, 3);
+        app.handle_command(Command::ToggleExpressionEditor);
+        assert!(app.expression_editing());
+        app.replace_expression_buffer("0.5");
+        app.handle_expression_key(KeyEvent::new(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(!app.expression_editing());
+
+        app.handle_command(Command::ToggleExpressionEditor);
+        app.replace_expression_buffer("unknown");
+        app.handle_expression_key(KeyEvent::new(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(app.expression_editing());
+        assert!(
+            app.backend_error()
+                .is_some_and(|error| error.contains("unknown"))
+        );
+        app.handle_expression_key(KeyEvent::new(
+            KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert!(!app.expression_editing());
+    }
+
+    #[test]
+    fn performance_stats_track_step_and_render_averages() {
+        let mut app = App::new(SimulationSpec::conway(), 2, 2);
+        app.record_step_duration(Duration::from_millis(2));
+        app.record_step_duration(Duration::from_millis(4));
+        app.record_render_duration(Duration::from_millis(1));
+
+        let stats = app.performance();
+        assert_eq!(stats.step_samples, 2);
+        assert_eq!(stats.last_step_ms, 4.0);
+        assert_eq!(stats.average_step_ms, 3.0);
+        assert_eq!(stats.render_samples, 1);
+        assert_eq!(stats.last_render_ms, 1.0);
+    }
+
+    #[test]
+    fn app_saves_a_reproducible_experiment_file() {
+        let mut app = App::new(SimulationSpec::conway(), 2, 2);
+        app.world_mut().replace_cells(&[0.1, 0.2, 0.3, 0.4]);
+        let path = std::env::temp_dir().join(format!(
+            "cellarium-app-experiment-{}.ron",
+            std::process::id()
+        ));
+
+        app.save_experiment(&path).unwrap();
+        let loaded = crate::sim::experiment::load_experiment(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(loaded.world_size, [2, 2]);
+        assert_eq!(loaded.cells, vec![0.1, 0.2, 0.3, 0.4]);
     }
 
     #[test]

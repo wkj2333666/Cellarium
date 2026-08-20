@@ -14,12 +14,14 @@ fn main() {
 fn kernel_file_cli_errors_include_concise_usage() {
     assert_eq!(
         cli_error("unexpected argument"),
-        "cellarium: unexpected argument\nusage: cellarium [--kernel <path>]"
+        "cellarium: unexpected argument\nusage: cellarium [--kernel <path>] [--experiment <path>] [--save-experiment <path>]"
     );
 }
 
 fn cli_error(message: &str) -> String {
-    format!("cellarium: {message}\nusage: cellarium [--kernel <path>]")
+    format!(
+        "cellarium: {message}\nusage: cellarium [--kernel <path>] [--experiment <path>] [--save-experiment <path>]"
+    )
 }
 
 #[derive(Debug)]
@@ -45,16 +47,69 @@ fn startup<I>(args: I) -> Result<(), Box<dyn Error>>
 where
     I: IntoIterator<Item = OsString>,
 {
-    let kernel_path = match parse_kernel_path(args) {
-        Ok(Some(kernel_path)) => kernel_path,
-        Ok(None) => return Ok(cellarium::app::run()?),
-        Err(message) => return Err(Box::new(CliError(message))),
-    };
-
-    let definition = load_kernel(&kernel_path)?;
-    Ok(cellarium::app::run_with_kernel(definition)?)
+    let options = parse_cli(args).map_err(CliError)?;
+    if let Some(experiment_path) = options.experiment {
+        let file = cellarium::sim::experiment::load_experiment(&experiment_path)?;
+        if let Some(save_path) = options.save_experiment {
+            return Ok(cellarium::app::run_with_experiment_and_save(
+                file, save_path,
+            )?);
+        }
+        return Ok(cellarium::app::run_with_experiment(file)?);
+    }
+    if let Some(kernel_path) = options.kernel {
+        let definition = load_kernel(&kernel_path)?;
+        if let Some(save_path) = options.save_experiment {
+            return Ok(cellarium::app::run_with_kernel_and_save(
+                definition, save_path,
+            )?);
+        }
+        return Ok(cellarium::app::run_with_kernel(definition)?);
+    }
+    if let Some(save_path) = options.save_experiment {
+        return Ok(cellarium::app::run_with_save(save_path)?);
+    }
+    Ok(cellarium::app::run()?)
 }
 
+#[derive(Debug, Default, PartialEq, Eq)]
+struct CliOptions {
+    kernel: Option<PathBuf>,
+    experiment: Option<PathBuf>,
+    save_experiment: Option<PathBuf>,
+}
+
+fn parse_cli<I>(args: I) -> Result<CliOptions, &'static str>
+where
+    I: IntoIterator<Item = OsString>,
+{
+    let mut options = CliOptions::default();
+    let mut args = args.into_iter();
+    while let Some(argument) = args.next() {
+        let flag = argument.to_string_lossy();
+        let target = match flag.as_ref() {
+            "--kernel" => &mut options.kernel,
+            "--experiment" => &mut options.experiment,
+            "--save-experiment" => &mut options.save_experiment,
+            _ => return Err("unexpected argument"),
+        };
+        if target.is_some() {
+            return Err("duplicate argument");
+        }
+        let path = args.next().ok_or(match flag.as_ref() {
+            "--kernel" => "--kernel requires a path",
+            "--experiment" => "--experiment requires a path",
+            _ => "--save-experiment requires a path",
+        })?;
+        *target = Some(PathBuf::from(path));
+    }
+    if options.kernel.is_some() && options.experiment.is_some() {
+        return Err("--kernel and --experiment cannot be combined");
+    }
+    Ok(options)
+}
+
+#[allow(dead_code)]
 fn parse_kernel_path<I>(args: I) -> Result<Option<PathBuf>, &'static str>
 where
     I: IntoIterator<Item = OsString>,
@@ -77,6 +132,24 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_parses_experiment_load_and_save_options() {
+        let options = parse_cli([
+            OsString::from("--experiment"),
+            OsString::from("/tmp/input.ron"),
+            OsString::from("--save-experiment"),
+            OsString::from("/tmp/output.ron"),
+        ])
+        .unwrap();
+
+        assert_eq!(options.experiment, Some(PathBuf::from("/tmp/input.ron")));
+        assert_eq!(
+            options.save_experiment,
+            Some(PathBuf::from("/tmp/output.ron"))
+        );
+        assert_eq!(options.kernel, None);
+    }
 
     #[test]
     fn kernel_file_cli_parses_the_exact_flag_and_path() {
