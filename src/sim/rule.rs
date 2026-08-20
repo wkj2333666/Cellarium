@@ -1,13 +1,11 @@
+use crate::sim::kernel::{KernelDefinition, KernelValues, Normalization, ring_definition};
+
+pub use crate::sim::kernel::Kernel;
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum Rule {
     Conway,
     Lenia { mu: f32, sigma: f32 },
-}
-
-#[derive(Clone, Debug, PartialEq)]
-pub struct Kernel {
-    pub radius: usize,
-    pub values: Vec<f32>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -21,10 +19,7 @@ impl SimulationSpec {
     pub fn conway() -> Self {
         Self {
             rule: Rule::Conway,
-            kernel: Kernel {
-                radius: 0,
-                values: Vec::new(),
-            },
+            kernel: empty_kernel(),
             dt: 1.0,
         }
     }
@@ -35,36 +30,28 @@ impl SimulationSpec {
                 mu: 0.135,
                 sigma: 0.015,
             },
-            kernel: ring_kernel(13),
+            kernel: ring_definition(13, 0.5, 0.5)
+                .build()
+                .expect("the built-in ring kernel is valid"),
             dt: 0.1,
         }
     }
 }
 
-fn ring_kernel(radius: usize) -> Kernel {
-    let diameter = 2 * radius + 1;
-    let mut values = Vec::with_capacity(diameter * diameter);
-    let radius_f = radius as f32;
-
-    for y in 0..diameter {
-        for x in 0..diameter {
-            let dx = x as f32 - radius_f;
-            let dy = y as f32 - radius_f;
-            let distance = (dx * dx + dy * dy).sqrt() / radius_f;
-            let value = if (0.0..1.0).contains(&distance) {
-                (-4.0 * distance * (1.0 - distance)).exp()
-            } else {
-                0.0
-            };
-            values.push(value);
-        }
+fn empty_kernel() -> Kernel {
+    KernelDefinition {
+        name: "none".to_string(),
+        width: 1,
+        height: 1,
+        anchor_x: 0,
+        anchor_y: 0,
+        mask: Some(vec![false]),
+        normalization: Normalization::None,
+        parameters: Default::default(),
+        values: KernelValues::Explicit(vec![0.0]),
     }
-
-    let sum: f32 = values.iter().sum();
-    for value in &mut values {
-        *value /= sum;
-    }
-    Kernel { radius, values }
+    .build()
+    .expect("the empty kernel is valid")
 }
 
 #[cfg(test)]
@@ -76,18 +63,18 @@ mod tests {
         let spec = SimulationSpec::lenia_orbium();
         assert!(spec.kernel.values.iter().all(|value| value.is_finite()));
         assert!((spec.kernel.values.iter().sum::<f32>() - 1.0).abs() < 1e-5);
-        assert_eq!(
-            spec.kernel.values.len(),
-            (2 * spec.kernel.radius + 1).pow(2)
-        );
+        assert_eq!(spec.kernel.radius(), 12);
+        assert_eq!(spec.kernel.values.len(), 27 * 27);
     }
 
     #[test]
     fn conway_rule_has_no_convolution_kernel() {
         let spec = SimulationSpec::conway();
         assert_eq!(spec.rule, Rule::Conway);
-        assert_eq!(spec.kernel.radius, 0);
-        assert!(spec.kernel.values.is_empty());
+        assert_eq!(spec.kernel.name, "none");
+        assert_eq!(spec.kernel.mask, Some(vec![false]));
+        assert_eq!(spec.kernel.values, [0.0]);
+        assert_eq!(spec.kernel.radius(), 0);
         assert_eq!(spec.dt, 1.0);
     }
 
