@@ -1,3 +1,5 @@
+use crate::sim::kernel::{Kernel, KernelDefinition};
+use std::io::ErrorKind;
 use std::time::{Duration, Instant};
 
 use crate::input::Command;
@@ -260,6 +262,24 @@ impl RateMeter {
 }
 
 pub fn run() -> std::io::Result<()> {
+    let spec = SimulationSpec::lenia_orbium();
+    let backend = SimulationBackend::cuda_or_cpu(spec.clone(), 256, 256);
+    run_app(App::with_backend(spec, 256, 256, backend))
+}
+
+pub fn run_with_kernel(kernel: KernelDefinition) -> std::io::Result<()> {
+    run_app(app_for_kernel(kernel)?)
+}
+
+fn app_for_kernel(kernel: KernelDefinition) -> std::io::Result<App> {
+    let mut spec = SimulationSpec::lenia_orbium();
+    spec.kernel = Kernel::try_from(kernel)
+        .map_err(|error| std::io::Error::new(ErrorKind::InvalidInput, error))?;
+    let backend = SimulationBackend::cuda_or_cpu(spec.clone(), 256, 256);
+    Ok(App::with_backend(spec, 256, 256, backend))
+}
+
+fn run_app(app: App) -> std::io::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
     let _terminal_guard = TerminalGuard;
     let mut stdout = std::io::stdout();
@@ -273,7 +293,7 @@ pub fn run() -> std::io::Result<()> {
     (|| {
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let mut terminal = ratatui::Terminal::new(backend)?;
-        run_loop(&mut terminal)
+        run_loop(app, &mut terminal)
     })()
 }
 
@@ -292,10 +312,7 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn run_loop(terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
-    let spec = SimulationSpec::lenia_orbium();
-    let backend = SimulationBackend::cuda_or_cpu(spec.clone(), 256, 256);
-    let mut app = App::with_backend(spec, 256, 256, backend);
+fn run_loop(mut app: App, terminal: &mut ratatui::DefaultTerminal) -> std::io::Result<()> {
     let display = crate::render::display::ViewportDisplay::detect();
     let mut tracker = crate::input::MouseTracker::new();
     let mut simulation_meter = RateMeter::new(Duration::from_secs(1));
@@ -383,9 +400,31 @@ pub fn rule_name(spec: &SimulationSpec) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::kernel::{KernelValues, Normalization};
 
     fn cuda_available() -> bool {
         crate::sim::cuda::CudaBackend::new(SimulationSpec::conway(), 1, 1).is_ok()
+    }
+
+    #[test]
+    fn kernel_file_custom_definition_becomes_the_active_selected_kernel() {
+        let app = app_for_kernel(KernelDefinition {
+            name: "custom".to_string(),
+            width: 2,
+            height: 1,
+            anchor_x: 1,
+            anchor_y: 0,
+            mask: None,
+            normalization: Normalization::None,
+            parameters: Default::default(),
+            values: KernelValues::Explicit(vec![2.0, 4.0]),
+        })
+        .unwrap();
+
+        assert_eq!(app.spec().kernel.name, "custom");
+        assert_eq!(app.spec().kernel.width, 2);
+        assert_eq!(app.spec().kernel.height, 1);
+        assert_eq!(app.spec().kernel.values, vec![2.0, 4.0]);
     }
 
     #[test]

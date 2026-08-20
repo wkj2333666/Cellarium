@@ -3,5 +3,6 @@ pub mod cpu;
 pub mod cuda;
 pub mod expression;
 pub mod kernel;
+pub mod kernel_file;
 pub mod rule;
 pub mod world;
