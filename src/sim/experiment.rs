@@ -51,6 +51,19 @@ pub struct ExperimentFile {
     pub topology: Option<ExperimentTopology>,
 }
 
+#[derive(Clone, Debug, PartialEq, Deserialize)]
+struct ExperimentWire {
+    format_version: u32,
+    #[serde(default)]
+    metadata: ExperimentMetadata,
+    world_size: [usize; 2],
+    seed: u64,
+    cells: Vec<f32>,
+    rule: ExperimentRule,
+    #[serde(default)]
+    topology: Option<ExperimentTopology>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct BuiltExperiment {
     pub metadata: ExperimentMetadata,
@@ -217,10 +230,23 @@ pub fn load_experiment(path: impl AsRef<Path>) -> Result<ExperimentFile, Experim
         path: display.clone(),
         source,
     })?;
-    let file: ExperimentFile = ron::from_str(&source).map_err(|source| ExperimentError::Parse {
+    let wire: ExperimentWire = ron::from_str(&source).map_err(|source| ExperimentError::Parse {
         path: display,
         source,
     })?;
+    let file = ExperimentFile {
+        format_version: if wire.format_version == 0 {
+            EXPERIMENT_FORMAT_VERSION
+        } else {
+            wire.format_version
+        },
+        metadata: wire.metadata,
+        world_size: wire.world_size,
+        seed: wire.seed,
+        cells: wire.cells,
+        rule: wire.rule,
+        topology: wire.topology,
+    };
     file.validate()?;
     Ok(file)
 }
@@ -349,5 +375,31 @@ mod tests {
         let built = file.build().unwrap();
         assert_eq!(built.spec.dt, 1.0);
         assert_eq!(built.cells, vec![1.0]);
+    }
+
+    #[test]
+    fn legacy_version_zero_experiment_migrates_to_current_schema() {
+        let path = std::env::temp_dir().join(format!(
+            "cellarium-experiment-{}-legacy.ron",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            r#"(
+                format_version: 0,
+                world_size: (1, 1),
+                seed: 3,
+                cells: [1.0],
+                rule: Conway,
+            )"#,
+        )
+        .unwrap();
+
+        let loaded = load_experiment(&path).unwrap();
+        let _ = std::fs::remove_file(path);
+
+        assert_eq!(loaded.format_version, EXPERIMENT_FORMAT_VERSION);
+        assert_eq!(loaded.metadata, ExperimentMetadata::default());
+        assert!(matches!(loaded.rule, ExperimentRule::Conway));
     }
 }

@@ -10,10 +10,11 @@ The compatibility rules are deliberately conservative:
 
 1. A loader validates world dimensions, finite state values, kernel definitions,
    rule-program symbols, and optional lattice topology before construction.
-2. A newer format version is rejected with an explicit error instead of being
-   partially interpreted.
-3. Future migrations should add a pure version-to-version conversion before
-   validation. The runtime model should only receive the current schema.
+2. Version `0` is migrated in memory to the current version with default
+   metadata; newer unknown versions are rejected with an explicit error instead
+   of being partially interpreted.
+3. Future migrations should add another pure version-to-version conversion
+   before validation. The runtime model should only receive the current schema.
 4. Backend selection remains an implementation detail. The same experiment can
    be rebuilt on CPU or CUDA without changing its serialized rule.
 

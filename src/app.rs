@@ -6,6 +6,7 @@ use std::time::{Duration, Instant};
 
 use crate::input::Command;
 use crate::render::camera::Camera;
+use crate::render::raster::{Framebuffer, rasterize_world_into};
 use crate::sim::backend::{BackendKind, SimulationBackend};
 use crate::sim::experiment::{ExperimentError, ExperimentFile, ExperimentMetadata};
 use crate::sim::rule::SimulationSpec;
@@ -66,6 +67,7 @@ pub struct App {
     active_panel: Panel,
     expression_editing: bool,
     expression_buffer: String,
+    framebuffer: Option<Framebuffer>,
     performance: PerformanceStats,
 }
 
@@ -106,6 +108,7 @@ impl App {
             active_panel: Panel::Overview,
             expression_editing: false,
             expression_buffer: String::new(),
+            framebuffer: None,
             performance: PerformanceStats::default(),
         }
     }
@@ -278,6 +281,23 @@ impl App {
             &mut self.performance.average_render_ms,
             &mut self.performance.render_samples,
         );
+    }
+
+    pub fn render_framebuffer(&mut self, width: usize, height: usize) -> &Framebuffer {
+        let needs_resize = self
+            .framebuffer
+            .as_ref()
+            .is_none_or(|frame| frame.width() != width || frame.height() != height);
+        if needs_resize {
+            self.framebuffer = Some(Framebuffer::new(width, height));
+        }
+        let camera = self.camera;
+        let framebuffer = self
+            .framebuffer
+            .as_mut()
+            .expect("framebuffer is initialized");
+        rasterize_world_into(&self.world, &camera, framebuffer);
+        framebuffer
     }
 
     pub fn set_viewport(&mut self, viewport: Rect, frame_size: [usize; 2]) {

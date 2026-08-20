@@ -1,6 +1,5 @@
 use crate::app::App;
 use crate::render::display::ViewportDisplay;
-use crate::render::raster::rasterize_world;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -34,10 +33,9 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App, display: &ViewportDisplay
     app.set_viewport(viewport, [frame_width, frame_height]);
 
     if viewport.width > 0 && viewport.height > 0 {
-        let camera = *app.camera();
-        let framebuffer = rasterize_world(app.world(), &camera, frame_width, frame_height);
+        let framebuffer = app.render_framebuffer(frame_width, frame_height);
         frame.render_widget(block, viewport_area);
-        display.render(frame, viewport, &framebuffer);
+        display.render(frame, viewport, framebuffer);
     }
 
     if outer.width >= 96 {

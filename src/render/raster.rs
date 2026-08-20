@@ -54,6 +54,13 @@ impl Framebuffer {
 
 pub fn rasterize_world(world: &World, camera: &Camera, width: usize, height: usize) -> Framebuffer {
     let mut frame = Framebuffer::new(width, height);
+    rasterize_world_into(world, camera, &mut frame);
+    frame
+}
+
+pub fn rasterize_world_into(world: &World, camera: &Camera, frame: &mut Framebuffer) {
+    let width = frame.width;
+    let height = frame.height;
     for y in 0..height {
         for x in 0..width {
             let world_position =
@@ -64,7 +71,6 @@ pub fn rasterize_world(world: &World, camera: &Camera, width: usize, height: usi
             frame.set(x, y, value_to_rgb(value));
         }
     }
-    frame
 }
 
 pub fn value_to_rgb(value: f32) -> Rgb8 {
@@ -105,6 +111,18 @@ mod tests {
         assert_eq!(frame.height(), 6);
         assert_ne!(frame.get(2, 2), frame.get(0, 0));
         assert_eq!(frame.get(2, 2), value_to_rgb(1.0));
+    }
+
+    #[test]
+    fn rasterizes_into_reusable_framebuffer_storage() {
+        let mut world = World::new(2, 2);
+        world.set(0, 0, 1.0);
+        let camera = Camera::new([0.5, 0.5], 1.0);
+        let mut frame = Framebuffer::new(2, 2);
+
+        rasterize_world_into(&world, &camera, &mut frame);
+
+        assert_eq!(frame.get(0, 0), value_to_rgb(1.0));
     }
 
     #[test]
