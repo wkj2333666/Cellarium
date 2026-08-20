@@ -188,6 +188,9 @@ impl TryFrom<KernelDefinition> for Kernel {
             for value in &mut values {
                 *value /= sum;
             }
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(KernelError::InvalidNormalizationSum);
+            }
         }
 
         let legacy_shape = LegacyKernelShape {
@@ -632,5 +635,25 @@ mod tests {
         tiny.values = KernelValues::Explicit(vec![1e-13; 6]);
         tiny.mask = None;
         assert_eq!(tiny.build(), Err(KernelError::InvalidNormalizationSum));
+    }
+
+    #[test]
+    fn rejects_normalization_that_produces_non_finite_values() {
+        let definition = KernelDefinition {
+            name: "catastrophic-cancellation".to_string(),
+            width: 3,
+            height: 1,
+            anchor_x: 1,
+            anchor_y: 0,
+            mask: None,
+            normalization: Normalization::Sum,
+            parameters: BTreeMap::new(),
+            values: KernelValues::Explicit(vec![f32::MAX, -f32::MAX, 2e-12]),
+        };
+
+        assert_eq!(
+            definition.build(),
+            Err(KernelError::InvalidNormalizationSum)
+        );
     }
 }
