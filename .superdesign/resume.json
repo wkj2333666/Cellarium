@@ -1,0 +1,35 @@
+{
+  "schemaVersion": 1,
+  "targets": {
+    "experiment-workbench": {
+      "targetKind": "new-ui",
+      "projectId": "32fb2911-7978-4d63-a2c8-7e53edb58090",
+      "activeDraftId": "10e803dd-1eb6-4cfc-8a91-e2421dbe4ead",
+      "designSystemPath": ".superdesign/design-system.md",
+      "referenceIds": [
+        "8072ec81-5fe8-42fc-94c9-853a1dc50fc3"
+      ],
+      "contextFiles": [
+        ".superdesign/design-system.md"
+      ],
+      "fingerprints": {
+        ".superdesign/design-system.md": "de974151096af6f90cda6c55e0de7a482ba2541a6018f868cf0e3efac3dd2615"
+      },
+      "components": [],
+      "drafts": {
+        "1f5359e4-5ad5-4acd-9d85-1f4872a38e9f": {
+          "title": "A — Canvas-first Cellarium Workbench",
+          "visualDirection": "top tabs, large editor canvas, persistent right inspector",
+          "currentVersion": 1
+        },
+        "10e803dd-1eb6-4cfc-8a91-e2421dbe4ead": {
+          "title": "B — Outline-first Cellarium Workbench",
+          "visualDirection": "persistent left experiment outline, center canvas, right inspector",
+          "parentDraftId": "1f5359e4-5ad5-4acd-9d85-1f4872a38e9f",
+          "currentVersion": 1
+        }
+      },
+      "updatedAt": "2026-08-21T22:46:34+08:00"
+    }
+  }
+}
