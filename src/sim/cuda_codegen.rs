@@ -39,6 +39,13 @@ pub fn generate_cuda_source(
     })
 }
 
+pub fn generate_cuda_expression(
+    expression: &KernelExpression,
+    symbols: &BTreeSet<String>,
+) -> Result<String, CodegenError> {
+    generate_expression(expression, 0, symbols)
+}
+
 fn generate_expression(
     expression: &KernelExpression,
     depth: usize,

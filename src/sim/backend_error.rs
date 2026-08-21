@@ -28,4 +28,6 @@ pub enum BackendError {
     CudaNotCompiled,
     #[error("CUDA runtime libraries are unavailable")]
     CudaUnavailable,
+    #[error("multi-channel runtime error: {0}")]
+    Runtime(#[from] crate::sim::runtime::RuntimeError),
 }

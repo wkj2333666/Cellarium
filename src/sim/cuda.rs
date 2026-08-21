@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::{
@@ -10,12 +10,14 @@ use cudarc::nvrtc::{Ptx, compile_ptx};
 
 pub use crate::sim::backend_error::BackendError;
 use crate::sim::cuda_codegen::{
-    generate_cuda_source, generate_program_cuda_source, generate_topology_cuda_source,
-    program_kernel_data,
+    generate_cuda_expression, generate_cuda_source, generate_program_cuda_source,
+    generate_topology_cuda_source, program_kernel_data,
 };
+use crate::sim::experiment_model::UpdateMode;
 use crate::sim::expression::KernelExpression;
 use crate::sim::program::InputSource;
 use crate::sim::rule::{Rule, SimulationSpec};
+use crate::sim::runtime::{CompiledExperiment, RuntimeError};
 use crate::sim::topology::CompiledTopology;
 use crate::sim::world::{ChannelWorld, World};
 
@@ -55,6 +57,36 @@ pub struct CudaBackend {
     channel_count: usize,
     tick: u64,
     device_name: String,
+}
+
+pub struct CudaExperimentBackend {
+    stream: Arc<CudaStream>,
+    functions: Vec<CudaFunction>,
+    kernel_values: CudaSlice<f32>,
+    kernel_masks: CudaSlice<i32>,
+    kernel_offsets: CudaSlice<i32>,
+    kernel_widths: CudaSlice<i32>,
+    kernel_heights: CudaSlice<i32>,
+    kernel_anchor_x: CudaSlice<i32>,
+    kernel_anchor_y: CudaSlice<i32>,
+    kernel_sources: CudaSlice<i32>,
+    channel_constants: CudaSlice<f32>,
+    current: CudaSlice<f32>,
+    next: CudaSlice<f32>,
+    width: usize,
+    height: usize,
+    channels: usize,
+    boundary_mode: i32,
+    dt: f32,
+    rules: Vec<CudaTargetRule>,
+    tick: u64,
+    device_name: String,
+}
+
+struct CudaTargetRule {
+    target: usize,
+    mode: UpdateMode,
+    parameters: Vec<f32>,
 }
 
 static PTX_CACHE: OnceLock<Mutex<HashMap<String, String>>> = OnceLock::new();
@@ -436,10 +468,254 @@ impl CudaBackend {
     }
 }
 
+impl CudaExperimentBackend {
+    pub fn new(compiled: CompiledExperiment) -> Result<Self, BackendError> {
+        if compiled.width == 0
+            || compiled.height == 0
+            || compiled.rules.is_empty()
+            || compiled
+                .rules
+                .iter()
+                .any(|rule| rule.target >= compiled.rules.len())
+        {
+            return Err(BackendError::InvalidWorld);
+        }
+        let context = shared_context()?;
+        let stream = context.default_stream();
+        let device_name = context.name()?;
+        let mut functions = Vec::new();
+        let mut rules = Vec::new();
+        if compiled.rules.iter().any(|rule| !rule.frozen) {
+            let source =
+                generate_experiment_cuda_source(&compiled).map_err(BackendError::Runtime)?;
+            let module = load_cached_module(&context, &source.source)?;
+            for rule in &compiled.rules {
+                if rule.frozen {
+                    continue;
+                }
+                let entry_point = format!("cellarium_target_{}", rule.target);
+                functions.push(module.load_function(&entry_point)?);
+                rules.push(CudaTargetRule {
+                    target: rule.target,
+                    mode: rule.mode,
+                    parameters: rule.parameters.values().copied().collect(),
+                });
+            }
+        }
+
+        let mut values = Vec::new();
+        let mut masks = Vec::new();
+        let mut offsets = Vec::new();
+        let mut widths = Vec::new();
+        let mut heights = Vec::new();
+        let mut anchor_x = Vec::new();
+        let mut anchor_y = Vec::new();
+        let mut sources = Vec::new();
+        let mut constants = vec![0.0; compiled.rules.len()];
+        for rule in &compiled.rules {
+            for input in &rule.inputs {
+                offsets.push(i32::try_from(values.len()).map_err(|_| BackendError::InvalidWorld)?);
+                widths.push(
+                    i32::try_from(input.kernel.width).map_err(|_| BackendError::InvalidWorld)?,
+                );
+                heights.push(
+                    i32::try_from(input.kernel.height).map_err(|_| BackendError::InvalidWorld)?,
+                );
+                anchor_x.push(
+                    i32::try_from(input.kernel.anchor_x).map_err(|_| BackendError::InvalidWorld)?,
+                );
+                anchor_y.push(
+                    i32::try_from(input.kernel.anchor_y).map_err(|_| BackendError::InvalidWorld)?,
+                );
+                sources.push(i32::try_from(input.source).map_err(|_| BackendError::InvalidWorld)?);
+                constants[input.source] = input.boundary_constant;
+                values.extend_from_slice(&input.kernel.values);
+                masks.extend(input.kernel.mask.as_ref().map_or_else(
+                    || vec![1; input.kernel.values.len()],
+                    |mask| mask.iter().map(|active| i32::from(*active)).collect(),
+                ));
+            }
+        }
+        if values.is_empty() {
+            values.push(0.0);
+            masks.push(0);
+        }
+        let cell_count = compiled.width * compiled.height;
+        let total = cell_count * compiled.rules.len();
+        Ok(Self {
+            kernel_values: stream.clone_htod(&values)?,
+            kernel_masks: stream.clone_htod(&masks)?,
+            kernel_offsets: stream.clone_htod(&offsets)?,
+            kernel_widths: stream.clone_htod(&widths)?,
+            kernel_heights: stream.clone_htod(&heights)?,
+            kernel_anchor_x: stream.clone_htod(&anchor_x)?,
+            kernel_anchor_y: stream.clone_htod(&anchor_y)?,
+            kernel_sources: stream.clone_htod(&sources)?,
+            channel_constants: stream.clone_htod(&constants)?,
+            current: stream.alloc_zeros(total)?,
+            next: stream.alloc_zeros(total)?,
+            stream,
+            functions,
+            width: compiled.width,
+            height: compiled.height,
+            channels: compiled.rules.len(),
+            boundary_mode: boundary_mode(compiled.boundary),
+            dt: compiled.simulation_dt,
+            rules,
+            tick: 0,
+            device_name,
+        })
+    }
+
+    pub fn tick(&self) -> u64 {
+        self.tick
+    }
+
+    pub fn device_name(&self) -> &str {
+        &self.device_name
+    }
+
+    pub fn step(&mut self, world: &mut ChannelWorld) -> Result<(), BackendError> {
+        if world.width() != self.width
+            || world.height() != self.height
+            || world.channels() != self.channels
+        {
+            return Err(BackendError::InvalidWorld);
+        }
+        self.stream.memcpy_htod(world.cells(), &mut self.current)?;
+        self.stream.memcpy_htod(world.cells(), &mut self.next)?;
+        let width = self.width as i32;
+        let height = self.height as i32;
+        let boundary = self.boundary_mode;
+        let cell_count = (self.width * self.height) as u32;
+        for (function, rule) in self.functions.iter().zip(&self.rules) {
+            let target = rule.target as i32;
+            let mode = match rule.mode {
+                UpdateMode::GrowthRate => 0_i32,
+                UpdateMode::DirectUpdate => 1_i32,
+            };
+            let mut launch = self.stream.launch_builder(function);
+            launch
+                .arg(&mut self.next)
+                .arg(&self.current)
+                .arg(&self.kernel_values)
+                .arg(&self.kernel_masks)
+                .arg(&self.kernel_offsets)
+                .arg(&self.kernel_widths)
+                .arg(&self.kernel_heights)
+                .arg(&self.kernel_anchor_x)
+                .arg(&self.kernel_anchor_y)
+                .arg(&self.kernel_sources)
+                .arg(&self.channel_constants)
+                .arg(&width)
+                .arg(&height)
+                .arg(&boundary)
+                .arg(&target)
+                .arg(&mode)
+                .arg(&self.dt);
+            for parameter in &rule.parameters {
+                launch.arg(parameter);
+            }
+            unsafe { launch.launch(LaunchConfig::for_num_elems(cell_count)) }?;
+        }
+        let updated = self.stream.clone_dtoh(&self.next)?;
+        self.stream.synchronize()?;
+        world
+            .replace_all(&updated)
+            .map_err(|error| BackendError::Runtime(RuntimeError::World(error)))?;
+        std::mem::swap(&mut self.current, &mut self.next);
+        self.tick += 1;
+        Ok(())
+    }
+}
+
+fn boundary_mode(boundary: crate::sim::runtime::CompiledBoundary) -> i32 {
+    match boundary {
+        crate::sim::runtime::CompiledBoundary::Open => 0,
+        crate::sim::runtime::CompiledBoundary::Constant => 1,
+        crate::sim::runtime::CompiledBoundary::Periodic => 2,
+        crate::sim::runtime::CompiledBoundary::Clamp => 3,
+        crate::sim::runtime::CompiledBoundary::Reflect => 4,
+    }
+}
+
+fn generate_experiment_cuda_source(
+    compiled: &CompiledExperiment,
+) -> Result<crate::sim::cuda_codegen::GeneratedCudaSource, RuntimeError> {
+    let mut source = String::from(EXPERIMENT_CUDA_HEADER);
+    let mut input_index = 0;
+    for rule in &compiled.rules {
+        if rule.frozen {
+            continue;
+        }
+        let mut symbols = BTreeSet::from(["self".to_string()]);
+        symbols.extend(rule.parameters.keys().cloned());
+        symbols.extend(rule.inputs.iter().map(|input| input.symbol.clone()));
+        let expression = generate_cuda_expression(&rule.update, &symbols)
+            .map_err(|error| RuntimeError::Model(error.to_string()))?;
+        let locals = rule
+            .inputs
+            .iter()
+            .map(|input| {
+                let line = format!(
+                    "float {symbol} = cellarium_convolve(current, kernel_values, kernel_masks, kernel_offsets, kernel_widths, kernel_heights, kernel_anchor_x, kernel_anchor_y, kernel_sources, channel_constants, width, height, boundary_mode, linear, {index});",
+                    symbol = input.symbol,
+                    index = input_index
+                );
+                input_index += 1;
+                line
+            })
+            .collect::<Vec<_>>()
+            .join("\n    ");
+        let params = rule
+            .parameters
+            .keys()
+            .map(|name| format!(", float {name}"))
+            .collect::<String>();
+        let mode = match rule.mode {
+            UpdateMode::GrowthRate => "fminf(1.0f, fmaxf(0.0f, self + dt * (EXPR)))",
+            UpdateMode::DirectUpdate => "fminf(1.0f, fmaxf(0.0f, EXPR))",
+        }
+        .replace("EXPR", &expression);
+        source.push_str(&format!(
+            "extern \"C\" __global__ void cellarium_target_{target}(float* next, const float* current, const float* kernel_values, const int* kernel_masks, const int* kernel_offsets, const int* kernel_widths, const int* kernel_heights, const int* kernel_anchor_x, const int* kernel_anchor_y, const int* kernel_sources, const float* channel_constants, int width, int height, int boundary_mode, int target, int mode, float dt{params}) {{ int linear = (int)(blockIdx.x * blockDim.x + threadIdx.x); int cell_count = width * height; if (linear >= cell_count) return; int x = linear % width; int y = linear / width; float self = current[target * cell_count + linear]; {locals} next[target * cell_count + linear] = {mode}; }}\n",
+            target = rule.target,
+            params = params,
+            locals = locals,
+            mode = mode,
+        ));
+    }
+    Ok(crate::sim::cuda_codegen::GeneratedCudaSource {
+        source,
+        entry_point: "cellarium_target_0",
+    })
+}
+
+const EXPERIMENT_CUDA_HEADER: &str = r#"
+extern "C" __device__ int cellarium_index(int value, int size, int mode, int* valid) {
+    if (value >= 0 && value < size) { *valid = 1; return value; }
+    if (mode == 0) { *valid = 0; return 0; }
+    if (mode == 1) { *valid = 0; return 0; }
+    if (mode == 2) { int wrapped = value % size; return wrapped < 0 ? wrapped + size : wrapped; }
+    if (mode == 3) { return value < 0 ? 0 : (value >= size ? size - 1 : value); }
+    int span = size - 1; if (span == 0) return 0; int period = span * 2; int folded = value % period; if (folded < 0) folded += period; return folded <= span ? folded : period - folded;
+}
+extern "C" __device__ float cellarium_convolve(const float* current, const float* values, const int* masks, const int* offsets, const int* widths, const int* heights, const int* anchors_x, const int* anchors_y, const int* sources, const float* constants, int width, int height, int boundary_mode, int linear, int input) {
+    int x = linear % width; int y = linear / width; float result = 0.0f;
+    for (int ky = 0; ky < heights[input]; ++ky) for (int kx = 0; kx < widths[input]; ++kx) { int ki = offsets[input] + ky * widths[input] + kx; if (!masks[ki]) continue; int valid_x = 1; int valid_y = 1; int nx = cellarium_index(x + kx - anchors_x[input], width, boundary_mode, &valid_x); int ny = cellarium_index(y + ky - anchors_y[input], height, boundary_mode, &valid_y); float sample = (valid_x && valid_y) ? current[sources[input] * width * height + ny * width + nx] : (boundary_mode == 1 ? constants[sources[input]] : 0.0f); result += values[ki] * sample; } return result;
+}
+"#;
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sim::cpu::CpuBackend;
+    #[cfg(feature = "cuda")]
+    use crate::sim::cpu::CpuExperimentBackend;
+    #[cfg(feature = "cuda")]
+    use crate::sim::experiment_model::{
+        ExperimentSpec, GrowthSource, KernelId, KernelSlot, UpdateMode,
+    };
     use crate::sim::kernel::{KernelDefinition, KernelValues, Normalization};
     use crate::sim::parser::parse_expression;
     use crate::sim::program::{RuleInput, RuleProgram};
@@ -448,8 +724,61 @@ mod tests {
         Basis2, BoardSpec, BoundarySpec, DomainSpec, LatticeSpec, NeighborTemplate, SiteSpec,
         compile_topology,
     };
+    #[cfg(feature = "cuda")]
+    use crate::sim::world::ChannelWorld;
     use crate::sim::world::World;
     use std::collections::BTreeMap;
+
+    #[cfg(feature = "cuda")]
+    fn routed_two_channel_fixture() -> ExperimentSpec {
+        let mut spec = ExperimentSpec::single_channel_lenia(2, 1);
+        spec.kernels.clear();
+        spec.growth.clear();
+        let first = spec.channels[0].id;
+        let second = spec.add_channel("second", false);
+        spec.kernels = vec![
+            KernelSlot::identity(KernelId(10), "from_second", second, first),
+            KernelSlot::identity(KernelId(20), "from_first", first, second),
+        ];
+        spec.growth = vec![
+            GrowthSource {
+                target: first,
+                kernel_inputs: vec![KernelId(10)],
+                parameters: BTreeMap::new(),
+                source: "from_second".to_string(),
+                mode: UpdateMode::DirectUpdate,
+            },
+            GrowthSource {
+                target: second,
+                kernel_inputs: vec![KernelId(20)],
+                parameters: BTreeMap::new(),
+                source: "from_first".to_string(),
+                mode: UpdateMode::DirectUpdate,
+            },
+        ];
+        spec
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn multi_target_cuda_matches_cpu_or_skips_without_driver() {
+        let spec = routed_two_channel_fixture();
+        let compiled = crate::sim::runtime::compile_experiment(&spec).unwrap();
+        let Ok(mut gpu) = CudaExperimentBackend::new(compiled.clone()) else {
+            return;
+        };
+        let mut cpu_world =
+            ChannelWorld::from_channels(2, 1, &[vec![0.25, 0.5], vec![0.75, 0.25]]).unwrap();
+        let mut gpu_world =
+            ChannelWorld::from_channels(2, 1, &[vec![0.25, 0.5], vec![0.75, 0.25]]).unwrap();
+        CpuExperimentBackend::new(compiled)
+            .step(&mut cpu_world)
+            .unwrap();
+        gpu.step(&mut gpu_world).unwrap();
+        for (lhs, rhs) in cpu_world.cells().iter().zip(gpu_world.cells()) {
+            assert!((lhs - rhs).abs() < 1e-5, "{lhs} != {rhs}");
+        }
+    }
 
     fn kernel_spec(definition: KernelDefinition) -> SimulationSpec {
         SimulationSpec {
