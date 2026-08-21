@@ -1339,6 +1339,35 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
         let now = Instant::now();
         let elapsed = now - last_iteration;
         last_iteration = now;
+
+        let wait = render_interval
+            .saturating_sub(now.duration_since(last_render))
+            .min(Duration::from_millis(5));
+        if crossterm::event::poll(wait)? {
+            match crossterm::event::read()? {
+                Event::Key(key) => {
+                    if app.expression_editing() {
+                        app.handle_expression_key(key);
+                        continue;
+                    }
+                    if let Some(command) = crate::input::translate_key(&key) {
+                        if command == Command::Quit {
+                            if let Some(path) = save_path {
+                                app.save_experiment(path).map_err(std::io::Error::other)?;
+                            }
+                            break;
+                        }
+                        app.handle_command(command);
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    app.handle_mouse(mouse, &mut tracker);
+                }
+                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
+                Event::Paste(_) => {}
+            }
+        }
+
         if app.paused() {
             simulation_backlog = Duration::ZERO;
         } else {
@@ -1371,34 +1400,6 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
             })?;
             app.record_render_duration(render_started.elapsed());
             last_render = now;
-        }
-
-        let wait = render_interval
-            .saturating_sub(now.duration_since(last_render))
-            .min(Duration::from_millis(5));
-        if crossterm::event::poll(wait)? {
-            match crossterm::event::read()? {
-                Event::Key(key) => {
-                    if app.expression_editing() {
-                        app.handle_expression_key(key);
-                        continue;
-                    }
-                    if let Some(command) = crate::input::translate_key(&key) {
-                        if command == Command::Quit {
-                            if let Some(path) = save_path {
-                                app.save_experiment(path).map_err(std::io::Error::other)?;
-                            }
-                            break;
-                        }
-                        app.handle_command(command);
-                    }
-                }
-                Event::Mouse(mouse) => {
-                    app.handle_mouse(mouse, &mut tracker);
-                }
-                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
-                Event::Paste(_) => {}
-            }
         }
     }
     Ok(())

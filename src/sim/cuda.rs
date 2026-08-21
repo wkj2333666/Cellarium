@@ -70,6 +70,12 @@ fn require_dynamic_library(present: bool) -> Result<(), BackendError> {
     }
 }
 
+fn nvrtc_available() -> bool {
+    // SAFETY: cudarc's presence probe only attempts to load candidate shared
+    // libraries and does not dereference caller-provided pointers.
+    unsafe { cudarc::nvrtc::sys::is_culib_present() }
+}
+
 fn shared_context() -> Result<Arc<CudaContext>, BackendError> {
     if let Some(context) = CUDA_CONTEXT.get() {
         return Ok(context.clone());
@@ -99,7 +105,7 @@ fn compile_cached(source: &str) -> Result<Ptx, BackendError> {
         return Ok(Ptx::from_src(ptx.clone()));
     }
 
-    require_dynamic_library(unsafe { cudarc::nvrtc::sys::is_culib_present() })?;
+    require_dynamic_library(nvrtc_available())?;
     let ptx = compile_ptx(source)?;
     evict_if_full(&mut cache);
     cache.insert(source.to_string(), ptx.to_src());
@@ -709,7 +715,7 @@ mod tests {
 
     #[test]
     fn runtime_compilation_cache_reuses_the_same_generated_source() {
-        if compile_ptx("extern \"C\" __global__ void probe() {}").is_err() {
+        if !nvrtc_available() {
             return;
         }
         let generated = generate_cuda_source(&KernelExpression::Constant(0.123_456_7)).unwrap();
@@ -753,7 +759,7 @@ mod tests {
 
     #[test]
     fn nvrtc_errors_retain_the_user_expression_source_mapping() {
-        if compile_ptx("extern \"C\" __global__ void probe() {}").is_err() {
+        if !nvrtc_available() {
             return;
         }
         let generated = generate_cuda_source(&KernelExpression::Constant(0.0)).unwrap();

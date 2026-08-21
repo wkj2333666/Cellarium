@@ -17,7 +17,7 @@ fn open_pty() -> (i32, i32) {
     assert_eq!(unsafe { libc::grantpt(master) }, 0);
     assert_eq!(unsafe { libc::unlockpt(master) }, 0);
 
-    let mut peer_name = [0_i8; 128];
+    let mut peer_name = [0 as libc::c_char; 128];
     assert_eq!(
         unsafe { libc::ptsname_r(master, peer_name.as_mut_ptr(), peer_name.len()) },
         0
@@ -173,6 +173,9 @@ fn nonresponsive_terminal_startup_accepts_quit_and_restores_terminal() {
     let mut child = spawn_on_pty(slave);
     unsafe { libc::close(slave) };
 
+    // Keep this terminal-startup regression independent of CPU simulation
+    // speed on runners without CUDA.
+    assert_eq!(unsafe { libc::write(master, b" ".as_ptr().cast(), 1) }, 1);
     let mut output = Vec::new();
     let rendered = pump_until(
         &mut child,
