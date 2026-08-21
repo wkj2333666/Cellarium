@@ -121,11 +121,13 @@ fn draw_footer(
 ) {
     frame.render_widget(Clear, area);
     let row1 = format!(
-        "Workbench · {} · {:?} · tick {} · display {}",
+        "Workbench · {}{} · {:?} · tick {} · display {}",
+        app.workbench_notice()
+            .map_or(String::new(), |notice| format!("{notice} · ")),
         app.workbench().section().label(),
         app.workbench().status(),
         app.tick(),
-        display.protocol().label()
+        display.protocol().label(),
     );
     let row2 = "[T] section  [Tab] focus  [Ctrl+Z/Y] undo/redo  [Ctrl+Enter] Apply  [Ctrl+S/E/O] files  [W] simulate  [?] help";
     let lines = vec![

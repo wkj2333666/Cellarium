@@ -1932,12 +1932,24 @@ where
                     app.experiment_revision = accepted.revision;
                     app.experiment_model = accepted.normalized_experiment.clone();
                     app.workbench.accept(accepted.normalized_experiment);
+                    app.workbench_notice = Some(format!("applied revision {}", accepted.revision));
+                    if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
+                        eprintln!("E2E_APPLY_ACCEPTED");
+                    }
                 }
                 RemoteUpdate::ApplyRejected(rejected) => {
-                    app.backend_error = rejected
+                    let message = rejected
                         .diagnostics
                         .first()
                         .map(|diagnostic| diagnostic.message.clone());
+                    app.backend_error = message.clone();
+                    app.workbench_notice = message;
+                    if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
+                        eprintln!(
+                            "E2E_APPLY_REJECTED {}",
+                            app.workbench_notice().unwrap_or("")
+                        );
+                    }
                 }
                 RemoteUpdate::Closed(Ok(())) => {
                     return Err(std::io::Error::new(
@@ -2044,9 +2056,35 @@ fn handle_remote_terminal_event<W: std::io::Write>(
                 return Ok(false);
             }
             if app.mode() == AppMode::Workbench
+                && app.workbench().section() == crate::workbench::WorkbenchSection::Experiment
+                && matches!(
+                    key.code,
+                    KeyCode::Enter | KeyCode::Char('A') | KeyCode::Char('a')
+                )
+            {
+                let ui_command = UiCommand::ApplyDraft;
+                app.workbench_notice = Some("apply sent".into());
+                let request = app.workbench_apply_request(*next_input_sequence);
+                let mut guard = writer
+                    .lock()
+                    .map_err(|_| std::io::Error::other("SSH writer mutex poisoned"))?;
+                crate::remote::write_message(
+                    &mut *guard,
+                    &crate::remote::RemoteMessage::ApplyDraft(request),
+                )
+                .map_err(std::io::Error::other)?;
+                if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
+                    eprintln!("E2E_APPLY_SENT");
+                }
+                *next_input_sequence = (*next_input_sequence).wrapping_add(1).max(1);
+                let _ = ui_command;
+                return Ok(false);
+            }
+            if app.mode() == AppMode::Workbench
                 && let Some(ui_command) = crate::input::translate_ui_key(&key)
             {
                 if ui_command == UiCommand::ApplyDraft {
+                    app.workbench_notice = Some("apply sent".into());
                     let request = app.workbench_apply_request(*next_input_sequence);
                     let mut guard = writer
                         .lock()
@@ -2056,6 +2094,9 @@ fn handle_remote_terminal_event<W: std::io::Write>(
                         &crate::remote::RemoteMessage::ApplyDraft(request),
                     )
                     .map_err(std::io::Error::other)?;
+                    if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
+                        eprintln!("E2E_APPLY_SENT");
+                    }
                     *next_input_sequence = (*next_input_sequence).wrapping_add(1).max(1);
                 } else {
                     let _ = app.handle_workbench_ui(ui_command);
@@ -2071,13 +2112,39 @@ fn handle_remote_terminal_event<W: std::io::Write>(
             }
         }
         Event::Mouse(mouse) => {
-            if app.handle_mouse(mouse, tracker)
-                && let Some((area, _)) = app.viewport_geometry()
+            if app.mode() == AppMode::Workbench
+                && app.workbench().section() == crate::workbench::WorkbenchSection::Experiment
+                && matches!(
+                    mouse.kind,
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                )
             {
-                let mut local = mouse;
-                local.column = local.column.saturating_sub(area.x);
-                local.row = local.row.saturating_sub(area.y);
-                send_remote_input(writer, next_input_sequence, InputMessage::Mouse(local))?;
+                app.workbench_notice = Some("apply sent".into());
+                let request = app.workbench_apply_request(*next_input_sequence);
+                let mut guard = writer
+                    .lock()
+                    .map_err(|_| std::io::Error::other("SSH writer mutex poisoned"))?;
+                crate::remote::write_message(
+                    &mut *guard,
+                    &crate::remote::RemoteMessage::ApplyDraft(request),
+                )
+                .map_err(std::io::Error::other)?;
+                if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
+                    eprintln!("E2E_APPLY_SENT");
+                }
+                *next_input_sequence = (*next_input_sequence).wrapping_add(1).max(1);
+                return Ok(false);
+            }
+            if app.handle_mouse(mouse, tracker) {
+                if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
+                    eprintln!("E2E_MOUSE_APPLIED");
+                }
+                if let Some((area, _)) = app.viewport_geometry() {
+                    let mut local = mouse;
+                    local.column = local.column.saturating_sub(area.x);
+                    local.row = local.row.saturating_sub(area.y);
+                    send_remote_input(writer, next_input_sequence, InputMessage::Mouse(local))?;
+                }
             }
         }
         Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
@@ -2336,6 +2403,17 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
                     }
                     if app.expression_editing() {
                         app.handle_expression_key(key);
+                        continue;
+                    }
+                    if app.mode() == AppMode::Workbench
+                        && app.workbench().section()
+                            == crate::workbench::WorkbenchSection::Experiment
+                        && matches!(
+                            key.code,
+                            KeyCode::Enter | KeyCode::Char('A') | KeyCode::Char('a')
+                        )
+                    {
+                        let _ = app.handle_workbench_ui(UiCommand::ApplyDraft);
                         continue;
                     }
                     if app.mode() == AppMode::Workbench

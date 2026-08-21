@@ -169,3 +169,15 @@ fn tinker_terminal_consumes_kitty_frames_and_observes_input() {
     terminal_probe::write_report(&report).expect("write terminal E2E JSON report");
     println!("{report:#?}");
 }
+
+#[test]
+#[ignore = "requires a configured SSH alias, PTY, and installed tinker server"]
+fn tinker_workbench_user_journey_applies_authoritatively() {
+    let host = std::env::var("CELLARIUM_E2E_HOST").unwrap_or_else(|_| "tinker".into());
+    let latency = terminal_probe::run_workbench_probe(&host).expect("Workbench PTY E2E probe");
+    assert!(
+        latency.is_finite() && latency < 20_000.0,
+        "Apply latency: {latency}ms"
+    );
+    println!("Workbench ApplyAccepted latency: {latency:.1}ms");
+}

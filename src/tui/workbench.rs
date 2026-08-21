@@ -117,11 +117,8 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             }
             lines
         }
-        WorkbenchSection::Channels => state
-            .draft()
-            .channels
-            .iter()
-            .map(|channel| {
+        WorkbenchSection::Channels => std::iter::once("Channel compositor".to_string())
+            .chain(state.draft().channels.iter().map(|channel| {
                 let selected = channel.id == state.selected_channel();
                 let color = crate::workbench::resolved_color(state.draft(), channel.id)
                     .map(|color| format!("#{:02x}{:02x}{:02x}", color.red, color.green, color.blue))
@@ -138,13 +135,10 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     },
                     if channel.frozen { "frozen" } else { "active" }
                 )
-            })
+            }))
             .collect(),
-        WorkbenchSection::Kernels => state
-            .draft()
-            .kernels
-            .iter()
-            .map(|kernel| {
+        WorkbenchSection::Kernels => std::iter::once("Kernel routing editor".to_string())
+            .chain(state.draft().kernels.iter().map(|kernel| {
                 format!(
                     "{}  ch{} → ch{}  {}×{}  {:?}",
                     kernel.symbol,
@@ -154,7 +148,7 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
                     kernel.definition.height,
                     kernel.definition.normalization
                 )
-            })
+            }))
             .collect(),
         WorkbenchSection::Growth => {
             let editor = state.growth_editor();

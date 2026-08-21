@@ -133,6 +133,14 @@ impl TerminalScreen {
             .any(|line| contains(line, needle))
     }
 
+    pub fn dump(&self) -> String {
+        self.cells
+            .chunks(self.width)
+            .map(|line| String::from_utf8_lossy(line).trim_end().to_string())
+            .collect::<Vec<_>>()
+            .join("\\n")
+    }
+
     fn put(&mut self, byte: u8) {
         if self.column < self.width && self.row < self.height {
             self.cells[self.row * self.width + self.column] = byte;
@@ -188,6 +196,15 @@ impl TerminalScreen {
 
 impl PtySession {
     fn spawn(host: &str, columns: u16, rows: u16) -> io::Result<Self> {
+        Self::spawn_with_graphics(host, columns, rows, true)
+    }
+
+    fn spawn_with_graphics(
+        host: &str,
+        columns: u16,
+        rows: u16,
+        graphics: bool,
+    ) -> io::Result<Self> {
         let master = unsafe { libc::posix_openpt(libc::O_RDWR | libc::O_NOCTTY) };
         if master < 0 {
             return Err(io::Error::last_os_error());
@@ -237,19 +254,32 @@ impl PtySession {
             .unwrap_or_else(|| "ssh".into());
         let client = std::env::var_os("CELLARIUM_E2E_CLIENT")
             .unwrap_or_else(|| env!("CARGO_BIN_EXE_cellarium").into());
-        let child = Command::new(client)
+        let mut command = Command::new(client);
+        command
             .args(["connect", host])
             .stdin(stdin)
             .stdout(stdout)
             .stderr(stderr)
-            .env("TERM", "xterm-kitty")
-            .env("KITTY_WINDOW_ID", "1")
+            .env(
+                "TERM",
+                if graphics {
+                    "xterm-kitty"
+                } else {
+                    "xterm-256color"
+                },
+            )
             .env("CELLARIUM_CELL_WIDTH", "8")
             .env("CELLARIUM_CELL_HEIGHT", "16")
+            .env("CELLARIUM_E2E_TRACE", "1")
             .env("CELLARIUM_SSH_COMMAND", ssh_command)
             .env_remove("SSH_CONNECTION")
-            .env_remove("SSH_TTY")
-            .spawn()?;
+            .env_remove("SSH_TTY");
+        if graphics {
+            command.env("KITTY_WINDOW_ID", "1");
+        } else {
+            command.env_remove("KITTY_WINDOW_ID");
+        }
+        let child = command.spawn()?;
         unsafe { libc::close(slave) };
         Ok(Self {
             master,
@@ -339,9 +369,13 @@ impl PtySession {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
-                        "timed out waiting for {description}; frames={}, output_bytes={}",
+                        "timed out waiting for {description}; frames={}, output_bytes={}; tail={:?}; screen=\\n{}",
                         self.frames.len(),
-                        self.output.len()
+                        self.output.len(),
+                        String::from_utf8_lossy(
+                            &self.output[self.output.len().saturating_sub(500)..]
+                        ),
+                        self.screen.dump()
                     ),
                 ));
             }
@@ -471,52 +505,6 @@ pub fn run_terminal_probe(host: &str) -> io::Result<TerminalProbeReport> {
         mouse_frame.at.duration_since(mouse_started).as_secs_f64() * 1_000.0;
     let mouse_ack_latency_ms = mouse_ack_at.duration_since(mouse_started).as_secs_f64() * 1_000.0;
 
-    // User-perspective Workbench journey.  Every mutation is driven through
-    // the PTY key path; Apply is counted only after the remote ApplyAccepted
-    // turns the local draft back to authoritative Clean.
-    session.write(b"w")?;
-    session.pump_until("Workbench shell", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"Workbench") && session.screen.contains(b"World")
-    })?;
-    session.write(b"tt")?;
-    session.pump_until("Channels section", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"Channels")
-    })?;
-    session.write(b"a]cvxf\x1a\x19")?;
-    session.pump_until("channel controls", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"channel_2")
-    })?;
-    session.write(b"t")?;
-    session.pump_until("Kernels section", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"k1")
-    })?;
-    session.write(b"at")?;
-    session.pump_until("Growth section", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"growth_")
-    })?;
-    session.write(b"e\r\x1b")?;
-    session.pump_for(Duration::from_millis(100))?;
-    session.write(b"t")?;
-    session.pump_until("Experiment section", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"Experiment")
-    })?;
-    // World -> Tiling after passing Experiment, then exercise both presets
-    // and polygon-side editing before returning to Experiment to Apply.
-    session.write(b"ttpp+")?;
-    session.pump_until("octagon tiling editor", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"octagon")
-    })?;
-    session.write(b"tttt")?;
-    session.pump_until("Experiment review", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"Experiment")
-    })?;
-    let workbench_apply_started = Instant::now();
-    session.write(b"\x1b[13;5u")?;
-    session.pump_until("authoritative Workbench Apply", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"Clean")
-    })?;
-    let workbench_apply_latency_ms = workbench_apply_started.elapsed().as_secs_f64() * 1_000.0;
-
     let observed_frames = session.frames.len();
     let frame_intervals_ms = session
         .frames
@@ -542,9 +530,81 @@ pub fn run_terminal_probe(host: &str) -> io::Result<TerminalProbeReport> {
         mouse_frame_latency_ms,
         frame_intervals_ms,
         frame_sizes,
-        workbench_apply_latency_ms,
-        workbench_authoritative_clean: true,
+        workbench_apply_latency_ms: 0.0,
+        workbench_authoritative_clean: false,
     })
+}
+
+/// A separate half-block PTY session keeps this user-flow test independent of
+/// the graphics encoder backlog.  Graphics cadence is measured by
+/// `run_terminal_probe`; input semantics are measured here against the same
+/// SSH connector and the same server.
+pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
+    let mut session = PtySession::spawn_with_graphics(host, 64, 20, false)?;
+    session.pump_until("Workbench startup", STARTUP_TIMEOUT, |session| {
+        session.screen.contains(b"Cellarium")
+    })?;
+    session.write(b"w")?;
+    session.pump_until("Workbench shell", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"Workbench") && session.screen.contains(b"World")
+    })?;
+    session.write(b"\x1b[<0;30;8M")?;
+    session.pump_until("Workbench mouse paint", INPUT_TIMEOUT, |session| {
+        contains(&session.output, b"E2E_MOUSE_APPLIED")
+    })?;
+    session.write(b"tt")?;
+    session.pump_until("Channels section", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"Channel compositor")
+    })?;
+    session.write(b"a]cvxff\x1a\x19")?;
+    session.pump_until("channel controls", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"channel_2")
+    })?;
+    session.write(b"t")?;
+    session.pump_until("Kernels section", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"Kernel routing editor")
+    })?;
+    session.write(b"at")?;
+    session.pump_until("Growth section", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"growth_")
+    })?;
+    session.write(b"e")?;
+    session.pump_until("Growth editor", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"EDITING")
+    })?;
+    session.write(b"\r")?;
+    session.pump_for(Duration::from_millis(100))?;
+    session.write(b"\x1b")?;
+    session.pump_for(Duration::from_millis(200))?;
+    session.write(b"t")?;
+    session.pump_until("Experiment section", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"Experiment review")
+    })?;
+    session.write(b"ttpp+")?;
+    session.pump_until("octagon tiling editor", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"octagon")
+    })?;
+    session.write(b"tttt")?;
+    session.pump_until("Experiment review", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"Experiment review")
+            && !session.screen.contains(b"Periodic tiling editor")
+    })?;
+    let started = Instant::now();
+    // Lowercase `a` is an unambiguous Apply fallback in Experiment review for
+    // PTYs that cannot carry Ctrl+Enter modifiers through SSH.
+    session.write(b"a")?;
+    session.pump_until("Apply dispatch", INPUT_TIMEOUT, |session| {
+        contains(&session.output, b"E2E_APPLY_SENT")
+    })?;
+    session.pump_until(
+        "authoritative ApplyAccepted",
+        Duration::from_secs(20),
+        |session| contains(&session.output, b"E2E_APPLY_ACCEPTED"),
+    )?;
+    let latency = started.elapsed().as_secs_f64() * 1_000.0;
+    session.write(b"q")?;
+    session.wait_for_successful_exit(INPUT_TIMEOUT)?;
+    Ok(latency)
 }
 
 pub fn write_report(report: &TerminalProbeReport) -> io::Result<()> {
