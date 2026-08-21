@@ -39,7 +39,9 @@ pub fn build_preset(preset: TilingPreset, scale: f64) -> PeriodicTilingDraft {
             mode: TilingMode::Topological,
         },
         TilingPreset::OctagonSquare => {
-            let period = s * (2.0 + 2.0_f64.sqrt());
+            // One octagon and the diamond-oriented square at a lattice corner
+            // are representatives of the periodic 4.8.8 quotient.
+            let period = s * (1.0 + 2.0_f64.sqrt());
             PeriodicTilingDraft {
                 translation_a: Vec2::new(period, 0.0),
                 translation_b: Vec2::new(0.0, period),
@@ -75,8 +77,8 @@ pub fn build_preset(preset: TilingPreset, scale: f64) -> PeriodicTilingDraft {
                         id: TileId(1),
                         prototype: PrototypeId(1),
                         transform: RigidTransform {
-                            translation: Vec2::new(0.0, period / 2.0),
-                            rotation: 0.0,
+                            translation: Vec2::new(period / 2.0, period / 2.0),
+                            rotation: std::f64::consts::FRAC_PI_4,
                         },
                     },
                 ],
@@ -107,5 +109,7 @@ mod tests {
                 side_length: 1.0
             }
         );
+        assert!(validate_coverage(&draft).is_ok());
+        assert!(canonical_half_edges(&draft, 1e-9).is_ok());
     }
 }

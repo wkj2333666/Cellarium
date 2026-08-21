@@ -30,6 +30,20 @@ pub enum UiCommand {
     Redo,
     FocusNext,
     FocusPrevious,
+    ContextAdd,
+    ContextDelete,
+    SelectNext,
+    CyclePresentation,
+    CycleColor,
+    ToggleVisibility,
+    ToggleFrozen,
+    CyclePreset,
+    SaveActive,
+    ExportDraft,
+    LoadDraft,
+    ShapeNext,
+    ShapeIncrease,
+    ShapeDecrease,
 }
 
 pub fn translate_ui_key(event: &KeyEvent) -> Option<UiCommand> {
@@ -49,8 +63,28 @@ pub fn translate_ui_key(event: &KeyEvent) -> Option<UiCommand> {
         (KeyCode::Char('r'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Some(UiCommand::RevertDraft)
         }
+        (KeyCode::Char('s'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(UiCommand::SaveActive)
+        }
+        (KeyCode::Char('e'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(UiCommand::ExportDraft)
+        }
+        (KeyCode::Char('o'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(UiCommand::LoadDraft)
+        }
         (KeyCode::BackTab, _) => Some(UiCommand::FocusPrevious),
         (KeyCode::Tab, _) => Some(UiCommand::FocusNext),
+        (KeyCode::Char('a'), KeyModifiers::NONE) => Some(UiCommand::ContextAdd),
+        (KeyCode::Delete, KeyModifiers::NONE) => Some(UiCommand::ContextDelete),
+        (KeyCode::Char(']'), KeyModifiers::NONE) => Some(UiCommand::SelectNext),
+        (KeyCode::Char('v'), KeyModifiers::NONE) => Some(UiCommand::CyclePresentation),
+        (KeyCode::Char('c'), KeyModifiers::NONE) => Some(UiCommand::CycleColor),
+        (KeyCode::Char('x'), KeyModifiers::NONE) => Some(UiCommand::ToggleVisibility),
+        (KeyCode::Char('f'), KeyModifiers::NONE) => Some(UiCommand::ToggleFrozen),
+        (KeyCode::Char('p'), KeyModifiers::NONE) => Some(UiCommand::CyclePreset),
+        (KeyCode::Char('n'), KeyModifiers::NONE) => Some(UiCommand::ShapeNext),
+        (KeyCode::Char('+'), KeyModifiers::NONE) => Some(UiCommand::ShapeIncrease),
+        (KeyCode::Char('-'), KeyModifiers::NONE) => Some(UiCommand::ShapeDecrease),
         _ => None,
     }
 }
@@ -129,6 +163,7 @@ impl MouseTracker {
                 direction: ZoomDirection::Out,
             }),
             MouseEventKind::Down(MouseButton::Left) => Some(MouseAction::Inspect),
+            MouseEventKind::Down(MouseButton::Right) => Some(MouseAction::Erase),
             MouseEventKind::Down(MouseButton::Middle) => {
                 self.previous = Some(current);
                 None
@@ -271,6 +306,18 @@ mod tests {
         assert_eq!(
             translate_ui_key(&KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
             Some(UiCommand::FocusPrevious)
+        );
+        assert_eq!(
+            translate_ui_key(&key(KeyCode::Char('a'))),
+            Some(UiCommand::ContextAdd)
+        );
+        assert_eq!(
+            translate_ui_key(&key(KeyCode::Delete)),
+            Some(UiCommand::ContextDelete)
+        );
+        assert_eq!(
+            translate_ui_key(&key(KeyCode::Char(']'))),
+            Some(UiCommand::SelectNext)
         );
     }
 

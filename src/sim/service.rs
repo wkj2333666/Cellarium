@@ -155,9 +155,15 @@ impl ExperimentService {
     pub fn world(&self) -> &ChannelWorld {
         &self.active.world
     }
+    pub fn world_mut(&mut self) -> &mut ChannelWorld {
+        &mut self.active.world
+    }
 
     pub fn step(&mut self) -> Result<(), RuntimeError> {
         self.active.backend.step(&mut self.active.world)
+    }
+    pub fn tick(&self) -> u64 {
+        self.active.backend.tick()
     }
 
     pub fn audit_snapshot(&self) -> AuditSnapshot {

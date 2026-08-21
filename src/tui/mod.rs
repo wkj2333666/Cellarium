@@ -127,7 +127,7 @@ fn draw_footer(
         app.tick(),
         display.protocol().label()
     );
-    let row2 = "[T] section  [Tab] focus  [Ctrl+Z/Y] undo/redo  [Ctrl+Enter] Apply  [W] simulate  [?] help";
+    let row2 = "[T] section  [Tab] focus  [Ctrl+Z/Y] undo/redo  [Ctrl+Enter] Apply  [Ctrl+S/E/O] files  [W] simulate  [?] help";
     let lines = vec![
         Line::from(fit_segments(area.width as usize, &[&row1])),
         Line::from(fit_segments(area.width as usize, &[row2])),

@@ -14,7 +14,9 @@ use crate::sim::backend::{BackendKind, SimulationBackend};
 use crate::sim::experiment::{ExperimentError, ExperimentFile, ExperimentMetadata};
 use crate::sim::experiment_model::{ExperimentSpec, validate_structure};
 use crate::sim::rule::SimulationSpec;
-use crate::sim::service::{ApplyAccepted, ApplyRejected, ApplyRequest, Diagnostic, DiagnosticPath};
+use crate::sim::service::{
+    ApplyAccepted, ApplyRejected, ApplyRequest, Diagnostic, DiagnosticPath, ExperimentService,
+};
 use crate::sim::tiling::PeriodicTilingDraft;
 use crate::sim::world::World;
 use crate::workbench::{AppMode, WorkbenchState};
@@ -87,6 +89,8 @@ pub struct App {
     experiment_revision: u64,
     mode: AppMode,
     workbench: WorkbenchState,
+    experiment_service: Option<ExperimentService>,
+    workbench_notice: Option<String>,
 }
 
 impl App {
@@ -144,6 +148,8 @@ impl App {
             experiment_revision: 0,
             mode: AppMode::Simulation,
             workbench,
+            experiment_service: None,
+            workbench_notice: None,
         }
     }
 
@@ -159,6 +165,9 @@ impl App {
     }
     pub fn workbench_mut(&mut self) -> &mut WorkbenchState {
         &mut self.workbench
+    }
+    pub fn workbench_notice(&self) -> Option<&str> {
+        self.workbench_notice.as_deref()
     }
     pub fn enter_workbench(&mut self) {
         self.mode = AppMode::Workbench;
@@ -189,6 +198,86 @@ impl App {
                 self.workbench.focus_previous();
                 Ok(())
             }
+            UiCommand::ContextAdd => match self.workbench.section() {
+                crate::workbench::WorkbenchSection::Channels => self
+                    .workbench
+                    .add_channel()
+                    .map_err(|error| error.to_string()),
+                crate::workbench::WorkbenchSection::Kernels => self
+                    .workbench
+                    .add_kernel_for_selected()
+                    .map_err(|error| error.to_string()),
+                _ => Err("Add is available in Channels and Kernels".into()),
+            },
+            UiCommand::ContextDelete => match self.workbench.section() {
+                crate::workbench::WorkbenchSection::Channels => {
+                    self.workbench.remove_selected_channel()
+                }
+                crate::workbench::WorkbenchSection::Kernels => {
+                    self.workbench.remove_last_kernel_for_selected()
+                }
+                _ => Err("Delete is available in Channels and Kernels".into()),
+            },
+            UiCommand::SelectNext => {
+                self.workbench.select_next_channel();
+                Ok(())
+            }
+            UiCommand::CyclePresentation => {
+                self.workbench.cycle_channel_view();
+                Ok(())
+            }
+            UiCommand::CycleColor => self
+                .workbench
+                .cycle_selected_color()
+                .map_err(|error| error.to_string()),
+            UiCommand::ToggleVisibility => self
+                .workbench
+                .toggle_selected_visibility()
+                .map_err(|error| error.to_string()),
+            UiCommand::ToggleFrozen => self
+                .workbench
+                .toggle_selected_frozen()
+                .map_err(|error| error.to_string()),
+            UiCommand::CyclePreset => self
+                .workbench
+                .cycle_tiling_preset()
+                .map_err(|error| error.to_string()),
+            UiCommand::ShapeNext => {
+                self.workbench.select_next_prototype();
+                Ok(())
+            }
+            UiCommand::ShapeIncrease => self.workbench.adjust_prototype_sides(1),
+            UiCommand::ShapeDecrease => self.workbench.adjust_prototype_sides(-1),
+            UiCommand::SaveActive => {
+                let path = Path::new("cellarium-active.ron");
+                crate::sim::experiment::save_experiment_model(path, &self.active_experiment())
+                    .map_err(|error| error.to_string())?;
+                self.workbench_notice = Some(format!("saved active to {}", path.display()));
+                Ok(())
+            }
+            UiCommand::ExportDraft => {
+                let path = Path::new("cellarium-draft.ron");
+                crate::workbench::export_draft(
+                    path,
+                    self.experiment_revision,
+                    self.workbench.draft(),
+                )?;
+                self.workbench_notice = Some(format!("exported draft to {}", path.display()));
+                Ok(())
+            }
+            UiCommand::LoadDraft => {
+                let path = Path::new("cellarium-draft.ron");
+                let envelope = crate::workbench::load_draft(path)?;
+                self.workbench
+                    .import_draft(envelope.draft)
+                    .map_err(|error| error.to_string())?;
+                self.workbench_notice = Some(format!(
+                    "loaded draft from {} (base revision {})",
+                    path.display(),
+                    envelope.base_revision
+                ));
+                Ok(())
+            }
             UiCommand::ApplyDraft => {
                 let request =
                     self.workbench_apply_request(self.experiment_revision.wrapping_add(1));
@@ -203,9 +292,65 @@ impl App {
             }
         }
     }
+    pub fn handle_workbench_growth_key(&mut self, key: KeyEvent) -> bool {
+        if self.mode != AppMode::Workbench || !self.workbench.growth_editing() {
+            return false;
+        }
+        if key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL)
+        {
+            return false;
+        }
+        match key.code {
+            KeyCode::Char(character)
+                if !key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
+            {
+                self.workbench
+                    .growth_editor_mut()
+                    .buffer_mut()
+                    .insert_char(character)
+            }
+            KeyCode::Enter => self.workbench.growth_editor_mut().buffer_mut().newline(),
+            KeyCode::Backspace => {
+                self.workbench.growth_editor_mut().buffer_mut().backspace();
+            }
+            KeyCode::Delete => {
+                self.workbench.growth_editor_mut().buffer_mut().delete();
+            }
+            KeyCode::Left => self.workbench.growth_editor_mut().buffer_mut().move_left(),
+            KeyCode::Right => self.workbench.growth_editor_mut().buffer_mut().move_right(),
+            KeyCode::Up => self
+                .workbench
+                .growth_editor_mut()
+                .buffer_mut()
+                .move_vertical(-1),
+            KeyCode::Down => self
+                .workbench
+                .growth_editor_mut()
+                .buffer_mut()
+                .move_vertical(1),
+            KeyCode::Home => self.workbench.growth_editor_mut().buffer_mut().move_home(),
+            KeyCode::End => self.workbench.growth_editor_mut().buffer_mut().move_end(),
+            KeyCode::Esc => {
+                self.workbench.stop_growth_editing();
+                return true;
+            }
+            _ => return false,
+        }
+        self.workbench.growth_editor_mut().refresh_now();
+        self.workbench.sync_growth_source();
+        true
+    }
 
     pub fn tick(&self) -> u64 {
-        self.remote_tick.unwrap_or_else(|| self.backend.tick())
+        self.remote_tick.unwrap_or_else(|| {
+            self.experiment_service
+                .as_ref()
+                .map_or_else(|| self.backend.tick(), ExperimentService::tick)
+        })
     }
 
     pub fn backend_error(&self) -> Option<&str> {
@@ -215,13 +360,21 @@ impl App {
     }
 
     pub fn backend_kind(&self) -> BackendKind {
-        self.backend.kind()
+        if self.experiment_service.is_some() {
+            BackendKind::Cpu
+        } else {
+            self.backend.kind()
+        }
     }
 
     pub fn backend_name(&self) -> &str {
-        self.remote_backend
-            .as_deref()
-            .unwrap_or_else(|| self.backend.device_name())
+        self.remote_backend.as_deref().unwrap_or_else(|| {
+            if self.experiment_service.is_some() {
+                "CPU experiment"
+            } else {
+                self.backend.device_name()
+            }
+        })
     }
 
     pub fn is_remote_mirror(&self) -> bool {
@@ -256,6 +409,9 @@ impl App {
     }
 
     pub fn active_experiment(&self) -> ExperimentSpec {
+        if let Some(service) = &self.experiment_service {
+            return service.snapshot_active_experiment();
+        }
         let mut model = self.experiment_model.clone();
         if let Some(channel) = model.channels.first_mut() {
             channel.initial = self.world.cells().to_vec();
@@ -363,18 +519,24 @@ impl App {
                 })
                 .collect(),
         })?;
-        if request.draft.channels.len() != 1 {
-            return Err(ApplyRejected {
-                request_id: request.request_id,
-                diagnostics: vec![Diagnostic {
-                    code: "legacy_runtime_requires_single_channel".to_string(),
-                    message: "multi-channel drafts require the experiment runtime".to_string(),
-                    path: DiagnosticPath::field("channels"),
-                }],
-            });
+        let service = ExperimentService::new(request.draft.clone()).map_err(|mut rejected| {
+            rejected.request_id = request.request_id;
+            rejected
+        })?;
+        if let Some(first) = request.draft.channels.first() {
+            let crate::sim::experiment_model::GeometrySpec::RasterGrid(grid) =
+                &request.draft.geometry;
+            if self.world.width() != grid.width as usize
+                || self.world.height() != grid.height as usize
+            {
+                self.world = World::new(grid.width as usize, grid.height as usize);
+                self.camera = Camera::new([grid.width as f32 / 2.0, grid.height as f32 / 2.0], 1.0);
+            }
+            self.world.replace_cells(&first.initial);
         }
         self.experiment_model = request.draft.clone();
         self.workbench.accept(request.draft.clone());
+        self.experiment_service = Some(service);
         self.experiment_revision =
             self.experiment_revision
                 .checked_add(1)
@@ -643,6 +805,23 @@ impl App {
 
     pub fn step(&mut self) -> bool {
         let started = Instant::now();
+        if let Some(service) = &mut self.experiment_service {
+            let result = service.step();
+            if result.is_ok() {
+                self.world.replace_cells(service.world().channel_cells(0));
+            }
+            self.record_step_duration(started.elapsed());
+            return match result {
+                Ok(()) => {
+                    self.backend_error = None;
+                    true
+                }
+                Err(error) => {
+                    self.backend_error = Some(error.to_string());
+                    false
+                }
+            };
+        }
         let result = self.backend.step(&mut self.world);
         self.record_step_duration(started.elapsed());
         match result {
@@ -700,7 +879,12 @@ impl App {
             }
             Command::Clear => {
                 self.world.clear();
-                self.backend = self.recreate_backend();
+                if let Some(service) = &mut self.experiment_service {
+                    let zeros = vec![0.0; service.world().cells().len()];
+                    let _ = service.world_mut().replace_all(&zeros);
+                } else {
+                    self.backend = self.recreate_backend();
+                }
             }
             Command::Conway => {
                 self.spec = SimulationSpec::conway();
@@ -734,7 +918,15 @@ impl App {
                     self.active_panel = self.active_panel.next();
                 }
             }
-            Command::ToggleExpressionEditor => self.toggle_expression_editor(),
+            Command::ToggleExpressionEditor => {
+                if self.mode == AppMode::Workbench
+                    && self.workbench.section() == crate::workbench::WorkbenchSection::Growth
+                {
+                    self.workbench.toggle_growth_editing();
+                } else {
+                    self.toggle_expression_editor();
+                }
+            }
             Command::ToggleHelp => self.help_visible = !self.help_visible,
             Command::ToggleWorkbench => {
                 self.mode = if self.mode == AppMode::Simulation {
@@ -761,7 +953,15 @@ impl App {
             Command::ToggleKernelPreview => {
                 self.kernel_preview_enabled = !self.kernel_preview_enabled;
             }
-            Command::ToggleExpressionEditor => self.toggle_expression_editor(),
+            Command::ToggleExpressionEditor => {
+                if self.mode == AppMode::Workbench
+                    && self.workbench.section() == crate::workbench::WorkbenchSection::Growth
+                {
+                    self.workbench.toggle_growth_editing();
+                } else {
+                    self.toggle_expression_editor();
+                }
+            }
             Command::ToggleHelp => self.help_visible = !self.help_visible,
             Command::ToggleWorkbench => {
                 self.mode = if self.mode == AppMode::Simulation {
@@ -880,6 +1080,7 @@ impl App {
     }
 
     fn reset(&mut self) {
+        self.experiment_service = None;
         self.world.randomize(self.seed, initial_density(&self.spec));
         self.backend = self.recreate_backend();
         self.inspected = None;
@@ -903,13 +1104,19 @@ impl App {
     pub fn inspect_world(&mut self, world: [f32; 2]) {
         let x = world[0].floor() as isize;
         let y = world[1].floor() as isize;
-        self.inspected = Some(self.world.get(x, y));
+        self.inspected = Some(self.experiment_service.as_ref().map_or_else(
+            || self.world.get(x, y),
+            |service| service.world().get(0, x, y),
+        ));
     }
 
     pub fn paint_world(&mut self, world: [f32; 2], value: f32) {
         let x = world[0].floor() as isize;
         let y = world[1].floor() as isize;
         self.world.set(x, y, value);
+        if let Some(service) = &mut self.experiment_service {
+            service.world_mut().set(0, x, y, value);
+        }
     }
 
     pub fn handle_mouse(
@@ -929,6 +1136,30 @@ impl App {
         let Some(action) = tracker.update(&local, viewport.width, viewport.height) else {
             return false;
         };
+        if self.mode == AppMode::Workbench
+            && self.workbench.section() == crate::workbench::WorkbenchSection::World
+        {
+            let crate::sim::experiment_model::GeometrySpec::RasterGrid(grid) =
+                &self.workbench.draft().geometry;
+            let x = usize::from(local.column) * grid.width as usize
+                / usize::from(viewport.width.max(1));
+            let y =
+                usize::from(local.row) * grid.height as usize / usize::from(viewport.height.max(1));
+            let tile = y.saturating_mul(grid.width as usize).saturating_add(x);
+            let value = match action {
+                crate::input::MouseAction::Erase => 0.0,
+                crate::input::MouseAction::Inspect | crate::input::MouseAction::Paint => 1.0,
+                _ => return false,
+            };
+            return self
+                .workbench
+                .execute(crate::workbench::DraftCommand::SetChannelValue {
+                    channel: self.workbench.selected_channel(),
+                    tile,
+                    value,
+                })
+                .is_ok();
+        }
         let frame_size = self
             .frame_size
             .unwrap_or([viewport.width as usize, viewport.height as usize * 2]);
@@ -1636,6 +1867,9 @@ where
         terminal_stdout,
         crossterm::terminal::EnterAlternateScreen,
         crossterm::event::EnableMouseCapture,
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        ),
         crossterm::cursor::Hide
     )?;
     let display = crate::render::display::ViewportDisplay::detect();
@@ -1788,6 +2022,9 @@ fn handle_remote_terminal_event<W: std::io::Write>(
     use crate::remote::{ExpressionKey, InputMessage};
     match event {
         Event::Key(key) => {
+            if app.handle_workbench_growth_key(key) {
+                return Ok(false);
+            }
             if app.expression_editing() {
                 let expression_key = match key.code {
                     KeyCode::Char(character) => Some(ExpressionKey::Char(character)),
@@ -1873,7 +2110,10 @@ fn run_app_with_save(app: App, save_path: Option<&Path>) -> std::io::Result<()> 
     crossterm::execute!(
         stdout,
         crossterm::terminal::EnterAlternateScreen,
-        crossterm::event::EnableMouseCapture
+        crossterm::event::EnableMouseCapture,
+        crossterm::event::PushKeyboardEnhancementFlags(
+            crossterm::event::KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
+        )
     )?;
     crossterm::execute!(stdout, crossterm::cursor::Hide)?;
 
@@ -2057,6 +2297,7 @@ impl Drop for TerminalGuard {
         let _ = crossterm::execute!(stdout, crossterm::cursor::Show);
         let _ = crossterm::execute!(
             stdout,
+            crossterm::event::PopKeyboardEnhancementFlags,
             crossterm::event::DisableMouseCapture,
             crossterm::terminal::LeaveAlternateScreen
         );
@@ -2090,6 +2331,9 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
         if crossterm::event::poll(wait)? {
             match crossterm::event::read()? {
                 Event::Key(key) => {
+                    if app.handle_workbench_growth_key(key) {
+                        continue;
+                    }
                     if app.expression_editing() {
                         app.handle_expression_key(key);
                         continue;
