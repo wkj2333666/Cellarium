@@ -1110,6 +1110,10 @@ where
                     return Ok(());
                 }
                 Ok(RemoteMessage::Snapshot(_)) => {}
+                Ok(RemoteMessage::ExperimentState { .. })
+                | Ok(RemoteMessage::ApplyDraft(_))
+                | Ok(RemoteMessage::ApplyAccepted(_))
+                | Ok(RemoteMessage::ApplyRejected(_)) => {}
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
                     snapshot_tx.close();

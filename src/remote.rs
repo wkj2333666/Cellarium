@@ -1,10 +1,11 @@
 use crate::input::Command;
 use crate::sim::kernel::KernelDefinition;
 use crate::sim::rule::SimulationSpec;
+use crate::sim::service::{ApplyAccepted, ApplyRejected, ApplyRequest, Diagnostic, DiagnosticPath};
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u8 = 4;
+pub const PROTOCOL_VERSION: u8 = 5;
 pub const MAX_FRAME_SIZE: u32 = 64 * 1024 * 1024;
 const MAGIC: [u8; 4] = *b"CLRM";
 
@@ -32,10 +33,23 @@ pub struct Snapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub enum RemoteMessage {
     Hello,
-    Input { sequence: u64, input: InputMessage },
+    Input {
+        sequence: u64,
+        input: InputMessage,
+    },
     Snapshot(Snapshot),
-    Viewport { width: u16, height: u16 },
+    Viewport {
+        width: u16,
+        height: u16,
+    },
     Quit,
+    ExperimentState {
+        revision: u64,
+        normalized_experiment: crate::sim::experiment_model::ExperimentSpec,
+    },
+    ApplyDraft(ApplyRequest),
+    ApplyAccepted(ApplyAccepted),
+    ApplyRejected(ApplyRejected),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -135,6 +149,43 @@ fn encode_message(message: &RemoteMessage, payload: &mut Vec<u8>) -> Result<u8, 
             Ok(4)
         }
         RemoteMessage::Quit => Ok(5),
+        RemoteMessage::ExperimentState {
+            revision,
+            normalized_experiment,
+        } => {
+            put_u64(payload, *revision);
+            put_experiment(payload, normalized_experiment)?;
+            Ok(6)
+        }
+        RemoteMessage::ApplyDraft(request) => {
+            put_u64(payload, request.request_id);
+            put_u64(payload, request.base_revision);
+            put_experiment(payload, &request.draft)?;
+            Ok(7)
+        }
+        RemoteMessage::ApplyAccepted(accepted) => {
+            put_u64(payload, accepted.request_id);
+            put_u64(payload, accepted.revision);
+            put_experiment(payload, &accepted.normalized_experiment)?;
+            Ok(8)
+        }
+        RemoteMessage::ApplyRejected(rejected) => {
+            put_u64(payload, rejected.request_id);
+            let count = u16::try_from(rejected.diagnostics.len())
+                .map_err(|_| ProtocolError::Invalid("too many diagnostics"))?;
+            put_u16(payload, count);
+            for diagnostic in &rejected.diagnostics {
+                put_string(payload, &diagnostic.code)?;
+                put_string(payload, &diagnostic.message)?;
+                let path_count = u16::try_from(diagnostic.path.0.len())
+                    .map_err(|_| ProtocolError::Invalid("diagnostic path is too long"))?;
+                put_u16(payload, path_count);
+                for component in &diagnostic.path.0 {
+                    put_string(payload, component)?;
+                }
+            }
+            Ok(9)
+        }
     }
 }
 
@@ -156,6 +207,67 @@ fn decode_message(tag: u8, payload: &[u8]) -> Result<RemoteMessage, ProtocolErro
             Ok(RemoteMessage::Viewport { width, height })
         }
         5 if payload.is_empty() => Ok(RemoteMessage::Quit),
+        6 => {
+            let revision = cursor.u64()?;
+            let normalized_experiment = cursor.experiment()?;
+            cursor.finish()?;
+            Ok(RemoteMessage::ExperimentState {
+                revision,
+                normalized_experiment,
+            })
+        }
+        7 => {
+            let request_id = cursor.u64()?;
+            let base_revision = cursor.u64()?;
+            let draft = cursor.experiment()?;
+            cursor.finish()?;
+            Ok(RemoteMessage::ApplyDraft(ApplyRequest {
+                request_id,
+                base_revision,
+                draft,
+            }))
+        }
+        8 => {
+            let request_id = cursor.u64()?;
+            let revision = cursor.u64()?;
+            let normalized_experiment = cursor.experiment()?;
+            cursor.finish()?;
+            Ok(RemoteMessage::ApplyAccepted(ApplyAccepted {
+                request_id,
+                revision,
+                normalized_experiment,
+            }))
+        }
+        9 => {
+            let request_id = cursor.u64()?;
+            let count = cursor.u16()? as usize;
+            if count > 4096 {
+                return Err(ProtocolError::Invalid("too many diagnostics"));
+            }
+            let mut diagnostics = Vec::with_capacity(count);
+            for _ in 0..count {
+                let code = cursor.string()?;
+                let message = cursor.string()?;
+                let path_count = cursor.u16()? as usize;
+                if path_count > 256 {
+                    return Err(ProtocolError::Invalid("diagnostic path is too long"));
+                }
+                let mut path = Vec::with_capacity(path_count);
+                for _ in 0..path_count {
+                    path.push(cursor.string()?);
+                }
+                diagnostics.push(Diagnostic {
+                    code,
+                    message,
+                    path: DiagnosticPath(path),
+                });
+            }
+            cursor.finish()?;
+            Ok(RemoteMessage::ApplyRejected(ApplyRejected {
+                request_id,
+                diagnostics,
+            }))
+        }
         _ => Err(ProtocolError::Invalid(
             "unknown message tag or trailing payload",
         )),
@@ -363,6 +475,15 @@ fn put_long_string(payload: &mut Vec<u8>, value: &str) -> Result<(), ProtocolErr
     Ok(())
 }
 
+fn put_experiment(
+    payload: &mut Vec<u8>,
+    experiment: &crate::sim::experiment_model::ExperimentSpec,
+) -> Result<(), ProtocolError> {
+    let encoded = ron::to_string(experiment)
+        .map_err(|error| ProtocolError::Message(format!("cannot encode experiment: {error}")))?;
+    put_long_string(payload, &encoded)
+}
+
 fn command_code(command: Command) -> u8 {
     match command {
         Command::Quit => 0,
@@ -549,6 +670,12 @@ impl<'a> Cursor<'a> {
         String::from_utf8(bytes.to_vec())
             .map_err(|_| ProtocolError::Invalid("invalid utf-8 long string"))
     }
+    fn experiment(
+        &mut self,
+    ) -> Result<crate::sim::experiment_model::ExperimentSpec, ProtocolError> {
+        ron::from_str(&self.long_string()?)
+            .map_err(|error| ProtocolError::Message(format!("cannot decode experiment: {error}")))
+    }
     fn finish(&self) -> Result<(), ProtocolError> {
         if self.offset == self.bytes.len() {
             Ok(())
@@ -561,6 +688,10 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::experiment_model::ExperimentSpec;
+    use crate::sim::service::{
+        ApplyAccepted, ApplyRejected, ApplyRequest, Diagnostic, DiagnosticPath,
+    };
     use std::io::Cursor as IoCursor;
 
     fn sample_snapshot() -> Snapshot {
@@ -655,5 +786,59 @@ mod tests {
             read_message(&mut IoCursor::new(Vec::<u8>::new())).unwrap(),
             None
         );
+    }
+
+    fn roundtrip(message: RemoteMessage) -> RemoteMessage {
+        let mut bytes = Vec::new();
+        write_message(&mut bytes, &message).unwrap();
+        read_message(&mut IoCursor::new(bytes)).unwrap().unwrap()
+    }
+
+    #[test]
+    fn apply_messages_roundtrip_complete_drafts_and_paths() {
+        let message = RemoteMessage::ApplyDraft(ApplyRequest {
+            request_id: 44,
+            base_revision: 7,
+            draft: ExperimentSpec::single_channel_lenia(2, 2),
+        });
+        assert_eq!(roundtrip(message.clone()), message);
+
+        let accepted = RemoteMessage::ApplyAccepted(ApplyAccepted {
+            request_id: 44,
+            revision: 8,
+            normalized_experiment: ExperimentSpec::single_channel_lenia(2, 2),
+        });
+        assert_eq!(roundtrip(accepted.clone()), accepted);
+
+        let rejected = RemoteMessage::ApplyRejected(ApplyRejected {
+            request_id: 45,
+            diagnostics: vec![Diagnostic {
+                code: "invalid_experiment".to_string(),
+                message: "bad field".to_string(),
+                path: DiagnosticPath(vec!["channels".to_string(), "0".to_string()]),
+            }],
+        });
+        assert_eq!(roundtrip(rejected.clone()), rejected);
+    }
+
+    #[test]
+    fn experiment_state_roundtrips_authoritative_revision() {
+        let message = RemoteMessage::ExperimentState {
+            revision: 12,
+            normalized_experiment: ExperimentSpec::single_channel_lenia(3, 2),
+        };
+        assert_eq!(roundtrip(message.clone()), message);
+    }
+
+    #[test]
+    fn oversized_apply_draft_is_rejected_before_allocation() {
+        let mut header = Vec::new();
+        header.extend_from_slice(&MAGIC);
+        header.extend_from_slice(&[PROTOCOL_VERSION, 7]);
+        header.extend_from_slice(&(MAX_FRAME_SIZE + 1).to_le_bytes());
+        assert!(matches!(
+            read_message(&mut IoCursor::new(header)),
+            Err(ProtocolError::Invalid(_))
+        ));
     }
 }
