@@ -3,6 +3,7 @@ use crate::render::display::{AsyncRasterizer, ViewportDisplay};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+pub mod workbench;
 
 const MINIMUM_KERNEL_PREVIEW_ROWS: usize = 8;
 
@@ -36,6 +37,14 @@ fn draw_impl(
         ratatui::layout::Constraint::Min(28),
     ])
     .split(chunks[0]);
+    if app.mode() == crate::workbench::AppMode::Workbench {
+        workbench::draw_workbench(frame, app, chunks[0]);
+        draw_footer(frame, app, display, chunks[1]);
+        if app.help_visible() {
+            render_help(frame, outer);
+        }
+        return false;
+    }
     let viewport_area = if outer.width >= 96 {
         content[0]
     } else {
@@ -102,6 +111,47 @@ fn draw_impl(
         chunks[1],
     );
     fresh_graphics
+}
+
+fn draw_footer(
+    frame: &mut ratatui::Frame,
+    app: &App,
+    display: &ViewportDisplay,
+    area: ratatui::layout::Rect,
+) {
+    frame.render_widget(Clear, area);
+    let row1 = format!(
+        "Workbench · {} · {:?} · tick {} · display {}",
+        app.workbench().section().label(),
+        app.workbench().status(),
+        app.tick(),
+        display.protocol().label()
+    );
+    let row2 = "[T] section  [Tab] focus  [Ctrl+Z/Y] undo/redo  [Ctrl+Enter] Apply  [W] simulate  [?] help";
+    let lines = vec![
+        Line::from(fit_segments(area.width as usize, &[&row1])),
+        Line::from(fit_segments(area.width as usize, &[row2])),
+    ];
+    frame.render_widget(
+        Paragraph::new(lines).style(
+            Style::default()
+                .bg(Color::Rgb(12, 18, 32))
+                .fg(Color::Rgb(190, 215, 255)),
+        ),
+        area,
+    );
+}
+
+fn fit_segments(width: usize, segments: &[&str]) -> String {
+    let mut result = String::new();
+    for segment in segments {
+        let separator = if result.is_empty() { "" } else { "  " };
+        if result.chars().count() + separator.chars().count() + segment.chars().count() <= width {
+            result.push_str(separator);
+            result.push_str(segment);
+        }
+    }
+    result
 }
 
 fn render_kernel_preview(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {

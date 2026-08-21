@@ -19,6 +19,40 @@ pub enum Command {
     NextPanel,
     ToggleExpressionEditor,
     ToggleHelp,
+    ToggleWorkbench,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum UiCommand {
+    ApplyDraft,
+    RevertDraft,
+    Undo,
+    Redo,
+    FocusNext,
+    FocusPrevious,
+}
+
+pub fn translate_ui_key(event: &KeyEvent) -> Option<UiCommand> {
+    if event.kind == crossterm::event::KeyEventKind::Release {
+        return None;
+    }
+    match (event.code, event.modifiers) {
+        (KeyCode::Enter, modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(UiCommand::ApplyDraft)
+        }
+        (KeyCode::Char('z'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(UiCommand::Undo)
+        }
+        (KeyCode::Char('y'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(UiCommand::Redo)
+        }
+        (KeyCode::Char('r'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+            Some(UiCommand::RevertDraft)
+        }
+        (KeyCode::BackTab, _) => Some(UiCommand::FocusPrevious),
+        (KeyCode::Tab, _) => Some(UiCommand::FocusNext),
+        _ => None,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -60,6 +94,7 @@ pub fn translate_key(event: &KeyEvent) -> Option<Command> {
         KeyCode::Char('t') => Some(Command::NextPanel),
         KeyCode::Char('e') => Some(Command::ToggleExpressionEditor),
         KeyCode::Char('?') => Some(Command::ToggleHelp),
+        KeyCode::Char('w') => Some(Command::ToggleWorkbench),
         KeyCode::Char('q') | KeyCode::Esc => Some(Command::Quit),
         _ => None,
     }
@@ -200,6 +235,10 @@ mod tests {
             Some(Command::ToggleHelp)
         );
         assert_eq!(
+            translate_key(&key(KeyCode::Char('w'))),
+            Some(Command::ToggleWorkbench)
+        );
+        assert_eq!(
             translate_key(&key(KeyCode::Char('e'))),
             Some(Command::ToggleExpressionEditor)
         );
@@ -213,6 +252,26 @@ mod tests {
     fn ctrl_c_also_quits() {
         let event = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
         assert_eq!(translate_key(&event), Some(Command::Quit));
+    }
+
+    #[test]
+    fn workbench_shortcuts_require_expected_modifiers() {
+        assert_eq!(
+            translate_ui_key(&KeyEvent::new(KeyCode::Enter, KeyModifiers::CONTROL)),
+            Some(UiCommand::ApplyDraft)
+        );
+        assert_ne!(
+            translate_ui_key(&key(KeyCode::Enter)),
+            Some(UiCommand::ApplyDraft)
+        );
+        assert_eq!(
+            translate_ui_key(&KeyEvent::new(KeyCode::Char('z'), KeyModifiers::CONTROL)),
+            Some(UiCommand::Undo)
+        );
+        assert_eq!(
+            translate_ui_key(&KeyEvent::new(KeyCode::BackTab, KeyModifiers::SHIFT)),
+            Some(UiCommand::FocusPrevious)
+        );
     }
 
     #[test]

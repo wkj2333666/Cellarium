@@ -7,7 +7,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
-use crate::input::Command;
+use crate::input::{Command, UiCommand};
 use crate::render::camera::Camera;
 use crate::render::raster::{Framebuffer, rasterize_world_into};
 use crate::sim::backend::{BackendKind, SimulationBackend};
@@ -17,6 +17,7 @@ use crate::sim::rule::SimulationSpec;
 use crate::sim::service::{ApplyAccepted, ApplyRejected, ApplyRequest, Diagnostic, DiagnosticPath};
 use crate::sim::tiling::PeriodicTilingDraft;
 use crate::sim::world::World;
+use crate::workbench::{AppMode, WorkbenchState};
 use crossterm::event::{Event, KeyCode, KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 use std::path::Path;
@@ -84,6 +85,8 @@ pub struct App {
     graphics_rate: f64,
     experiment_model: ExperimentSpec,
     experiment_revision: u64,
+    mode: AppMode,
+    workbench: WorkbenchState,
 }
 
 impl App {
@@ -106,6 +109,7 @@ impl App {
             ExperimentSpec::single_channel_lenia(width as u32, height as u32);
         experiment_model.name = rule_name(&spec).to_string();
         experiment_model.channels[0].initial = world.cells().to_vec();
+        let workbench = WorkbenchState::new(experiment_model.clone());
         Self {
             spec: spec.clone(),
             backend,
@@ -138,11 +142,66 @@ impl App {
             graphics_rate: 0.0,
             experiment_model,
             experiment_revision: 0,
+            mode: AppMode::Simulation,
+            workbench,
         }
     }
 
     pub fn paused(&self) -> bool {
         self.paused
+    }
+
+    pub fn mode(&self) -> AppMode {
+        self.mode
+    }
+    pub fn workbench(&self) -> &WorkbenchState {
+        &self.workbench
+    }
+    pub fn workbench_mut(&mut self) -> &mut WorkbenchState {
+        &mut self.workbench
+    }
+    pub fn enter_workbench(&mut self) {
+        self.mode = AppMode::Workbench;
+    }
+    pub fn leave_workbench(&mut self) {
+        self.mode = AppMode::Simulation;
+    }
+    pub fn workbench_apply_request(&self, request_id: u64) -> ApplyRequest {
+        ApplyRequest {
+            request_id,
+            base_revision: self.experiment_revision,
+            draft: self.workbench.draft().clone(),
+        }
+    }
+    pub fn handle_workbench_ui(&mut self, command: UiCommand) -> Result<(), String> {
+        match command {
+            UiCommand::Undo => self.workbench.undo().map_err(|error| error.to_string()),
+            UiCommand::Redo => self.workbench.redo().map_err(|error| error.to_string()),
+            UiCommand::RevertDraft => {
+                self.workbench.revert();
+                Ok(())
+            }
+            UiCommand::FocusNext => {
+                self.workbench.focus_next();
+                Ok(())
+            }
+            UiCommand::FocusPrevious => {
+                self.workbench.focus_previous();
+                Ok(())
+            }
+            UiCommand::ApplyDraft => {
+                let request =
+                    self.workbench_apply_request(self.experiment_revision.wrapping_add(1));
+                self.submit_draft(request).map(|_| ()).map_err(|rejected| {
+                    rejected
+                        .diagnostics
+                        .into_iter()
+                        .map(|d| d.message)
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })
+            }
+        }
     }
 
     pub fn tick(&self) -> u64 {
@@ -220,7 +279,8 @@ impl App {
                 .map(|error| error.to_string())
                 .collect::<Vec<_>>()
         })?;
-        self.experiment_model = candidate;
+        self.experiment_model = candidate.clone();
+        self.workbench.accept(candidate);
         self.kernel_error = None;
         self.backend_error = None;
         Ok(())
@@ -314,6 +374,7 @@ impl App {
             });
         }
         self.experiment_model = request.draft.clone();
+        self.workbench.accept(request.draft.clone());
         self.experiment_revision =
             self.experiment_revision
                 .checked_add(1)
@@ -666,9 +727,22 @@ impl App {
             Command::ToggleKernelPreview => {
                 self.kernel_preview_enabled = !self.kernel_preview_enabled;
             }
-            Command::NextPanel => self.active_panel = self.active_panel.next(),
+            Command::NextPanel => {
+                if self.mode == AppMode::Workbench {
+                    self.workbench.section_next();
+                } else {
+                    self.active_panel = self.active_panel.next();
+                }
+            }
             Command::ToggleExpressionEditor => self.toggle_expression_editor(),
             Command::ToggleHelp => self.help_visible = !self.help_visible,
+            Command::ToggleWorkbench => {
+                self.mode = if self.mode == AppMode::Simulation {
+                    AppMode::Workbench
+                } else {
+                    AppMode::Simulation
+                }
+            }
             Command::Quit => {}
         }
     }
@@ -677,12 +751,25 @@ impl App {
         match command {
             Command::TogglePause => self.paused = !self.paused,
             Command::Clear => self.world.clear(),
-            Command::NextPanel => self.active_panel = self.active_panel.next(),
+            Command::NextPanel => {
+                if self.mode == AppMode::Workbench {
+                    self.workbench.section_next();
+                } else {
+                    self.active_panel = self.active_panel.next();
+                }
+            }
             Command::ToggleKernelPreview => {
                 self.kernel_preview_enabled = !self.kernel_preview_enabled;
             }
             Command::ToggleExpressionEditor => self.toggle_expression_editor(),
             Command::ToggleHelp => self.help_visible = !self.help_visible,
+            Command::ToggleWorkbench => {
+                self.mode = if self.mode == AppMode::Simulation {
+                    AppMode::Workbench
+                } else {
+                    AppMode::Simulation
+                }
+            }
             Command::Quit
             | Command::Step
             | Command::Reset
@@ -1604,11 +1691,13 @@ where
                     experiment,
                 } => {
                     app.experiment_revision = revision;
-                    app.experiment_model = experiment;
+                    app.experiment_model = experiment.clone();
+                    app.workbench.accept(experiment);
                 }
                 RemoteUpdate::ApplyAccepted(accepted) => {
                     app.experiment_revision = accepted.revision;
-                    app.experiment_model = accepted.normalized_experiment;
+                    app.experiment_model = accepted.normalized_experiment.clone();
+                    app.workbench.accept(accepted.normalized_experiment);
                 }
                 RemoteUpdate::ApplyRejected(rejected) => {
                     app.backend_error = rejected
@@ -1714,6 +1803,25 @@ fn handle_remote_terminal_event<W: std::io::Write>(
                         next_input_sequence,
                         InputMessage::ExpressionKey(expression_key),
                     )?;
+                }
+                return Ok(false);
+            }
+            if app.mode() == AppMode::Workbench
+                && let Some(ui_command) = crate::input::translate_ui_key(&key)
+            {
+                if ui_command == UiCommand::ApplyDraft {
+                    let request = app.workbench_apply_request(*next_input_sequence);
+                    let mut guard = writer
+                        .lock()
+                        .map_err(|_| std::io::Error::other("SSH writer mutex poisoned"))?;
+                    crate::remote::write_message(
+                        &mut *guard,
+                        &crate::remote::RemoteMessage::ApplyDraft(request),
+                    )
+                    .map_err(std::io::Error::other)?;
+                    *next_input_sequence = (*next_input_sequence).wrapping_add(1).max(1);
+                } else {
+                    let _ = app.handle_workbench_ui(ui_command);
                 }
                 return Ok(false);
             }
@@ -1984,6 +2092,12 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
                 Event::Key(key) => {
                     if app.expression_editing() {
                         app.handle_expression_key(key);
+                        continue;
+                    }
+                    if app.mode() == AppMode::Workbench
+                        && let Some(ui_command) = crate::input::translate_ui_key(&key)
+                    {
+                        let _ = app.handle_workbench_ui(ui_command);
                         continue;
                     }
                     if let Some(command) = crate::input::translate_key(&key) {
