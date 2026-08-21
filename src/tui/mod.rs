@@ -1,12 +1,30 @@
 use crate::app::App;
-use crate::render::display::ViewportDisplay;
+use crate::render::display::{AsyncRasterizer, ViewportDisplay};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
 
 const MINIMUM_KERNEL_PREVIEW_ROWS: usize = 8;
 
-pub fn draw(frame: &mut ratatui::Frame, app: &mut App, display: &ViewportDisplay) {
+pub fn draw(frame: &mut ratatui::Frame, app: &mut App, display: &ViewportDisplay) -> bool {
+    draw_impl(frame, app, display, None)
+}
+
+pub fn draw_remote(
+    frame: &mut ratatui::Frame,
+    app: &mut App,
+    display: &ViewportDisplay,
+    rasterizer: &AsyncRasterizer,
+) -> bool {
+    draw_impl(frame, app, display, Some(rasterizer))
+}
+
+fn draw_impl(
+    frame: &mut ratatui::Frame,
+    app: &mut App,
+    display: &ViewportDisplay,
+    rasterizer: Option<&AsyncRasterizer>,
+) -> bool {
     let outer = frame.area();
     let chunks = ratatui::layout::Layout::vertical([
         ratatui::layout::Constraint::Min(3),
@@ -32,10 +50,24 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App, display: &ViewportDisplay
     let (frame_width, frame_height) = display.framebuffer_size(viewport);
     app.set_viewport(viewport, [frame_width, frame_height]);
 
+    let mut fresh_graphics = false;
     if viewport.width > 0 && viewport.height > 0 {
-        let framebuffer = app.render_framebuffer(frame_width, frame_height);
         frame.render_widget(block, viewport_area);
-        display.render(frame, viewport, framebuffer);
+        fresh_graphics = if let Some(rasterizer) = rasterizer
+            && display.protocol().is_pixel_protocol()
+        {
+            display.render_async(
+                frame,
+                viewport,
+                app.world(),
+                *app.camera(),
+                rasterizer,
+                app.applied_input_sequence(),
+            )
+        } else {
+            let framebuffer = app.render_framebuffer(frame_width, frame_height);
+            display.render(frame, viewport, framebuffer)
+        };
     }
 
     if outer.width >= 96 {
@@ -63,6 +95,7 @@ pub fn draw(frame: &mut ratatui::Frame, app: &mut App, display: &ViewportDisplay
         Paragraph::new(status).style(Style::default().bg(Color::Rgb(12, 18, 32))),
         chunks[1],
     );
+    fresh_graphics
 }
 
 fn render_kernel_preview(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
@@ -244,6 +277,7 @@ fn editor_panel_lines(app: &App, max_width: usize, max_height: usize) -> Vec<Str
         return Vec::new();
     }
     let (simulation_rate, render_rate) = app.rates();
+    let (snapshot_rate, graphics_rate) = app.remote_transport_rates();
     let performance = app.performance();
     let world = app.world();
     let mut lines = vec![
@@ -251,7 +285,7 @@ fn editor_panel_lines(app: &App, max_width: usize, max_height: usize) -> Vec<Str
         format!("size {}×{} · scalar channel", world.width(), world.height()),
         "boundary periodic · editable viewport".to_string(),
         format!("{} RULE", panel_marker(app, crate::app::Panel::Rule)),
-        crate::app::rule_name(app.spec()).to_string(),
+        app.display_rule_name().to_string(),
         if app.expression_editing() {
             format!("edit: {}", app.expression_buffer())
         } else {
@@ -280,19 +314,49 @@ fn editor_panel_lines(app: &App, max_width: usize, max_height: usize) -> Vec<Str
         "square lattice · dense periodic CSR-ready".to_string(),
         "custom lattice/domain editor available".to_string(),
         "STATISTICS".to_string(),
-        format!("tick {} · sim {:.1}/s", app.tick(), simulation_rate),
-        format!(
-            "render {:.1}/s · inspect {:?}",
-            render_rate,
-            app.inspected()
-        ),
-        format!(
-            "step {:.2}/{:.2} ms · render {:.2}/{:.2} ms",
-            performance.last_step_ms,
-            performance.average_step_ms,
-            performance.last_render_ms,
-            performance.average_render_ms
-        ),
+        if app.is_remote_mirror() {
+            format!("tick {} · server sim {:.1}/s", app.tick(), simulation_rate)
+        } else {
+            format!("tick {} · sim {:.1}/s", app.tick(), simulation_rate)
+        },
+        if app.is_remote_mirror() {
+            format!(
+                "snapshot rx {:.1}/s · UI draw {:.1}/s",
+                snapshot_rate, render_rate
+            )
+        } else {
+            format!(
+                "render {:.1}/s · inspect {:?}",
+                render_rate,
+                app.inspected()
+            )
+        },
+        if app.is_remote_mirror() {
+            format!(
+                "fresh graphics {:.1}/s · inspect {:?}",
+                graphics_rate,
+                app.inspected()
+            )
+        } else {
+            String::new()
+        },
+        if app.is_remote_mirror() {
+            format!(
+                "server step {:.2}/{:.2} ms · UI draw {:.2}/{:.2} ms",
+                performance.last_step_ms,
+                performance.average_step_ms,
+                performance.last_render_ms,
+                performance.average_render_ms
+            )
+        } else {
+            format!(
+                "step {:.2}/{:.2} ms · render {:.2}/{:.2} ms",
+                performance.last_step_ms,
+                performance.average_step_ms,
+                performance.last_render_ms,
+                performance.average_render_ms
+            )
+        },
         format!("{} ERRORS", panel_marker(app, crate::app::Panel::Errors)),
         app.backend_error().unwrap_or("none").to_string(),
         "[T] next panel · mouse targets viewport".to_string(),
@@ -354,14 +418,29 @@ fn status_text_with_error(
     backend_error: Option<&str>,
 ) -> String {
     let (simulation_rate, render_rate) = app.rates();
+    let (snapshot_rate, graphics_rate) = app.remote_transport_rates();
     let world = app.world();
     let inspected = app
         .inspected()
         .map_or("—".to_string(), |value| format!("{value:.3}"));
+    let rates = if app.is_remote_mirror() {
+        format!(
+            "server sim {:.1}/s · snapshot rx {:.1}/s · UI draw {:.1}/s · graphics {:.1}/s",
+            simulation_rate, snapshot_rate, render_rate, graphics_rate
+        )
+    } else {
+        format!("sim {:.1}/s · render {:.1}/s", simulation_rate, render_rate)
+    };
+    let prefix = if app.is_remote_mirror() {
+        format!("ack {} · ", app.applied_input_sequence())
+    } else {
+        String::new()
+    };
     let status = format!(
-        "{} · {} · {} · tick {} · {}×{} · zoom {:.1}× · inspect {} · display {} · sim {:.1}/s · render {:.1}/s",
+        "{}{} · {} · {} · tick {} · {}×{} · zoom {:.1}× · inspect {} · display {} · {}",
+        prefix,
         app.backend_name(),
-        crate::app::rule_name(app.spec()),
+        app.display_rule_name(),
         if app.paused() { "paused" } else { "running" },
         app.tick(),
         world.width(),
@@ -369,8 +448,7 @@ fn status_text_with_error(
         app.camera().zoom(),
         inspected,
         display.protocol().label(),
-        simulation_rate,
-        render_rate,
+        rates,
     );
     if let Some(error) = backend_error {
         format!("{status} · error {error}")
@@ -398,6 +476,32 @@ mod tests {
         assert!(status.contains("render 47.0/s"));
         assert!(status.contains("8×8"));
         assert!(status.contains("display half-block fallback"));
+    }
+
+    #[test]
+    fn remote_status_labels_server_and_client_measurements() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 8, 8);
+        let mut snapshot = app.remote_snapshot();
+        snapshot.backend = "NVIDIA test GPU".into();
+        snapshot.tick = 17;
+        snapshot.simulation_rate = 29.5;
+        assert!(app.apply_remote_snapshot(&snapshot));
+        app.set_rates(29.5, 18.0);
+        app.set_remote_transport_rates(27.0, 16.0);
+
+        let status = status_text(&app, &ViewportDisplay::HalfBlock);
+        let panel = editor_panel_lines(&app, 64, 32).join("\n");
+
+        assert!(status.contains("NVIDIA test GPU"));
+        assert!(status.contains("server sim 29.5/s"));
+        assert!(status.contains("UI draw 18.0/s"));
+        assert!(status.contains("snapshot rx 27.0/s"));
+        assert!(status.contains("graphics 16.0/s"));
+        assert!(panel.contains("tick 17 · server sim 29.5/s"));
+        assert!(panel.contains("UI draw 18.0/s"));
+        assert!(panel.contains("snapshot rx 27.0/s"));
+        assert!(panel.contains("fresh graphics 16.0/s"));
+        assert!(panel.contains("server step"));
     }
 
     #[test]

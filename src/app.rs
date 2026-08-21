@@ -71,6 +71,12 @@ pub struct App {
     expression_buffer: String,
     framebuffer: Option<Framebuffer>,
     performance: PerformanceStats,
+    remote_tick: Option<u64>,
+    remote_backend: Option<String>,
+    remote_rule: Option<String>,
+    applied_input_sequence: u64,
+    snapshot_rate: f64,
+    graphics_rate: f64,
 }
 
 impl App {
@@ -112,6 +118,12 @@ impl App {
             expression_buffer: String::new(),
             framebuffer: None,
             performance: PerformanceStats::default(),
+            remote_tick: None,
+            remote_backend: None,
+            remote_rule: None,
+            applied_input_sequence: 0,
+            snapshot_rate: 0.0,
+            graphics_rate: 0.0,
         }
     }
 
@@ -120,7 +132,7 @@ impl App {
     }
 
     pub fn tick(&self) -> u64 {
-        self.backend.tick()
+        self.remote_tick.unwrap_or_else(|| self.backend.tick())
     }
 
     pub fn backend_error(&self) -> Option<&str> {
@@ -134,7 +146,32 @@ impl App {
     }
 
     pub fn backend_name(&self) -> &str {
-        self.backend.device_name()
+        self.remote_backend
+            .as_deref()
+            .unwrap_or_else(|| self.backend.device_name())
+    }
+
+    pub fn is_remote_mirror(&self) -> bool {
+        self.remote_tick.is_some()
+    }
+
+    pub fn display_rule_name(&self) -> &str {
+        self.remote_rule
+            .as_deref()
+            .unwrap_or_else(|| rule_name(&self.spec))
+    }
+
+    pub fn applied_input_sequence(&self) -> u64 {
+        self.applied_input_sequence
+    }
+
+    pub fn set_remote_transport_rates(&mut self, snapshot: f64, graphics: f64) {
+        self.snapshot_rate = snapshot;
+        self.graphics_rate = graphics;
+    }
+
+    pub fn remote_transport_rates(&self) -> (f64, f64) {
+        (self.snapshot_rate, self.graphics_rate)
     }
 
     pub fn selected_kernel_name(&self) -> &str {
@@ -225,6 +262,7 @@ impl App {
 
     pub fn remote_snapshot(&self) -> crate::remote::Snapshot {
         let (simulation_rate, render_rate) = self.rates();
+        let performance = self.performance();
         crate::remote::Snapshot {
             width: self.world.width() as u32,
             height: self.world.height() as u32,
@@ -232,8 +270,20 @@ impl App {
             paused: self.paused,
             simulation_rate,
             render_rate,
+            last_step_ms: performance.last_step_ms,
+            average_step_ms: performance.average_step_ms,
+            step_samples: performance.step_samples,
+            applied_input_sequence: self.applied_input_sequence,
             backend: self.backend_name().to_string(),
             rule: rule_name(&self.spec).to_string(),
+            spec: Box::new(self.spec.clone()),
+            selected_kernel: Box::new(
+                self.kernel_definitions
+                    .get(self.selected_kernel)
+                    .cloned()
+                    .unwrap_or_else(|| definition_from_kernel(&self.spec.kernel)),
+            ),
+            selected_parameter: self.selected_parameter.clone(),
             error: self.backend_error().map(str::to_string),
             cells: self.world.cells().to_vec(),
         }
@@ -246,11 +296,38 @@ impl App {
         if !dimensions_match {
             return false;
         }
+        if snapshot.selected_kernel.build().is_err()
+            || definition_from_kernel(&snapshot.spec.kernel)
+                .build()
+                .is_err()
+        {
+            return false;
+        }
         self.world.replace_cells(&snapshot.cells);
         self.paused = snapshot.paused;
+        self.remote_tick = Some(snapshot.tick);
+        self.remote_backend = Some(snapshot.backend.clone());
+        self.apply_remote_spec(&snapshot.rule, &snapshot.spec, &snapshot.selected_kernel);
+        self.selected_parameter = snapshot.selected_parameter.clone();
+        self.applied_input_sequence = snapshot.applied_input_sequence;
         self.simulation_rate = snapshot.simulation_rate;
+        self.performance.last_step_ms = snapshot.last_step_ms;
+        self.performance.average_step_ms = snapshot.average_step_ms;
+        self.performance.step_samples = snapshot.step_samples;
         self.backend_error = snapshot.error.clone();
         true
+    }
+
+    fn apply_remote_spec(
+        &mut self,
+        name: &str,
+        spec: &SimulationSpec,
+        selected_kernel: &KernelDefinition,
+    ) {
+        self.remote_rule = Some(name.to_string());
+        self.spec = spec.clone();
+        self.kernel_definitions = vec![selected_kernel.clone()];
+        self.selected_kernel = 0;
     }
 
     pub fn camera(&self) -> &Camera {
@@ -430,6 +507,29 @@ impl App {
             Command::NextPanel => self.active_panel = self.active_panel.next(),
             Command::ToggleExpressionEditor => self.toggle_expression_editor(),
             Command::Quit => {}
+        }
+    }
+
+    pub fn handle_remote_command_optimistically(&mut self, command: Command) {
+        match command {
+            Command::TogglePause => self.paused = !self.paused,
+            Command::Clear => self.world.clear(),
+            Command::NextPanel => self.active_panel = self.active_panel.next(),
+            Command::ToggleKernelPreview => {
+                self.kernel_preview_enabled = !self.kernel_preview_enabled;
+            }
+            Command::ToggleExpressionEditor => self.toggle_expression_editor(),
+            Command::Quit
+            | Command::Step
+            | Command::Reset
+            | Command::Randomize
+            | Command::Conway
+            | Command::Lenia
+            | Command::NextKernel
+            | Command::NextKernelParameter
+            | Command::IncreaseKernelParameter
+            | Command::DecreaseKernelParameter
+            | Command::RegenerateKernel => {}
         }
     }
 
@@ -624,14 +724,57 @@ mod remote_snapshot_tests {
         app.world_mut().replace_cells(&[0.1, 0.2, 0.3, 0.4]);
         app.handle_command(Command::TogglePause);
         app.set_rates(12.0, 30.0);
-        let snapshot = app.remote_snapshot();
+        app.record_step_duration(Duration::from_millis(2));
+        let mut snapshot = app.remote_snapshot();
+        snapshot.tick = 42;
+        snapshot.backend = "NVIDIA test GPU".into();
+        snapshot.applied_input_sequence = 19;
 
         let mut mirror = App::new(SimulationSpec::conway(), 2, 2);
         mirror.set_rates(0.0, 7.0);
         assert!(mirror.apply_remote_snapshot(&snapshot));
         assert_eq!(mirror.world().cells(), &[0.1, 0.2, 0.3, 0.4]);
         assert!(mirror.paused());
+        assert_eq!(mirror.tick(), 42);
+        assert_eq!(mirror.backend_name(), "NVIDIA test GPU");
+        assert!(mirror.is_remote_mirror());
+        assert_eq!(mirror.applied_input_sequence(), 19);
+        assert_eq!(mirror.performance().last_step_ms, 2.0);
         assert_eq!(mirror.rates(), (12.0, 7.0));
+    }
+
+    #[test]
+    fn remote_snapshot_applies_authoritative_builtin_rule_metadata() {
+        let mut mirror = App::new(SimulationSpec::lenia_orbium(), 2, 2);
+        let mut snapshot = mirror.remote_snapshot();
+        snapshot.rule = "Conway".into();
+        snapshot.spec = Box::new(SimulationSpec::conway());
+        snapshot.selected_kernel = Box::new(definition_from_kernel(&snapshot.spec.kernel));
+
+        assert!(mirror.apply_remote_snapshot(&snapshot));
+
+        assert_eq!(mirror.display_rule_name(), "Conway");
+        assert!(matches!(mirror.spec().rule, crate::sim::rule::Rule::Conway));
+    }
+
+    #[test]
+    fn remote_snapshot_applies_authoritative_kernel_parameter_and_growth_metadata() {
+        let mut server = App::new(SimulationSpec::lenia_orbium(), 2, 2);
+        server.handle_command(Command::NextKernelParameter);
+        server.handle_command(Command::IncreaseKernelParameter);
+        assert!(server.set_growth_expression("potential - mu"));
+        let snapshot = server.remote_snapshot();
+
+        let mut mirror = App::new(SimulationSpec::lenia_orbium(), 2, 2);
+        assert!(mirror.apply_remote_snapshot(&snapshot));
+
+        assert_eq!(mirror.spec(), server.spec());
+        assert_eq!(mirror.selected_kernel_name(), server.selected_kernel_name());
+        assert_eq!(
+            mirror.selected_kernel_parameter(),
+            server.selected_kernel_parameter()
+        );
+        assert_eq!(mirror.expression_buffer(), server.expression_buffer());
     }
 
     #[test]
@@ -642,12 +785,114 @@ mod remote_snapshot_tests {
         let mut mirror = App::new(SimulationSpec::conway(), 2, 2);
         assert!(!mirror.apply_remote_snapshot(&snapshot));
     }
+
+    #[test]
+    fn remote_optimistic_step_never_executes_the_local_backend() {
+        let mut mirror = App::new(SimulationSpec::lenia_orbium(), 8, 8);
+        let mut snapshot = mirror.remote_snapshot();
+        snapshot.tick = 41;
+        snapshot.paused = true;
+        assert!(mirror.apply_remote_snapshot(&snapshot));
+
+        mirror.handle_remote_command_optimistically(Command::Step);
+
+        assert_eq!(mirror.tick(), 41);
+        assert_eq!(mirror.performance().step_samples, 0);
+    }
+
+    #[test]
+    fn latest_remote_update_slot_overwrites_stale_snapshots() {
+        let slot = LatestRemoteUpdate::default();
+        let mut first = App::new(SimulationSpec::conway(), 1, 1).remote_snapshot();
+        first.tick = 1;
+        let mut latest = first.clone();
+        latest.tick = 3;
+
+        slot.store(RemoteUpdate::Snapshot {
+            snapshot: first,
+            receive_rate: 1.0,
+        });
+        slot.store(RemoteUpdate::Snapshot {
+            snapshot: latest,
+            receive_rate: 3.0,
+        });
+
+        let RemoteUpdate::Snapshot {
+            snapshot,
+            receive_rate,
+        } = slot.take().expect("latest update")
+        else {
+            panic!("expected snapshot");
+        };
+        assert_eq!(snapshot.tick, 3);
+        assert_eq!(receive_rate, 3.0);
+        assert!(slot.take().is_none());
+    }
+
+    #[test]
+    fn remote_server_processes_at_most_one_simulation_step_between_input_checks() {
+        assert_eq!(SERVER_MAX_STEPS_PER_ITERATION, 1);
+    }
 }
 
 pub struct RateMeter {
     window: Duration,
     events: Vec<Instant>,
     rate: f64,
+}
+
+const SERVER_MAX_STEPS_PER_ITERATION: usize = 1;
+
+struct LatestServerSnapshotState {
+    snapshot: Option<crate::remote::Snapshot>,
+    closed: bool,
+}
+
+#[derive(Clone)]
+struct LatestServerSnapshots {
+    state: Arc<(Mutex<LatestServerSnapshotState>, Condvar)>,
+}
+
+impl LatestServerSnapshots {
+    fn new() -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(LatestServerSnapshotState {
+                    snapshot: None,
+                    closed: false,
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    fn store(&self, snapshot: crate::remote::Snapshot) {
+        let (lock, wake) = &*self.state;
+        if let Ok(mut state) = lock.lock()
+            && !state.closed
+        {
+            state.snapshot = Some(snapshot);
+            wake.notify_one();
+        }
+    }
+
+    fn recv(&self) -> Option<crate::remote::Snapshot> {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().ok()?;
+        while state.snapshot.is_none() && !state.closed {
+            state = wake.wait(state).ok()?;
+        }
+        state.snapshot.take()
+    }
+
+    fn close(&self) {
+        let (lock, wake) = &*self.state;
+        if let Ok(mut state) = lock.lock() {
+            state.closed = true;
+            state.snapshot = None;
+            wake.notify_all();
+        }
+    }
 }
 
 impl RateMeter {
@@ -795,11 +1040,11 @@ where
         }
     });
 
-    let (snapshot_tx, snapshot_rx) = mpsc::sync_channel::<Option<crate::remote::Snapshot>>(1);
+    let snapshot_tx = LatestServerSnapshots::new();
+    let snapshot_rx = snapshot_tx.clone();
     std::thread::spawn(move || {
         let mut writer = writer;
-        while let Ok(snapshot) = snapshot_rx.recv() {
-            let Some(snapshot) = snapshot else { break };
+        while let Some(snapshot) = snapshot_rx.recv() {
             if write_message(&mut writer, &RemoteMessage::Snapshot(snapshot)).is_err() {
                 break;
             }
@@ -820,11 +1065,12 @@ where
         let elapsed = now.saturating_duration_since(last_iteration);
         last_iteration = now;
 
+        let mut force_snapshot = false;
         loop {
             match input_rx.try_recv() {
                 Ok(RemoteMessage::Hello) => {
                     connected = true;
-                    let _ = snapshot_tx.try_send(Some(app.remote_snapshot()));
+                    snapshot_tx.store(app.remote_snapshot());
                 }
                 Ok(RemoteMessage::Viewport { width, height }) => {
                     let width = width.max(1);
@@ -834,35 +1080,39 @@ where
                         [width as usize, height as usize * 2],
                     );
                 }
-                Ok(RemoteMessage::Input(input)) => match input {
-                    InputMessage::Command(Command::Quit) => {
-                        let _ = snapshot_tx.send(None);
-                        return Ok(());
-                    }
-                    InputMessage::Command(command) => app.handle_command(command),
-                    InputMessage::ExpressionKey(key) => {
-                        if app.expression_editing() {
-                            let code = match key {
-                                ExpressionKey::Char(c) => KeyCode::Char(c),
-                                ExpressionKey::Backspace => KeyCode::Backspace,
-                                ExpressionKey::Enter => KeyCode::Enter,
-                                ExpressionKey::Escape => KeyCode::Esc,
-                            };
-                            app.handle_expression_key(KeyEvent::new(code, KeyModifiers::NONE));
+                Ok(RemoteMessage::Input { sequence, input }) => {
+                    match input {
+                        InputMessage::Command(Command::Quit) => {
+                            snapshot_tx.close();
+                            return Ok(());
+                        }
+                        InputMessage::Command(command) => app.handle_command(command),
+                        InputMessage::ExpressionKey(key) => {
+                            if app.expression_editing() {
+                                let code = match key {
+                                    ExpressionKey::Char(c) => KeyCode::Char(c),
+                                    ExpressionKey::Backspace => KeyCode::Backspace,
+                                    ExpressionKey::Enter => KeyCode::Enter,
+                                    ExpressionKey::Escape => KeyCode::Esc,
+                                };
+                                app.handle_expression_key(KeyEvent::new(code, KeyModifiers::NONE));
+                            }
+                        }
+                        InputMessage::Mouse(mouse) => {
+                            app.handle_mouse(mouse, &mut tracker);
                         }
                     }
-                    InputMessage::Mouse(mouse) => {
-                        app.handle_mouse(mouse, &mut tracker);
-                    }
-                },
+                    app.applied_input_sequence = app.applied_input_sequence.max(sequence);
+                    force_snapshot = true;
+                }
                 Ok(RemoteMessage::Quit) => {
-                    let _ = snapshot_tx.send(None);
+                    snapshot_tx.close();
                     return Ok(());
                 }
                 Ok(RemoteMessage::Snapshot(_)) => {}
                 Err(TryRecvError::Empty) => break,
                 Err(TryRecvError::Disconnected) => {
-                    let _ = snapshot_tx.send(None);
+                    snapshot_tx.close();
                     return Ok(());
                 }
             }
@@ -871,9 +1121,11 @@ where
         if !app.paused() {
             simulation_backlog += elapsed;
             let mut steps = 0;
-            while simulation_backlog >= simulation_interval && steps < 8 {
+            while simulation_backlog >= simulation_interval
+                && steps < SERVER_MAX_STEPS_PER_ITERATION
+            {
                 if app.step() {
-                    simulation_meter.record(now);
+                    simulation_meter.record(Instant::now());
                     simulation_backlog -= simulation_interval;
                     steps += 1;
                 } else {
@@ -888,11 +1140,14 @@ where
             simulation_backlog = Duration::ZERO;
         }
 
-        if connected && now.duration_since(last_snapshot) >= snapshot_interval {
-            simulation_meter.refresh(now);
+        let snapshot_now = Instant::now();
+        if connected
+            && (force_snapshot || snapshot_now.duration_since(last_snapshot) >= snapshot_interval)
+        {
+            simulation_meter.refresh(snapshot_now);
             app.set_rates(simulation_meter.rate(), 30.0);
-            let _ = snapshot_tx.try_send(Some(app.remote_snapshot()));
-            last_snapshot = now;
+            snapshot_tx.store(app.remote_snapshot());
+            last_snapshot = snapshot_now;
         }
         std::thread::sleep(Duration::from_millis(1));
     }
@@ -1007,8 +1262,28 @@ fn split_command_line(command: &str) -> Result<Vec<String>, &'static str> {
 }
 
 enum RemoteUpdate {
-    Snapshot(crate::remote::Snapshot),
+    Snapshot {
+        snapshot: crate::remote::Snapshot,
+        receive_rate: f64,
+    },
     Closed(Result<(), crate::remote::ProtocolError>),
+}
+
+#[derive(Clone, Default)]
+struct LatestRemoteUpdate {
+    update: Arc<Mutex<Option<RemoteUpdate>>>,
+}
+
+impl LatestRemoteUpdate {
+    fn store(&self, update: RemoteUpdate) {
+        if let Ok(mut slot) = self.update.lock() {
+            *slot = Some(update);
+        }
+    }
+
+    fn take(&self) -> Option<RemoteUpdate> {
+        self.update.lock().ok()?.take()
+    }
 }
 
 fn run_local_remote_viewer<R, W>(mut app: App, stdin: R, stdout: W) -> std::io::Result<()>
@@ -1017,7 +1292,7 @@ where
     W: std::io::Read + Send + 'static,
 {
     use crate::remote::{RemoteMessage, read_message, write_message};
-    use std::sync::{Arc, Mutex, mpsc};
+    use std::sync::{Arc, Mutex};
     let writer = Arc::new(Mutex::new(stdin));
     {
         let mut guard = writer
@@ -1025,21 +1300,29 @@ where
             .map_err(|_| std::io::Error::other("SSH writer mutex poisoned"))?;
         write_message(&mut *guard, &RemoteMessage::Hello).map_err(std::io::Error::other)?;
     }
-    let (snapshot_tx, snapshot_rx) = mpsc::sync_channel(2);
+    let snapshot_rx = LatestRemoteUpdate::default();
+    let snapshot_tx = snapshot_rx.clone();
     std::thread::spawn(move || {
         let mut stdout = stdout;
+        let mut receive_meter = RateMeter::new(Duration::from_secs(1));
         loop {
             match read_message(&mut stdout) {
                 Ok(Some(crate::remote::RemoteMessage::Snapshot(snapshot))) => {
-                    let _ = snapshot_tx.try_send(RemoteUpdate::Snapshot(snapshot));
+                    let received = Instant::now();
+                    receive_meter.record(received);
+                    receive_meter.refresh(received);
+                    snapshot_tx.store(RemoteUpdate::Snapshot {
+                        snapshot,
+                        receive_rate: receive_meter.rate(),
+                    });
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => {
-                    let _ = snapshot_tx.send(RemoteUpdate::Closed(Ok(())));
+                    snapshot_tx.store(RemoteUpdate::Closed(Ok(())));
                     break;
                 }
                 Err(error) => {
-                    let _ = snapshot_tx.send(RemoteUpdate::Closed(Err(error)));
+                    snapshot_tx.store(RemoteUpdate::Closed(Err(error)));
                     break;
                 }
             }
@@ -1073,49 +1356,71 @@ fn run_remote_loop<B, W>(
     terminal: &mut ratatui::Terminal<B>,
     display: crate::render::display::ViewportDisplay,
     writer: std::sync::Arc<std::sync::Mutex<W>>,
-    snapshot_rx: std::sync::mpsc::Receiver<RemoteUpdate>,
+    snapshot_rx: LatestRemoteUpdate,
 ) -> std::io::Result<()>
 where
     B: ratatui::backend::Backend<Error = std::io::Error>,
     W: std::io::Write,
 {
-    use crate::remote::{ExpressionKey, InputMessage, RemoteMessage, write_message};
+    use crate::remote::{RemoteMessage, write_message};
     let mut tracker = crate::input::MouseTracker::new();
     let mut render_meter = RateMeter::new(Duration::from_secs(1));
+    let mut graphics_meter = RateMeter::new(Duration::from_secs(1));
+    let rasterizer = crate::render::display::AsyncRasterizer::new();
+    let mut next_input_sequence = 1_u64;
     let render_interval = Duration::from_secs_f64(1.0 / 30.0);
     let mut last_render = Instant::now() - render_interval;
     let mut last_viewport = None;
     loop {
-        loop {
-            match snapshot_rx.try_recv() {
-                Ok(RemoteUpdate::Snapshot(snapshot)) => {
+        if let Some(update) = snapshot_rx.take() {
+            match update {
+                RemoteUpdate::Snapshot {
+                    snapshot,
+                    receive_rate,
+                } => {
+                    let previous_ack = app.applied_input_sequence();
                     let _ = app.apply_remote_snapshot(&snapshot);
+                    app.snapshot_rate = receive_rate;
+                    if app.applied_input_sequence() > previous_ack {
+                        last_render = Instant::now() - render_interval;
+                    }
                 }
-                Ok(RemoteUpdate::Closed(Ok(()))) => {
+                RemoteUpdate::Closed(Ok(())) => {
                     return Err(std::io::Error::new(
                         ErrorKind::UnexpectedEof,
                         "SSH connector closed the Cellarium protocol stream",
                     ));
                 }
-                Ok(RemoteUpdate::Closed(Err(error))) => {
+                RemoteUpdate::Closed(Err(error)) => {
                     return Err(std::io::Error::other(format!(
                         "SSH connector protocol failed: {error}"
                     )));
                 }
-                Err(std::sync::mpsc::TryRecvError::Empty) => break,
-                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err(std::io::Error::new(
-                        ErrorKind::UnexpectedEof,
-                        "SSH connector protocol reader stopped",
-                    ));
-                }
             }
         }
         let now = Instant::now();
+        let wait = render_interval
+            .saturating_sub(now.duration_since(last_render))
+            .min(Duration::from_millis(5));
+        if crossterm::event::poll(wait)? {
+            if handle_remote_terminal_event(
+                app,
+                &mut tracker,
+                &writer,
+                &mut next_input_sequence,
+                crossterm::event::read()?,
+            )? {
+                return Ok(());
+            }
+            last_render = Instant::now() - render_interval;
+        }
+
+        let now = Instant::now();
         if now.duration_since(last_render) >= render_interval {
-            render_meter.record(now);
             render_meter.refresh(now);
+            graphics_meter.refresh(now);
             app.render_rate = render_meter.rate();
+            app.graphics_rate = graphics_meter.rate();
             let viewport = app.viewport_geometry().map(|(_, frame)| frame);
             if viewport != last_viewport {
                 if let Some((area, _frame_size)) = app.viewport_geometry() {
@@ -1133,67 +1438,93 @@ where
                 }
                 last_viewport = viewport;
             }
-            terminal.draw(|frame| crate::tui::draw(frame, app, &display))?;
-            last_render = now;
-        }
-
-        let wait = render_interval
-            .saturating_sub(now.duration_since(last_render))
-            .min(Duration::from_millis(5));
-        if crossterm::event::poll(wait)? {
-            match crossterm::event::read()? {
-                Event::Key(key) => {
-                    if app.expression_editing() {
-                        let expression_key = match key.code {
-                            KeyCode::Char(character) => Some(ExpressionKey::Char(character)),
-                            KeyCode::Backspace => Some(ExpressionKey::Backspace),
-                            KeyCode::Enter => Some(ExpressionKey::Enter),
-                            KeyCode::Esc => Some(ExpressionKey::Escape),
-                            _ => None,
-                        };
-                        if let Some(expression_key) = expression_key {
-                            app.handle_expression_key(key);
-                            send_remote_input(
-                                &writer,
-                                InputMessage::ExpressionKey(expression_key),
-                            )?;
-                        }
-                        continue;
-                    }
-                    if let Some(command) = crate::input::translate_key(&key) {
-                        send_remote_input(&writer, InputMessage::Command(command))?;
-                        if command == Command::Quit {
-                            return Ok(());
-                        }
-                        app.handle_command(command);
-                    }
-                }
-                Event::Mouse(mouse) => {
-                    if app.handle_mouse(mouse, &mut tracker)
-                        && let Some((area, _)) = app.viewport_geometry()
-                    {
-                        let mut local = mouse;
-                        local.column = local.column.saturating_sub(area.x);
-                        local.row = local.row.saturating_sub(area.y);
-                        send_remote_input(&writer, InputMessage::Mouse(local))?;
-                    }
-                }
-                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
-                Event::Paste(_) => {}
+            let render_started = Instant::now();
+            let mut fresh_graphics = false;
+            terminal.draw(|frame| {
+                fresh_graphics = crate::tui::draw_remote(frame, app, &display, &rasterizer);
+            })?;
+            let completed = Instant::now();
+            app.record_render_duration(completed.duration_since(render_started));
+            render_meter.record(completed);
+            render_meter.refresh(completed);
+            if fresh_graphics {
+                graphics_meter.record(completed);
             }
+            graphics_meter.refresh(completed);
+            app.render_rate = render_meter.rate();
+            app.graphics_rate = graphics_meter.rate();
+            last_render = now;
         }
     }
 }
 
+fn handle_remote_terminal_event<W: std::io::Write>(
+    app: &mut App,
+    tracker: &mut crate::input::MouseTracker,
+    writer: &std::sync::Arc<std::sync::Mutex<W>>,
+    next_input_sequence: &mut u64,
+    event: Event,
+) -> std::io::Result<bool> {
+    use crate::remote::{ExpressionKey, InputMessage};
+    match event {
+        Event::Key(key) => {
+            if app.expression_editing() {
+                let expression_key = match key.code {
+                    KeyCode::Char(character) => Some(ExpressionKey::Char(character)),
+                    KeyCode::Backspace => Some(ExpressionKey::Backspace),
+                    KeyCode::Enter => Some(ExpressionKey::Enter),
+                    KeyCode::Esc => Some(ExpressionKey::Escape),
+                    _ => None,
+                };
+                if let Some(expression_key) = expression_key {
+                    app.handle_expression_key(key);
+                    send_remote_input(
+                        writer,
+                        next_input_sequence,
+                        InputMessage::ExpressionKey(expression_key),
+                    )?;
+                }
+                return Ok(false);
+            }
+            if let Some(command) = crate::input::translate_key(&key) {
+                send_remote_input(writer, next_input_sequence, InputMessage::Command(command))?;
+                if command == Command::Quit {
+                    return Ok(true);
+                }
+                app.handle_remote_command_optimistically(command);
+            }
+        }
+        Event::Mouse(mouse) => {
+            if app.handle_mouse(mouse, tracker)
+                && let Some((area, _)) = app.viewport_geometry()
+            {
+                let mut local = mouse;
+                local.column = local.column.saturating_sub(area.x);
+                local.row = local.row.saturating_sub(area.y);
+                send_remote_input(writer, next_input_sequence, InputMessage::Mouse(local))?;
+            }
+        }
+        Event::Resize(_, _) | Event::FocusGained | Event::FocusLost | Event::Paste(_) => {}
+    }
+    Ok(false)
+}
+
 fn send_remote_input<W: std::io::Write>(
     writer: &std::sync::Arc<std::sync::Mutex<W>>,
+    next_sequence: &mut u64,
     input: crate::remote::InputMessage,
-) -> std::io::Result<()> {
+) -> std::io::Result<u64> {
+    let sequence = *next_sequence;
     let mut guard = writer
         .lock()
         .map_err(|_| std::io::Error::other("SSH writer mutex poisoned"))?;
-    crate::remote::write_message(&mut *guard, &crate::remote::RemoteMessage::Input(input))
-        .map_err(std::io::Error::other)
+    crate::remote::write_message(
+        &mut *guard,
+        &crate::remote::RemoteMessage::Input { sequence, input },
+    )
+    .map_err(std::io::Error::other)?;
+    *next_sequence = sequence.wrapping_add(1).max(1);
+    Ok(sequence)
 }
 
 fn run_app_with_save(app: App, save_path: Option<&Path>) -> std::io::Result<()> {
@@ -1470,7 +1801,7 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
             let render_started = Instant::now();
             terminal.draw(|frame| {
                 app.set_rates(rates.0, rates.1);
-                crate::tui::draw(frame, &mut app, &display);
+                let _ = crate::tui::draw(frame, &mut app, &display);
             })?;
             app.record_render_duration(render_started.elapsed());
             last_render = now;

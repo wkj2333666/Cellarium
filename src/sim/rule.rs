@@ -1,3 +1,4 @@
+use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 use crate::sim::expression::KernelExpression;
@@ -7,14 +8,14 @@ use crate::sim::program::{RuleProgram, RuleProgramError};
 
 pub use crate::sim::kernel::Kernel;
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Rule {
     Conway,
     Lenia { mu: f32, sigma: f32 },
     Program(RuleProgram),
 }
 
-#[derive(Clone, Debug, PartialEq)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct SimulationSpec {
     pub rule: Rule,
     pub kernel: Kernel,

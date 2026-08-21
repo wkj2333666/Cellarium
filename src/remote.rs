@@ -1,8 +1,10 @@
 use crate::input::Command;
+use crate::sim::kernel::KernelDefinition;
+use crate::sim::rule::SimulationSpec;
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u8 = 1;
+pub const PROTOCOL_VERSION: u8 = 4;
 pub const MAX_FRAME_SIZE: u32 = 64 * 1024 * 1024;
 const MAGIC: [u8; 4] = *b"CLRM";
 
@@ -14,8 +16,15 @@ pub struct Snapshot {
     pub paused: bool,
     pub simulation_rate: f64,
     pub render_rate: f64,
+    pub last_step_ms: f64,
+    pub average_step_ms: f64,
+    pub step_samples: u64,
+    pub applied_input_sequence: u64,
     pub backend: String,
     pub rule: String,
+    pub spec: Box<SimulationSpec>,
+    pub selected_kernel: Box<KernelDefinition>,
+    pub selected_parameter: Option<String>,
     pub error: Option<String>,
     pub cells: Vec<f32>,
 }
@@ -23,7 +32,7 @@ pub struct Snapshot {
 #[derive(Clone, Debug, PartialEq)]
 pub enum RemoteMessage {
     Hello,
-    Input(InputMessage),
+    Input { sequence: u64, input: InputMessage },
     Snapshot(Snapshot),
     Viewport { width: u16, height: u16 },
     Quit,
@@ -111,7 +120,8 @@ pub fn read_message<R: Read>(reader: &mut R) -> Result<Option<RemoteMessage>, Pr
 fn encode_message(message: &RemoteMessage, payload: &mut Vec<u8>) -> Result<u8, ProtocolError> {
     match message {
         RemoteMessage::Hello => Ok(1),
-        RemoteMessage::Input(input) => {
+        RemoteMessage::Input { sequence, input } => {
+            put_u64(payload, *sequence);
             encode_input(input, payload)?;
             Ok(2)
         }
@@ -132,7 +142,12 @@ fn decode_message(tag: u8, payload: &[u8]) -> Result<RemoteMessage, ProtocolErro
     let mut cursor = Cursor::new(payload);
     match tag {
         1 if payload.is_empty() => Ok(RemoteMessage::Hello),
-        2 => Ok(RemoteMessage::Input(decode_input(&mut cursor)?)),
+        2 => {
+            let sequence = cursor.u64()?;
+            let input = decode_input(&mut cursor)?;
+            cursor.finish()?;
+            Ok(RemoteMessage::Input { sequence, input })
+        }
         3 => Ok(RemoteMessage::Snapshot(decode_snapshot(&mut cursor)?)),
         4 => {
             let width = cursor.u16()?;
@@ -223,8 +238,30 @@ fn encode_snapshot(snapshot: &Snapshot, payload: &mut Vec<u8>) -> Result<(), Pro
     payload.push(u8::from(snapshot.paused));
     payload.extend_from_slice(&snapshot.simulation_rate.to_le_bytes());
     payload.extend_from_slice(&snapshot.render_rate.to_le_bytes());
+    payload.extend_from_slice(&snapshot.last_step_ms.to_le_bytes());
+    payload.extend_from_slice(&snapshot.average_step_ms.to_le_bytes());
+    put_u64(payload, snapshot.step_samples);
+    put_u64(payload, snapshot.applied_input_sequence);
     put_string(payload, &snapshot.backend)?;
     put_string(payload, &snapshot.rule)?;
+    put_long_string(
+        payload,
+        &ron::to_string(&snapshot.spec)
+            .map_err(|error| ProtocolError::Message(format!("cannot encode rule spec: {error}")))?,
+    )?;
+    put_long_string(
+        payload,
+        &ron::to_string(&snapshot.selected_kernel).map_err(|error| {
+            ProtocolError::Message(format!("cannot encode selected kernel: {error}"))
+        })?,
+    )?;
+    match &snapshot.selected_parameter {
+        Some(parameter) => {
+            payload.push(1);
+            put_string(payload, parameter)?;
+        }
+        None => payload.push(0),
+    }
     match &snapshot.error {
         Some(error) => {
             payload.push(1);
@@ -250,8 +287,22 @@ fn decode_snapshot(cursor: &mut Cursor<'_>) -> Result<Snapshot, ProtocolError> {
     };
     let simulation_rate = cursor.f64()?;
     let render_rate = cursor.f64()?;
+    let last_step_ms = cursor.f64()?;
+    let average_step_ms = cursor.f64()?;
+    let step_samples = cursor.u64()?;
+    let applied_input_sequence = cursor.u64()?;
     let backend = cursor.string()?;
     let rule = cursor.string()?;
+    let spec = ron::from_str(&cursor.long_string()?)
+        .map_err(|error| ProtocolError::Message(format!("cannot decode rule spec: {error}")))?;
+    let selected_kernel = ron::from_str(&cursor.long_string()?).map_err(|error| {
+        ProtocolError::Message(format!("cannot decode selected kernel: {error}"))
+    })?;
+    let selected_parameter = match cursor.u8()? {
+        0 => None,
+        1 => Some(cursor.string()?),
+        _ => return Err(ProtocolError::Invalid("invalid selected parameter flag")),
+    };
     let error = match cursor.u8()? {
         0 => None,
         1 => Some(cursor.string()?),
@@ -276,8 +327,15 @@ fn decode_snapshot(cursor: &mut Cursor<'_>) -> Result<Snapshot, ProtocolError> {
         paused,
         simulation_rate,
         render_rate,
+        last_step_ms,
+        average_step_ms,
+        step_samples,
+        applied_input_sequence,
         backend,
         rule,
+        spec,
+        selected_kernel,
+        selected_parameter,
         error,
         cells,
     })
@@ -289,6 +347,18 @@ fn put_string(payload: &mut Vec<u8>, value: &str) -> Result<(), ProtocolError> {
         return Err(ProtocolError::Invalid("string too long"));
     }
     put_u16(payload, bytes.len() as u16);
+    payload.extend_from_slice(bytes);
+    Ok(())
+}
+
+fn put_long_string(payload: &mut Vec<u8>, value: &str) -> Result<(), ProtocolError> {
+    let bytes = value.as_bytes();
+    let length =
+        u32::try_from(bytes.len()).map_err(|_| ProtocolError::Invalid("long string too long"))?;
+    if length > MAX_FRAME_SIZE {
+        return Err(ProtocolError::Invalid("long string too long"));
+    }
+    put_u32(payload, length);
     payload.extend_from_slice(bytes);
     Ok(())
 }
@@ -473,6 +543,12 @@ impl<'a> Cursor<'a> {
         String::from_utf8(bytes.to_vec())
             .map_err(|_| ProtocolError::Invalid("invalid utf-8 string"))
     }
+    fn long_string(&mut self) -> Result<String, ProtocolError> {
+        let length = self.u32()? as usize;
+        let bytes = self.take(length)?;
+        String::from_utf8(bytes.to_vec())
+            .map_err(|_| ProtocolError::Invalid("invalid utf-8 long string"))
+    }
     fn finish(&self) -> Result<(), ProtocolError> {
         if self.offset == self.bytes.len() {
             Ok(())
@@ -495,8 +571,25 @@ mod tests {
             paused: true,
             simulation_rate: 12.5,
             render_rate: 30.0,
+            last_step_ms: 1.25,
+            average_step_ms: 1.5,
+            step_samples: 9,
+            applied_input_sequence: 17,
             backend: "CPU".into(),
             rule: "Conway".into(),
+            spec: Box::new(SimulationSpec::conway()),
+            selected_kernel: Box::new(crate::sim::kernel::KernelDefinition {
+                name: "none".into(),
+                width: 1,
+                height: 1,
+                anchor_x: 0,
+                anchor_y: 0,
+                mask: Some(vec![false]),
+                normalization: crate::sim::kernel::Normalization::None,
+                parameters: Default::default(),
+                values: crate::sim::kernel::KernelValues::Explicit(vec![0.0]),
+            }),
+            selected_parameter: None,
             error: Some("oops".into()),
             cells: vec![0.0, 1.0, 0.25, 0.75],
         }
@@ -515,14 +608,23 @@ mod tests {
     #[test]
     fn command_and_mouse_round_trip() {
         let messages = [
-            RemoteMessage::Input(InputMessage::Command(Command::TogglePause)),
-            RemoteMessage::Input(InputMessage::ExpressionKey(ExpressionKey::Char('中'))),
-            RemoteMessage::Input(InputMessage::Mouse(MouseEvent {
-                kind: MouseEventKind::ScrollUp,
-                column: 3,
-                row: 4,
-                modifiers: KeyModifiers::ALT,
-            })),
+            RemoteMessage::Input {
+                sequence: 11,
+                input: InputMessage::Command(Command::TogglePause),
+            },
+            RemoteMessage::Input {
+                sequence: 12,
+                input: InputMessage::ExpressionKey(ExpressionKey::Char('中')),
+            },
+            RemoteMessage::Input {
+                sequence: 13,
+                input: InputMessage::Mouse(MouseEvent {
+                    kind: MouseEventKind::ScrollUp,
+                    column: 3,
+                    row: 4,
+                    modifiers: KeyModifiers::ALT,
+                }),
+            },
         ];
         for message in messages {
             let mut bytes = Vec::new();

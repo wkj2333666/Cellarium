@@ -25,9 +25,34 @@ allocation fails, it switches to inline Kitty graphics. Other compatible
 terminals use inline graphics directly, and half-block rendering remains the
 last-resort fallback when no graphics protocol is available.
 
-The `render` rate shown by `connect` is measured by the local viewer. It is not
-the server's configured snapshot target, so it reflects graphics work the
-client is actually scheduling.
+Remote status distinguishes `server sim`, `snapshot rx`, `UI draw`, and
+`fresh graphics`. The first two are measured from server work and decoded
+snapshots; `UI draw` counts completed local terminal draws, while
+`fresh graphics` counts only draws that publish a newly encoded viewport.
+For C1 graphics, viewport rasterization also runs in a latest-frame worker:
+slow clients replace obsolete raster requests instead of blocking input or
+building a latency queue. Direct local rendering keeps its synchronous path.
+The editor's `server step` timing comes from the server, while `UI draw` timing
+is local. The remote backend name, rule, tick, and input acknowledgement are
+also authoritative snapshot values rather than placeholders from the local
+mirror.
+
+Protocol versions must match, so update the local and remote executable
+together. To run the maintained hybrid end-to-end check against an SSH alias:
+
+```sh
+./scripts/e2e-tinker.sh tinker
+```
+
+The script uses an optimized local client but never benchmarks local
+simulation: protocol simulation/step rates come exclusively from the remote
+server. The terminal report separately records the actual client-side Kitty
+frame-consumption cadence and server-confirmed input-to-frame latency.
+
+The protocol report measures the tinker GPU, tick/snapshot cadence, and
+input-to-state latency. The terminal report uses a small local PTY to consume
+real Kitty shared-memory frames and verify keyboard/mouse-to-frame behavior;
+its frame cadence is diagnostic and is not a benchmark of the server.
 
 Cellarium uses the system `ssh` command by default. This keeps the protocol
 stdin/stdout as a transparent byte stream while the local viewer independently

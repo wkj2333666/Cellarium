@@ -32,3 +32,13 @@ fn release_contains_every_supported_target() {
     assert!(RELEASE.contains("SHA256SUMS"));
     assert!(RELEASE.contains("needs: build"));
 }
+
+#[test]
+fn linux_release_uses_an_old_glibc_baseline_for_server_compatibility() {
+    assert!(
+        RELEASE.matches("runner: ubuntu-22.04").count() >= 2,
+        "both Linux archives must be linked against the Ubuntu 22.04 glibc baseline"
+    );
+    assert!(RELEASE.contains("gcc-aarch64-linux-gnu"));
+    assert!(RELEASE.contains("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"));
+}

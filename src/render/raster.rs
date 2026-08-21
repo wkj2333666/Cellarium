@@ -59,12 +59,24 @@ pub fn rasterize_world(world: &World, camera: &Camera, width: usize, height: usi
 }
 
 pub fn rasterize_world_into(world: &World, camera: &Camera, frame: &mut Framebuffer) {
+    let _ = rasterize_world_into_while(world, camera, frame, || true);
+}
+
+pub fn rasterize_world_into_while(
+    world: &World,
+    camera: &Camera,
+    frame: &mut Framebuffer,
+    mut keep_rendering: impl FnMut() -> bool,
+) -> bool {
     let width = frame.width;
     let height = frame.height;
     // Integer zooms keep crisp cell edges; fractional zooms need the whole
     // output-pixel footprint to avoid nearest-neighbor shape aliasing.
     let use_coverage = (camera.zoom() - camera.zoom().round()).abs() > 1.0e-6;
     for y in 0..height {
+        if !keep_rendering() {
+            return false;
+        }
         for x in 0..width {
             let screen = [x as f32 + 0.5, y as f32 + 0.5];
             let value = if use_coverage {
@@ -78,6 +90,7 @@ pub fn rasterize_world_into(world: &World, camera: &Camera, frame: &mut Framebuf
             frame.set(x, y, value_to_rgb(value));
         }
     }
+    true
 }
 
 fn sample_world_coverage(
@@ -173,6 +186,22 @@ mod tests {
         rasterize_world_into(&world, &camera, &mut frame);
 
         assert_eq!(frame.get(0, 0), value_to_rgb(1.0));
+    }
+
+    #[test]
+    fn cancellable_rasterization_stops_before_obsolete_rows() {
+        let world = World::new(2, 2);
+        let camera = Camera::new([1.0, 1.0], 1.0);
+        let mut frame = Framebuffer::new(4, 4);
+        let mut rows = 0;
+
+        let completed = rasterize_world_into_while(&world, &camera, &mut frame, || {
+            rows += 1;
+            rows <= 2
+        });
+
+        assert!(!completed);
+        assert_eq!(rows, 3);
     }
 
     #[test]

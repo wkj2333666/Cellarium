@@ -13,15 +13,15 @@ use std::io::Read;
 use std::io::Write;
 #[cfg(unix)]
 use std::os::fd::FromRawFd;
-use std::sync::{
-    Arc, Mutex,
-    mpsc::{SyncSender, sync_channel},
-};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
 use crate::render::raster::Framebuffer;
+use crate::render::{camera::Camera, raster::rasterize_world_into_while};
+use crate::sim::world::World;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DisplayProtocol {
@@ -49,8 +49,173 @@ impl DisplayProtocol {
 pub struct PixelDisplay {
     picker: ratatui_image::picker::Picker,
     protocol: Arc<Mutex<Option<ratatui_image::protocol::Protocol>>>,
-    tx: Option<SyncSender<(DynamicImage, ratatui::layout::Size)>>,
+    ready_sequence: Arc<AtomicU64>,
+    displayed_sequence: AtomicU64,
+    queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size)>,
     worker: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone, Copy)]
+struct RenderStatus {
+    rendered: bool,
+    fresh: bool,
+}
+
+struct LatestWorkState<T> {
+    value: Option<T>,
+    closed: bool,
+}
+
+struct LatestWorkQueue<T> {
+    state: Arc<(Mutex<LatestWorkState<T>>, Condvar)>,
+}
+
+struct RasterRequest {
+    generation: u64,
+    world_width: usize,
+    world_height: usize,
+    cells: Vec<f32>,
+    camera: Camera,
+    frame_width: usize,
+    frame_height: usize,
+    terminal_size: ratatui::layout::Size,
+}
+
+pub struct AsyncRasterizer {
+    queue: LatestWorkQueue<RasterRequest>,
+    ready: Arc<Mutex<Option<(DynamicImage, ratatui::layout::Size)>>>,
+    latest_generation: Arc<AtomicU64>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl AsyncRasterizer {
+    pub fn new() -> Self {
+        let queue: LatestWorkQueue<RasterRequest> = LatestWorkQueue::new();
+        let worker_queue = queue.clone();
+        let ready = Arc::new(Mutex::new(None));
+        let worker_ready = Arc::clone(&ready);
+        let latest_generation = Arc::new(AtomicU64::new(0));
+        let worker_generation = Arc::clone(&latest_generation);
+        let worker = std::thread::spawn(move || {
+            while let Some(request) = worker_queue.recv() {
+                let mut world = World::new(request.world_width, request.world_height);
+                world.replace_cells(&request.cells);
+                let mut framebuffer = Framebuffer::new(request.frame_width, request.frame_height);
+                let completed =
+                    rasterize_world_into_while(&world, &request.camera, &mut framebuffer, || {
+                        worker_generation.load(Ordering::Acquire) == request.generation
+                    });
+                if !completed || worker_generation.load(Ordering::Acquire) != request.generation {
+                    continue;
+                }
+                let image = framebuffer_to_dynamic_image(&framebuffer);
+                if worker_generation.load(Ordering::Acquire) != request.generation {
+                    continue;
+                }
+                if let Ok(mut slot) = worker_ready.lock() {
+                    *slot = Some((image, request.terminal_size));
+                }
+            }
+        });
+        Self {
+            queue,
+            ready,
+            latest_generation,
+            worker: Some(worker),
+        }
+    }
+
+    pub fn submit(
+        &self,
+        world: &World,
+        camera: Camera,
+        frame_width: usize,
+        frame_height: usize,
+        terminal_size: ratatui::layout::Size,
+        priority_generation: u64,
+    ) {
+        self.latest_generation
+            .store(priority_generation, Ordering::Release);
+        self.queue.submit(RasterRequest {
+            generation: priority_generation,
+            world_width: world.width(),
+            world_height: world.height(),
+            cells: world.cells().to_vec(),
+            camera,
+            frame_width,
+            frame_height,
+            terminal_size,
+        });
+    }
+
+    fn take_ready(&self) -> Option<(DynamicImage, ratatui::layout::Size)> {
+        self.ready.lock().ok()?.take()
+    }
+}
+
+impl Default for AsyncRasterizer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Drop for AsyncRasterizer {
+    fn drop(&mut self) {
+        self.queue.close();
+        // Large raster work is allowed to finish in the detached worker; exit
+        // must not block behind a frame that the terminal will never display.
+        let _ = self.worker.take();
+    }
+}
+
+impl<T> Clone for LatestWorkQueue<T> {
+    fn clone(&self) -> Self {
+        Self {
+            state: Arc::clone(&self.state),
+        }
+    }
+}
+
+impl<T> LatestWorkQueue<T> {
+    fn new() -> Self {
+        Self {
+            state: Arc::new((
+                Mutex::new(LatestWorkState {
+                    value: None,
+                    closed: false,
+                }),
+                Condvar::new(),
+            )),
+        }
+    }
+
+    fn submit(&self, value: T) {
+        let (lock, wake) = &*self.state;
+        if let Ok(mut state) = lock.lock()
+            && !state.closed
+        {
+            state.value = Some(value);
+            wake.notify_one();
+        }
+    }
+
+    fn recv(&self) -> Option<T> {
+        let (lock, wake) = &*self.state;
+        let mut state = lock.lock().ok()?;
+        while state.value.is_none() && !state.closed {
+            state = wake.wait(state).ok()?;
+        }
+        state.value.take()
+    }
+
+    fn close(&self) {
+        let (lock, wake) = &*self.state;
+        if let Ok(mut state) = lock.lock() {
+            state.closed = true;
+            state.value = None;
+            wake.notify_all();
+        }
+    }
 }
 
 #[cfg(unix)]
@@ -66,7 +231,7 @@ struct KittySharedState {
 pub struct KittySharedDisplay {
     font_size: (u16, u16),
     state: Arc<Mutex<KittySharedState>>,
-    tx: Option<SyncSender<(DynamicImage, ratatui::layout::Size)>>,
+    queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size)>,
     worker: Option<JoinHandle<()>>,
     fallback: PixelDisplay,
 }
@@ -74,7 +239,7 @@ pub struct KittySharedDisplay {
 #[cfg(unix)]
 impl KittySharedDisplay {
     fn new(font_size: (u16, u16)) -> Self {
-        let (tx, rx) = sync_channel::<(DynamicImage, ratatui::layout::Size)>(1);
+        let queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size)> = LatestWorkQueue::new();
         let state = Arc::new(Mutex::new(KittySharedState {
             ready: None,
             displayed_id: None,
@@ -83,13 +248,14 @@ impl KittySharedDisplay {
             next_image_id: rand::random::<u32>().max(1),
         }));
         let worker_state = Arc::clone(&state);
+        let worker_queue = queue.clone();
         let worker = std::thread::spawn(move || {
-            while let Ok((image, area)) = rx.recv() {
-                let (image_id, previous_id) = match worker_state.lock() {
+            while let Some((image, area)) = worker_queue.recv() {
+                let image_id = match worker_state.lock() {
                     Ok(mut state) => {
                         let image_id = state.next_image_id;
                         state.next_image_id = state.next_image_id.wrapping_add(1).max(1);
-                        (image_id, state.displayed_id)
+                        image_id
                     }
                     Err(_) => break,
                 };
@@ -101,7 +267,6 @@ impl KittySharedDisplay {
                     area.width,
                     area.height,
                     image_id,
-                    previous_id,
                 );
                 let Ok(frame) = frame else {
                     if let Ok(mut state) = worker_state.lock() {
@@ -117,7 +282,7 @@ impl KittySharedDisplay {
         Self {
             font_size,
             state,
-            tx: Some(tx),
+            queue,
             worker: Some(worker),
             fallback: kitty_pixel_display(font_size),
         }
@@ -128,12 +293,10 @@ impl KittySharedDisplay {
             self.fallback.submit(image, size);
             return;
         }
-        if let Some(tx) = &self.tx {
-            let _ = tx.try_send((image, size));
-        }
+        self.queue.submit((image, size));
     }
 
-    fn render(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) -> bool {
+    fn render(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) -> RenderStatus {
         let Ok(mut state) = self.state.lock() else {
             return self.fallback.render(frame, area);
         };
@@ -159,32 +322,46 @@ impl KittySharedDisplay {
                     },
                     area,
                 );
-                return true;
+                return RenderStatus {
+                    rendered: true,
+                    fresh: false,
+                };
             }
             drop(state);
             return self.fallback.render(frame, area);
         }
         let Some(shared) = state.ready.take() else {
             frame.render_widget(KittySharedWidget { command: None }, area);
-            return state.displayed_id.is_some();
+            return RenderStatus {
+                rendered: state.displayed_id.is_some(),
+                fresh: false,
+            };
         };
         let image_id = shared.image_id;
+        let mut command = shared.command.clone();
+        if let Some(previous_id) = state.displayed_id {
+            command.push_str(&kitty_delete_image_command(previous_id));
+        }
+        command.push_str("\x1b[u");
         frame.render_widget(
             KittySharedWidget {
-                command: Some(&shared.command),
+                command: Some(&command),
             },
             area,
         );
         state.displayed_id = Some(image_id);
         state.retained.push_back(shared);
-        true
+        RenderStatus {
+            rendered: true,
+            fresh: true,
+        }
     }
 }
 
 #[cfg(unix)]
 impl Drop for KittySharedDisplay {
     fn drop(&mut self) {
-        self.tx.take();
+        self.queue.close();
         // A high-resolution write may still be in progress. Detach rather than
         // making q/exit wait behind a frame that will never be displayed.
         let _ = self.worker.take();
@@ -220,46 +397,61 @@ impl ratatui::widgets::Widget for KittySharedWidget<'_> {
 
 impl PixelDisplay {
     fn new(picker: ratatui_image::picker::Picker) -> Self {
-        let (tx, rx) = sync_channel::<(DynamicImage, ratatui::layout::Size)>(1);
+        let queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size)> = LatestWorkQueue::new();
         let protocol = Arc::new(Mutex::new(None));
+        let ready_sequence = Arc::new(AtomicU64::new(0));
         let worker_protocol = Arc::clone(&protocol);
+        let worker_ready_sequence = Arc::clone(&ready_sequence);
         let worker_picker = picker.clone();
+        let worker_queue = queue.clone();
         let worker = std::thread::spawn(move || {
-            while let Ok((image, size)) = rx.recv() {
+            while let Some((image, size)) = worker_queue.recv() {
                 if let Ok(encoded) =
                     worker_picker.new_protocol(image, size, ratatui_image::Resize::Fit(None))
                     && let Ok(mut slot) = worker_protocol.lock()
                 {
                     *slot = Some(encoded);
+                    worker_ready_sequence.fetch_add(1, Ordering::Release);
                 }
             }
         });
         Self {
             picker,
             protocol,
-            tx: Some(tx),
+            ready_sequence,
+            displayed_sequence: AtomicU64::new(0),
+            queue,
             worker: Some(worker),
         }
     }
 
     fn submit(&self, image: DynamicImage, size: ratatui::layout::Size) {
-        if let Some(tx) = &self.tx {
-            let _ = tx.try_send((image, size));
-        }
+        self.queue.submit((image, size));
     }
 
-    fn render(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) -> bool {
+    fn render(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) -> RenderStatus {
         let Ok(protocol) = self.protocol.lock() else {
-            return false;
+            return RenderStatus {
+                rendered: false,
+                fresh: false,
+            };
         };
         let Some(protocol) = protocol.as_ref() else {
-            return false;
+            return RenderStatus {
+                rendered: false,
+                fresh: false,
+            };
         };
         frame.render_widget(
             ratatui_image::Image::new(protocol).allow_clipping(true),
             area,
         );
-        true
+        let ready = self.ready_sequence.load(Ordering::Acquire);
+        let displayed = self.displayed_sequence.swap(ready, Ordering::AcqRel);
+        RenderStatus {
+            rendered: true,
+            fresh: ready != displayed,
+        }
     }
 }
 
@@ -281,7 +473,7 @@ fn kitty_delete_image_command(image_id: u32) -> String {
 
 impl Drop for PixelDisplay {
     fn drop(&mut self) {
-        self.tx.take();
+        self.queue.close();
         // Encoding a high-resolution frame can outlive the terminal session.
         // Joining here would make shutdown wait behind an obsolete frame and
         // prevent the quit key from returning control to the shell.
@@ -313,7 +505,6 @@ impl KittySharedFrame {
         columns: u16,
         rows: u16,
         image_id: u32,
-        previous_id: Option<u32>,
     ) -> std::io::Result<Self> {
         use base64::Engine;
 
@@ -335,14 +526,10 @@ impl KittySharedFrame {
 
         let name = create_shared_memory(rgba)?;
         let encoded_name = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
-        let mut command = format!(
+        let command = format!(
             "\x1b[s\x1b_Ga=T,f=32,t=s,s={width},v={height},S={},i={image_id},p=1,c={columns},r={rows},q=1;{encoded_name}\x1b\\",
             rgba.len()
         );
-        if let Some(previous_id) = previous_id {
-            command.push_str(&kitty_delete_image_command(previous_id));
-        }
-        command.push_str("\x1b[u");
         Ok(Self {
             command,
             name,
@@ -554,13 +741,14 @@ impl ViewportDisplay {
         frame: &mut ratatui::Frame,
         area: ratatui::layout::Rect,
         framebuffer: &Framebuffer,
-    ) {
+    ) -> bool {
         if let Self::Pixel(pixel) = self {
             let image = framebuffer_to_dynamic_image(framebuffer);
             let size = ratatui::layout::Size::new(area.width, area.height);
             pixel.submit(image, size);
-            if pixel.render(frame, area) {
-                return;
+            let status = pixel.render(frame, area);
+            if status.rendered {
+                return status.fresh;
             }
         }
 
@@ -569,8 +757,9 @@ impl ViewportDisplay {
             let image = framebuffer_to_dynamic_image(framebuffer);
             let size = ratatui::layout::Size::new(area.width, area.height);
             display.submit(image, size);
-            if display.render(frame, area) {
-                return;
+            let status = display.render(frame, area);
+            if status.rendered {
+                return status.fresh;
             }
         }
 
@@ -578,6 +767,42 @@ impl ViewportDisplay {
             ratatui::widgets::Paragraph::new(half_block::half_block_lines(framebuffer)),
             area,
         );
+        true
+    }
+
+    pub fn render_async(
+        &self,
+        frame: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        world: &World,
+        camera: Camera,
+        rasterizer: &AsyncRasterizer,
+        priority_generation: u64,
+    ) -> bool {
+        let (frame_width, frame_height) = self.framebuffer_size(area);
+        let terminal_size = ratatui::layout::Size::new(area.width, area.height);
+        rasterizer.submit(
+            world,
+            camera,
+            frame_width,
+            frame_height,
+            terminal_size,
+            priority_generation,
+        );
+        if let Some((image, size)) = rasterizer.take_ready() {
+            match self {
+                Self::Pixel(display) => display.submit(image, size),
+                #[cfg(unix)]
+                Self::KittyShared(display) => display.submit(image, size),
+                Self::HalfBlock => return false,
+            }
+        }
+        match self {
+            Self::Pixel(display) => display.render(frame, area).fresh,
+            #[cfg(unix)]
+            Self::KittyShared(display) => display.render(frame, area).fresh,
+            Self::HalfBlock => false,
+        }
     }
 }
 
@@ -655,6 +880,91 @@ mod tests {
     use image::GenericImageView;
 
     #[test]
+    fn latest_image_queue_replaces_pending_frames_instead_of_preserving_stale_work() {
+        let queue = LatestWorkQueue::new();
+        queue.submit(1_u8);
+        queue.submit(2_u8);
+
+        assert_eq!(queue.recv(), Some(2));
+        queue.close();
+        assert_eq!(queue.recv(), None);
+    }
+
+    #[test]
+    fn async_rasterizer_produces_a_pixel_frame_without_blocking_the_caller() {
+        let mut world = World::new(2, 2);
+        world.replace_cells(&[0.0, 1.0, 0.0, 1.0]);
+        let rasterizer = AsyncRasterizer::new();
+        rasterizer.submit(
+            &world,
+            Camera::new([1.0, 1.0], 1.0),
+            4,
+            4,
+            ratatui::layout::Size::new(2, 2),
+            0,
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let (image, size) = loop {
+            if let Some(ready) = rasterizer.take_ready() {
+                break ready;
+            }
+            assert!(Instant::now() < deadline, "raster worker did not publish");
+            std::thread::sleep(Duration::from_millis(1));
+        };
+
+        assert_eq!((image.width(), image.height()), (4, 4));
+        assert_eq!(size, ratatui::layout::Size::new(2, 2));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_display_marks_reused_placement_as_not_fresh() {
+        let display = KittySharedDisplay::new((8, 16));
+        display.state.lock().unwrap().displayed_id = Some(41);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(1, 1)).unwrap();
+        let mut fresh = true;
+
+        terminal
+            .draw(|frame| {
+                fresh = display
+                    .render(frame, ratatui::layout::Rect::new(0, 0, 1, 1))
+                    .fresh;
+            })
+            .unwrap();
+
+        assert!(!fresh);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_display_deletes_the_image_displayed_at_presentation_time() {
+        let display = KittySharedDisplay::new((8, 16));
+        let pixels = [1_u8, 2, 3, 255];
+        let ready = KittySharedFrame::new(&pixels, 1, 1, 1, 1, 41).unwrap();
+        {
+            let mut state = display.state.lock().unwrap();
+            state.displayed_id = Some(99);
+            state.ready = Some(ready);
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(1, 1)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                display.render(frame, ratatui::layout::Rect::new(0, 0, 1, 1));
+            })
+            .unwrap();
+
+        let symbol = terminal.backend().buffer().cell((0, 0)).unwrap().symbol();
+        assert!(symbol.contains("a=T"));
+        assert!(symbol.contains("i=41"));
+        assert!(symbol.contains("a=d,d=I,i=99"));
+        assert_eq!(display.state.lock().unwrap().displayed_id, Some(41));
+    }
+
+    #[test]
     fn detects_pixel_protocols_and_falls_back_to_half_blocks() {
         assert_eq!(
             detect_protocol("xterm-kitty", "", ""),
@@ -713,7 +1023,7 @@ mod tests {
     #[test]
     fn local_kitty_frames_use_a_small_shared_memory_command() {
         let pixels = [1, 2, 3, 255, 4, 5, 6, 255];
-        let frame = KittySharedFrame::new(&pixels, 2, 1, 12, 4, 41, Some(40)).unwrap();
+        let frame = KittySharedFrame::new(&pixels, 2, 1, 12, 4, 41).unwrap();
 
         assert!(frame.command.contains("a=T"));
         assert!(frame.command.contains("t=s"));
@@ -723,7 +1033,7 @@ mod tests {
         assert!(frame.command.contains("i=41,p=1"));
         assert!(frame.command.contains("q=1"));
         assert!(!frame.command.contains("q=2"));
-        assert!(frame.command.contains("a=d,d=I,i=40"));
+        assert!(!frame.command.contains("a=d,d=I"));
         assert!(frame.command.len() < 256);
         assert_eq!(frame.read_pixels_for_test().unwrap(), pixels);
     }
@@ -755,7 +1065,7 @@ mod tests {
     #[test]
     fn shared_memory_frame_is_reaped_only_after_terminal_unlinks_it() {
         let pixels = [1, 2, 3, 255];
-        let frame = KittySharedFrame::new(&pixels, 1, 1, 1, 1, 41, None).unwrap();
+        let frame = KittySharedFrame::new(&pixels, 1, 1, 1, 1, 41).unwrap();
 
         assert!(!frame.was_consumed_by_terminal());
         assert_eq!(unsafe { libc::shm_unlink(frame.name.as_ptr()) }, 0);
@@ -878,7 +1188,9 @@ mod tests {
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(1, 1)).unwrap();
 
         terminal
-            .draw(|frame| display.render(frame, area, &framebuffer))
+            .draw(|frame| {
+                display.render(frame, area, &framebuffer);
+            })
             .unwrap();
         assert_eq!(display.protocol(), DisplayProtocol::HalfBlock);
     }
@@ -896,7 +1208,9 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
         let symbol = loop {
             terminal
-                .draw(|frame| display.render(frame, area, &framebuffer))
+                .draw(|frame| {
+                    display.render(frame, area, &framebuffer);
+                })
                 .unwrap();
             let symbol = terminal
                 .backend()
