@@ -297,6 +297,7 @@ fn editor_panel_lines(app: &App, max_width: usize, max_height: usize) -> Vec<Str
                     .unwrap_or_else(|| "n/a".to_string())
             )
         },
+        format!("growth plot {}", growth_plot_line(app, 28)),
         format!("{} KERNEL", panel_marker(app, crate::app::Panel::Kernel)),
         format!(
             "{} {}×{} · anchor ({},{})",
@@ -365,6 +366,34 @@ fn editor_panel_lines(app: &App, max_width: usize, max_height: usize) -> Vec<Str
     lines
         .into_iter()
         .map(|line| truncate_chars(&line, max_width))
+        .collect()
+}
+
+fn growth_plot_line(app: &App, width: usize) -> String {
+    let samples = app.growth_plot_samples(width.max(1));
+    if samples.is_empty() {
+        return "—".to_string();
+    }
+    let finite = samples.iter().flatten().copied().collect::<Vec<_>>();
+    let (minimum, maximum) = finite.iter().copied().fold(
+        (f32::INFINITY, f32::NEG_INFINITY),
+        |(minimum, maximum), value| (minimum.min(value), maximum.max(value)),
+    );
+    let glyphs = "▁▂▃▄▅▆▇█";
+    samples
+        .into_iter()
+        .map(|value| {
+            let Some(value) = value else { return '×' };
+            let ratio = if (maximum - minimum).abs() <= f32::EPSILON {
+                0.5
+            } else {
+                ((value - minimum) / (maximum - minimum)).clamp(0.0, 1.0)
+            };
+            glyphs
+                .chars()
+                .nth((ratio * 7.0).round() as usize)
+                .unwrap_or('▁')
+        })
         .collect()
 }
 

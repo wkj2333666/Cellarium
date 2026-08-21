@@ -201,6 +201,58 @@ impl App {
         model
     }
 
+    pub fn growth_plot_samples(&self, count: usize) -> Vec<Option<f32>> {
+        let source = self
+            .active_experiment()
+            .growth
+            .first()
+            .map(|growth| growth.source.clone())
+            .or_else(|| {
+                self.spec
+                    .growth_expression()
+                    .map(crate::sim::parser::format_expression)
+            });
+        let Some(source) = source else {
+            return Vec::new();
+        };
+        let parameters = match self.spec.rule {
+            crate::sim::rule::Rule::Lenia { mu, sigma } => std::collections::BTreeMap::from([
+                ("mu".to_string(), mu),
+                ("sigma".to_string(), sigma),
+            ]),
+            _ => std::collections::BTreeMap::new(),
+        };
+        let Ok(program) = crate::sim::growth::typecheck::compile(
+            &source,
+            &crate::sim::growth::types::ExternalSymbols {
+                kernel_inputs: vec!["potential".to_string()],
+                parameters: parameters.keys().cloned().collect(),
+            },
+        ) else {
+            return Vec::new();
+        };
+        let Ok(crate::sim::growth::plot::PlotData::Curve(curve)) =
+            crate::sim::growth::plot::sample_plot(
+                &program,
+                crate::sim::growth::plot::PlotRequest::Curve {
+                    axis: "potential".to_string(),
+                    start: 0.0,
+                    end: 1.0,
+                    samples: count.clamp(1, 128),
+                    pinned: crate::sim::growth::plot::PinnedInputs(parameters),
+                    trace: false,
+                },
+            )
+        else {
+            return Vec::new();
+        };
+        curve
+            .samples
+            .into_iter()
+            .map(|sample| sample.value)
+            .collect()
+    }
+
     pub fn submit_draft(&mut self, request: ApplyRequest) -> Result<ApplyAccepted, ApplyRejected> {
         if request.base_revision != self.experiment_revision {
             return Err(ApplyRejected {

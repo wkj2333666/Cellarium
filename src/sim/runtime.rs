@@ -26,6 +26,7 @@ pub struct CompiledChannelRule {
     pub inputs: Vec<CompiledKernelInput>,
     pub parameters: BTreeMap<String, f32>,
     pub update: KernelExpression,
+    pub program: Option<crate::sim::growth::types::TypedProgram>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -124,6 +125,7 @@ pub fn compile_experiment(spec: &ExperimentSpec) -> Result<CompiledExperiment, R
                 inputs: Vec::new(),
                 parameters: BTreeMap::new(),
                 update: KernelExpression::Constant(0.0),
+                program: None,
             });
             continue;
         }
@@ -156,7 +158,26 @@ pub fn compile_experiment(spec: &ExperimentSpec) -> Result<CompiledExperiment, R
             });
         }
         symbols.extend(growth.parameters.keys().cloned());
-        let update = parse_and_validate(&growth.source, &symbols)?;
+        let typed_program = crate::sim::growth::typecheck::compile(
+            &growth.source,
+            &crate::sim::growth::types::ExternalSymbols {
+                kernel_inputs: inputs.iter().map(|input| input.symbol.clone()).collect(),
+                parameters: growth.parameters.keys().cloned().collect(),
+            },
+        )
+        .map_err(|errors| {
+            RuntimeError::Model(
+                errors
+                    .into_iter()
+                    .map(|error| {
+                        format!("{} at {}..{}", error.code, error.span.start, error.span.end)
+                    })
+                    .collect::<Vec<_>>()
+                    .join("; "),
+            )
+        })?;
+        let update =
+            parse_and_validate(&growth.source, &symbols).unwrap_or(KernelExpression::Constant(0.0));
         rules.push(CompiledChannelRule {
             target,
             frozen: channel.frozen,
@@ -164,6 +185,7 @@ pub fn compile_experiment(spec: &ExperimentSpec) -> Result<CompiledExperiment, R
             inputs,
             parameters: growth.parameters.clone(),
             update,
+            program: Some(typed_program),
         });
     }
 
@@ -238,20 +260,37 @@ impl CpuExperimentBackend {
                             );
                             values.insert(input.symbol.clone(), value);
                         }
-                        let result = match evaluate(
-                            &rule.update,
-                            &ExpressionContext {
-                                x: 0.0,
-                                y: 0.0,
-                                radius: 0.0,
-                                distance: 0.0,
-                                parameters: &values,
-                            },
-                        ) {
+                        let result: Result<f32, RuntimeError> = if let Some(program) = &rule.program
+                        {
+                            let inputs = crate::sim::growth::eval::ScalarInputs {
+                                kernel_inputs: rule
+                                    .inputs
+                                    .iter()
+                                    .map(|input| values.get(&input.symbol).copied().unwrap_or(0.0))
+                                    .collect(),
+                                self_value: current,
+                                parameters: rule.parameters.clone(),
+                            };
+                            crate::sim::growth::eval::evaluate(program, &inputs)
+                                .map_err(|error| RuntimeError::Model(error.to_string()))
+                        } else {
+                            evaluate(
+                                &rule.update,
+                                &ExpressionContext {
+                                    x: 0.0,
+                                    y: 0.0,
+                                    radius: 0.0,
+                                    distance: 0.0,
+                                    parameters: &values,
+                                },
+                            )
+                            .map_err(RuntimeError::Expression)
+                        };
+                        let result = match result {
                             Ok(result) => result,
                             Err(error) => {
                                 world.discard_next();
-                                return Err(RuntimeError::Expression(error));
+                                return Err(error);
                             }
                         };
                         let next_value = match rule.mode {
@@ -533,5 +572,21 @@ mod tests {
         );
         assert_eq!(world.cells(), before.as_slice());
         assert!(world.next_cells_mut().iter().all(|value| *value == 0.0));
+    }
+
+    #[test]
+    fn structured_growth_program_runs_on_the_channel_runtime() {
+        let mut spec = ExperimentSpec::single_channel_lenia(1, 1);
+        spec.growth[0].source =
+            "let doubled = self * 2.0; if doubled > 0.5 { doubled } else { 0.0 }".to_string();
+        spec.growth[0].kernel_inputs.clear();
+        spec.kernels.clear();
+        spec.growth[0].mode = UpdateMode::DirectUpdate;
+        let compiled = compile_experiment(&spec).unwrap();
+        let mut world = ChannelWorld::from_channels(1, 1, &[vec![0.3]]).unwrap();
+        CpuExperimentBackend::new(compiled)
+            .step(&mut world)
+            .unwrap();
+        assert!((world.get(0, 0, 0) - 0.6).abs() < 1e-6);
     }
 }

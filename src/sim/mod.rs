@@ -7,6 +7,7 @@ pub mod cuda_codegen;
 pub mod experiment;
 pub mod experiment_model;
 pub mod expression;
+pub mod growth;
 pub mod kernel;
 pub mod kernel_file;
 pub mod lattice_file;
