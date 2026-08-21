@@ -1,0 +1,469 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use serde::{Deserialize, Serialize};
+
+use crate::sim::kernel::{KernelDefinition, KernelValues, Normalization, ring_definition};
+use crate::sim::topology::BoundarySpec;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ChannelId(pub u32);
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct KernelId(pub u32);
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChannelSpec {
+    pub id: ChannelId,
+    pub name: String,
+    pub frozen: bool,
+    pub initial: Vec<f32>,
+    pub boundary_constant: f32,
+    pub display: ChannelDisplay,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ChannelDisplay {
+    pub color: DisplayColor,
+    pub visible: bool,
+    pub opacity: f32,
+}
+
+impl Default for ChannelDisplay {
+    fn default() -> Self {
+        Self {
+            color: DisplayColor::Auto,
+            visible: true,
+            opacity: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DisplayColor {
+    Auto,
+    Custom(RgbColor),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RgbColor {
+    pub red: u8,
+    pub green: u8,
+    pub blue: u8,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct KernelSlot {
+    pub id: KernelId,
+    pub symbol: String,
+    pub name: String,
+    pub source: ChannelId,
+    pub target: ChannelId,
+    pub definition: KernelDefinition,
+}
+
+impl KernelSlot {
+    pub fn identity(
+        id: KernelId,
+        symbol: impl Into<String>,
+        source: ChannelId,
+        target: ChannelId,
+    ) -> Self {
+        let symbol = symbol.into();
+        Self {
+            id,
+            name: symbol.clone(),
+            symbol,
+            source,
+            target,
+            definition: KernelDefinition {
+                name: "identity".to_string(),
+                width: 1,
+                height: 1,
+                anchor_x: 0,
+                anchor_y: 0,
+                mask: None,
+                normalization: Normalization::None,
+                parameters: BTreeMap::new(),
+                values: KernelValues::Explicit(vec![1.0]),
+            },
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub enum UpdateMode {
+    GrowthRate,
+    DirectUpdate,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GrowthSource {
+    pub target: ChannelId,
+    pub kernel_inputs: Vec<KernelId>,
+    pub parameters: BTreeMap<String, f32>,
+    pub source: String,
+    pub mode: UpdateMode,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub enum GeometrySpec {
+    RasterGrid(GridGeometry),
+}
+
+impl GeometrySpec {
+    pub fn tile_count(&self) -> Option<usize> {
+        match self {
+            Self::RasterGrid(grid) => (grid.width as usize).checked_mul(grid.height as usize),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct GridGeometry {
+    pub width: u32,
+    pub height: u32,
+    pub boundary: BoundarySpec,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExperimentSpec {
+    pub name: String,
+    pub geometry: GeometrySpec,
+    pub channels: Vec<ChannelSpec>,
+    pub kernels: Vec<KernelSlot>,
+    pub growth: Vec<GrowthSource>,
+    pub simulation_dt: f32,
+    pub seed: u64,
+}
+
+impl ExperimentSpec {
+    pub fn single_channel_lenia(width: u32, height: u32) -> Self {
+        let channel = ChannelId(0);
+        let potential = KernelId(0);
+        let tile_count = (width as usize).saturating_mul(height as usize);
+        Self {
+            name: "Lenia/Orbium".to_string(),
+            geometry: GeometrySpec::RasterGrid(GridGeometry {
+                width,
+                height,
+                boundary: BoundarySpec::Periodic,
+            }),
+            channels: vec![ChannelSpec {
+                id: channel,
+                name: "state".to_string(),
+                frozen: false,
+                initial: vec![0.0; tile_count],
+                boundary_constant: 0.0,
+                display: ChannelDisplay::default(),
+            }],
+            kernels: vec![KernelSlot {
+                id: potential,
+                symbol: "potential".to_string(),
+                name: "ring".to_string(),
+                source: channel,
+                target: channel,
+                definition: ring_definition(13, 0.5, 0.5),
+            }],
+            growth: vec![GrowthSource {
+                target: channel,
+                kernel_inputs: vec![potential],
+                parameters: BTreeMap::from([
+                    ("mu".to_string(), 0.135),
+                    ("sigma".to_string(), 0.015),
+                ]),
+                source: "2 * exp(-((potential - mu) / sigma) ^ 2) - 1".to_string(),
+                mode: UpdateMode::GrowthRate,
+            }],
+            simulation_dt: 0.1,
+            seed: 0,
+        }
+    }
+
+    pub fn add_channel(&mut self, name: impl Into<String>, frozen: bool) -> ChannelId {
+        let id = ChannelId(
+            self.channels
+                .iter()
+                .map(|channel| channel.id.0.saturating_add(1))
+                .max()
+                .unwrap_or(0),
+        );
+        self.channels.push(ChannelSpec {
+            id,
+            name: name.into(),
+            frozen,
+            initial: vec![0.0; self.geometry.tile_count().unwrap_or(0)],
+            boundary_constant: 0.0,
+            display: ChannelDisplay::default(),
+        });
+        if !frozen {
+            self.growth.push(GrowthSource {
+                target: id,
+                kernel_inputs: Vec::new(),
+                parameters: BTreeMap::new(),
+                source: "self".to_string(),
+                mode: UpdateMode::DirectUpdate,
+            });
+        }
+        id
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ExperimentModelError {
+    #[error("an experiment must contain at least one channel")]
+    EmptyChannels,
+    #[error("raster grid dimensions must be positive and representable")]
+    InvalidGeometry,
+    #[error("simulation dt must be finite and positive")]
+    InvalidSimulationDt,
+    #[error("channel ID {0:?} is duplicated")]
+    DuplicateChannelId(ChannelId),
+    #[error("channel name `{0}` is empty or duplicated")]
+    InvalidChannelName(String),
+    #[error("channel {channel:?} has {actual} cells; expected {expected}")]
+    InvalidInitialLength {
+        channel: ChannelId,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("channel {0:?} contains a non-finite value")]
+    NonFiniteChannel(ChannelId),
+    #[error("channel {0:?} has a non-finite boundary constant")]
+    NonFiniteBoundary(ChannelId),
+    #[error("channel {0:?} has opacity outside 0..=1")]
+    InvalidOpacity(ChannelId),
+    #[error("kernel ID {0:?} is duplicated")]
+    DuplicateKernelId(KernelId),
+    #[error("kernel symbol `{0}` is empty, reserved, or duplicated")]
+    InvalidKernelSymbol(String),
+    #[error("kernel {kernel:?} refers to missing {role} channel {channel:?}")]
+    MissingKernelChannel {
+        kernel: KernelId,
+        role: &'static str,
+        channel: ChannelId,
+    },
+    #[error("kernel {kernel:?} targets frozen channel {target:?}")]
+    FrozenKernelTarget { kernel: KernelId, target: ChannelId },
+    #[error("kernel {kernel:?} is invalid: {reason}")]
+    InvalidKernel { kernel: KernelId, reason: String },
+    #[error("growth program target {0:?} does not exist")]
+    MissingGrowthTarget(ChannelId),
+    #[error("growth program target {0:?} is duplicated")]
+    DuplicateGrowthTarget(ChannelId),
+    #[error("frozen channel {0:?} must not have a growth program")]
+    FrozenGrowthTarget(ChannelId),
+    #[error("active channel {0:?} has no growth program")]
+    MissingGrowthProgram(ChannelId),
+    #[error("growth program for {target:?} has kernel inputs {actual:?}; expected {expected:?}")]
+    GrowthKernelMismatch {
+        target: ChannelId,
+        expected: Vec<KernelId>,
+        actual: Vec<KernelId>,
+    },
+    #[error("growth program for {target:?} has invalid parameter `{parameter}`")]
+    InvalidGrowthParameter {
+        target: ChannelId,
+        parameter: String,
+    },
+    #[error("growth program for {0:?} is empty")]
+    EmptyGrowthSource(ChannelId),
+}
+
+pub fn validate_structure(spec: &ExperimentSpec) -> Result<(), Vec<ExperimentModelError>> {
+    let mut errors = Vec::new();
+    let tile_count = match &spec.geometry {
+        GeometrySpec::RasterGrid(grid) => {
+            if grid.width == 0 || grid.height == 0 {
+                errors.push(ExperimentModelError::InvalidGeometry);
+                None
+            } else {
+                if matches!(grid.boundary, BoundarySpec::Constant(value) if !value.is_finite()) {
+                    errors.push(ExperimentModelError::InvalidGeometry);
+                }
+                (grid.width as usize).checked_mul(grid.height as usize)
+            }
+        }
+    };
+    if tile_count.is_none() && !errors.contains(&ExperimentModelError::InvalidGeometry) {
+        errors.push(ExperimentModelError::InvalidGeometry);
+    }
+    if !spec.simulation_dt.is_finite() || spec.simulation_dt <= 0.0 {
+        errors.push(ExperimentModelError::InvalidSimulationDt);
+    }
+    if spec.channels.is_empty() {
+        errors.push(ExperimentModelError::EmptyChannels);
+    }
+
+    let mut channel_ids = BTreeSet::new();
+    let mut channel_names = BTreeSet::new();
+    for channel in &spec.channels {
+        if !channel_ids.insert(channel.id) {
+            errors.push(ExperimentModelError::DuplicateChannelId(channel.id));
+        }
+        if channel.name.trim().is_empty() || !channel_names.insert(channel.name.as_str()) {
+            errors.push(ExperimentModelError::InvalidChannelName(
+                channel.name.clone(),
+            ));
+        }
+        if let Some(expected) = tile_count
+            && channel.initial.len() != expected
+        {
+            errors.push(ExperimentModelError::InvalidInitialLength {
+                channel: channel.id,
+                expected,
+                actual: channel.initial.len(),
+            });
+        }
+        if channel.initial.iter().any(|value| !value.is_finite()) {
+            errors.push(ExperimentModelError::NonFiniteChannel(channel.id));
+        }
+        if !channel.boundary_constant.is_finite() {
+            errors.push(ExperimentModelError::NonFiniteBoundary(channel.id));
+        }
+        if !channel.display.opacity.is_finite() || !(0.0..=1.0).contains(&channel.display.opacity) {
+            errors.push(ExperimentModelError::InvalidOpacity(channel.id));
+        }
+    }
+
+    let channels = spec
+        .channels
+        .iter()
+        .map(|channel| (channel.id, channel))
+        .collect::<BTreeMap<_, _>>();
+    let mut kernel_ids = BTreeSet::new();
+    let mut kernel_symbols = BTreeSet::new();
+    for kernel in &spec.kernels {
+        if !kernel_ids.insert(kernel.id) {
+            errors.push(ExperimentModelError::DuplicateKernelId(kernel.id));
+        }
+        if kernel.symbol.trim().is_empty()
+            || kernel.symbol == "self"
+            || !kernel_symbols.insert(kernel.symbol.as_str())
+        {
+            errors.push(ExperimentModelError::InvalidKernelSymbol(
+                kernel.symbol.clone(),
+            ));
+        }
+        if !channels.contains_key(&kernel.source) {
+            errors.push(ExperimentModelError::MissingKernelChannel {
+                kernel: kernel.id,
+                role: "source",
+                channel: kernel.source,
+            });
+        }
+        match channels.get(&kernel.target) {
+            None => errors.push(ExperimentModelError::MissingKernelChannel {
+                kernel: kernel.id,
+                role: "target",
+                channel: kernel.target,
+            }),
+            Some(channel) if channel.frozen => {
+                errors.push(ExperimentModelError::FrozenKernelTarget {
+                    kernel: kernel.id,
+                    target: kernel.target,
+                })
+            }
+            Some(_) => {}
+        }
+        if let Err(error) = kernel.definition.build() {
+            errors.push(ExperimentModelError::InvalidKernel {
+                kernel: kernel.id,
+                reason: error.to_string(),
+            });
+        }
+    }
+
+    let mut growth_targets = BTreeSet::new();
+    for growth in &spec.growth {
+        if !growth_targets.insert(growth.target) {
+            errors.push(ExperimentModelError::DuplicateGrowthTarget(growth.target));
+        }
+        match channels.get(&growth.target) {
+            None => errors.push(ExperimentModelError::MissingGrowthTarget(growth.target)),
+            Some(channel) if channel.frozen => {
+                errors.push(ExperimentModelError::FrozenGrowthTarget(growth.target))
+            }
+            Some(_) => {}
+        }
+        let mut expected = spec
+            .kernels
+            .iter()
+            .filter(|kernel| kernel.target == growth.target)
+            .map(|kernel| kernel.id)
+            .collect::<Vec<_>>();
+        expected.sort_unstable();
+        let mut actual = growth.kernel_inputs.clone();
+        actual.sort_unstable();
+        if actual != expected || growth.kernel_inputs != actual {
+            errors.push(ExperimentModelError::GrowthKernelMismatch {
+                target: growth.target,
+                expected,
+                actual: growth.kernel_inputs.clone(),
+            });
+        }
+        for (name, value) in &growth.parameters {
+            if name.trim().is_empty() || name == "self" || !value.is_finite() {
+                errors.push(ExperimentModelError::InvalidGrowthParameter {
+                    target: growth.target,
+                    parameter: name.clone(),
+                });
+            }
+        }
+        if growth.source.trim().is_empty() {
+            errors.push(ExperimentModelError::EmptyGrowthSource(growth.target));
+        }
+    }
+    for channel in spec.channels.iter().filter(|channel| !channel.frozen) {
+        if !growth_targets.contains(&channel.id) {
+            errors.push(ExperimentModelError::MissingGrowthProgram(channel.id));
+        }
+    }
+
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(errors)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_model_is_single_channel_and_runnable() {
+        let model = ExperimentSpec::single_channel_lenia(32, 24);
+        assert_eq!(model.channels.len(), 1);
+        assert_eq!(model.channels[0].initial.len(), 32 * 24);
+        assert!(validate_structure(&model).is_ok());
+    }
+
+    #[test]
+    fn growth_inputs_are_exactly_targeting_kernels() {
+        let mut model = ExperimentSpec::single_channel_lenia(4, 4);
+        let channel = model.channels[0].id;
+        model
+            .kernels
+            .push(KernelSlot::identity(KernelId(1), "crowd", channel, channel));
+        model.growth[0].kernel_inputs.push(KernelId(999));
+        let errors = validate_structure(&model).unwrap_err();
+        assert!(errors.iter().any(|error| matches!(
+            error,
+            ExperimentModelError::GrowthKernelMismatch { target, .. } if *target == channel
+        )));
+    }
+
+    #[test]
+    fn frozen_target_is_rejected_but_frozen_source_is_allowed() {
+        let mut model = ExperimentSpec::single_channel_lenia(2, 2);
+        let frozen = model.add_channel("environment", true);
+        let active = model.channels[0].id;
+        model
+            .kernels
+            .push(KernelSlot::identity(KernelId(7), "signal", frozen, active));
+        model.growth[0].kernel_inputs.push(KernelId(7));
+        assert!(validate_structure(&model).is_ok());
+        model.kernels[0].target = frozen;
+        assert!(validate_structure(&model).is_err());
+    }
+}

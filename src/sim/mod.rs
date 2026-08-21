@@ -5,6 +5,7 @@ pub mod cpu;
 pub mod cuda;
 pub mod cuda_codegen;
 pub mod experiment;
+pub mod experiment_model;
 pub mod expression;
 pub mod kernel;
 pub mod kernel_file;
