@@ -1,6 +1,7 @@
 use crate::sim::kernel::{
     Kernel, KernelDefinition, KernelValues, Normalization, render_definition, ring_definition,
 };
+use std::collections::VecDeque;
 use std::io::{ErrorKind, Write};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
@@ -11,7 +12,9 @@ use crate::render::camera::Camera;
 use crate::render::raster::{Framebuffer, rasterize_world_into};
 use crate::sim::backend::{BackendKind, SimulationBackend};
 use crate::sim::experiment::{ExperimentError, ExperimentFile, ExperimentMetadata};
+use crate::sim::experiment_model::{ExperimentSpec, validate_structure};
 use crate::sim::rule::SimulationSpec;
+use crate::sim::service::{ApplyAccepted, ApplyRejected, ApplyRequest, Diagnostic, DiagnosticPath};
 use crate::sim::world::World;
 use crossterm::event::{Event, KeyCode, KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
@@ -77,6 +80,8 @@ pub struct App {
     applied_input_sequence: u64,
     snapshot_rate: f64,
     graphics_rate: f64,
+    experiment_model: ExperimentSpec,
+    experiment_revision: u64,
 }
 
 impl App {
@@ -95,6 +100,10 @@ impl App {
         world.randomize(seed, initial_density(&spec));
         let center = [width as f32 / 2.0, height as f32 / 2.0];
         let (kernel_definitions, selected_kernel) = kernel_catalog(&spec);
+        let mut experiment_model =
+            ExperimentSpec::single_channel_lenia(width as u32, height as u32);
+        experiment_model.name = rule_name(&spec).to_string();
+        experiment_model.channels[0].initial = world.cells().to_vec();
         Self {
             spec: spec.clone(),
             backend,
@@ -124,6 +133,8 @@ impl App {
             applied_input_sequence: 0,
             snapshot_rate: 0.0,
             graphics_rate: 0.0,
+            experiment_model,
+            experiment_revision: 0,
         }
     }
 
@@ -172,6 +183,76 @@ impl App {
 
     pub fn remote_transport_rates(&self) -> (f64, f64) {
         (self.snapshot_rate, self.graphics_rate)
+    }
+
+    pub fn active_revision(&self) -> u64 {
+        self.experiment_revision
+    }
+
+    pub fn channel_count(&self) -> usize {
+        self.experiment_model.channels.len()
+    }
+
+    pub fn active_experiment(&self) -> ExperimentSpec {
+        let mut model = self.experiment_model.clone();
+        if let Some(channel) = model.channels.first_mut() {
+            channel.initial = self.world.cells().to_vec();
+        }
+        model
+    }
+
+    pub fn submit_draft(&mut self, request: ApplyRequest) -> Result<ApplyAccepted, ApplyRejected> {
+        if request.base_revision != self.experiment_revision {
+            return Err(ApplyRejected {
+                request_id: request.request_id,
+                diagnostics: vec![Diagnostic {
+                    code: "revision_conflict".to_string(),
+                    message: format!(
+                        "draft is based on revision {}, active revision is {}",
+                        request.base_revision, self.experiment_revision
+                    ),
+                    path: DiagnosticPath::field("base_revision"),
+                }],
+            });
+        }
+        validate_structure(&request.draft).map_err(|errors| ApplyRejected {
+            request_id: request.request_id,
+            diagnostics: errors
+                .into_iter()
+                .map(|error| Diagnostic {
+                    code: "invalid_experiment".to_string(),
+                    message: error.to_string(),
+                    path: DiagnosticPath::field("experiment"),
+                })
+                .collect(),
+        })?;
+        if request.draft.channels.len() != 1 {
+            return Err(ApplyRejected {
+                request_id: request.request_id,
+                diagnostics: vec![Diagnostic {
+                    code: "legacy_runtime_requires_single_channel".to_string(),
+                    message: "multi-channel drafts require the experiment runtime".to_string(),
+                    path: DiagnosticPath::field("channels"),
+                }],
+            });
+        }
+        self.experiment_model = request.draft.clone();
+        self.experiment_revision =
+            self.experiment_revision
+                .checked_add(1)
+                .ok_or_else(|| ApplyRejected {
+                    request_id: request.request_id,
+                    diagnostics: vec![Diagnostic {
+                        code: "revision_overflow".to_string(),
+                        message: "experiment revision overflow".to_string(),
+                        path: DiagnosticPath::field("revision"),
+                    }],
+                })?;
+        Ok(ApplyAccepted {
+            request_id: request.request_id,
+            revision: self.experiment_revision,
+            normalized_experiment: request.draft,
+        })
     }
 
     pub fn selected_kernel_name(&self) -> &str {
@@ -845,6 +926,7 @@ const SERVER_MAX_STEPS_PER_ITERATION: usize = 1;
 
 struct LatestServerSnapshotState {
     snapshot: Option<crate::remote::Snapshot>,
+    controls: VecDeque<crate::remote::RemoteMessage>,
     closed: bool,
 }
 
@@ -859,6 +941,7 @@ impl LatestServerSnapshots {
             state: Arc::new((
                 Mutex::new(LatestServerSnapshotState {
                     snapshot: None,
+                    controls: VecDeque::new(),
                     closed: false,
                 }),
                 Condvar::new(),
@@ -876,13 +959,28 @@ impl LatestServerSnapshots {
         }
     }
 
-    fn recv(&self) -> Option<crate::remote::Snapshot> {
+    fn send(&self, message: crate::remote::RemoteMessage) {
+        let (lock, wake) = &*self.state;
+        if let Ok(mut state) = lock.lock()
+            && !state.closed
+        {
+            state.controls.push_back(message);
+            wake.notify_one();
+        }
+    }
+
+    fn recv(&self) -> Option<crate::remote::RemoteMessage> {
         let (lock, wake) = &*self.state;
         let mut state = lock.lock().ok()?;
-        while state.snapshot.is_none() && !state.closed {
+        while state.snapshot.is_none() && state.controls.is_empty() && !state.closed {
             state = wake.wait(state).ok()?;
         }
-        state.snapshot.take()
+        state.controls.pop_front().or_else(|| {
+            state
+                .snapshot
+                .take()
+                .map(crate::remote::RemoteMessage::Snapshot)
+        })
     }
 
     fn close(&self) {
@@ -1044,8 +1142,8 @@ where
     let snapshot_rx = snapshot_tx.clone();
     std::thread::spawn(move || {
         let mut writer = writer;
-        while let Some(snapshot) = snapshot_rx.recv() {
-            if write_message(&mut writer, &RemoteMessage::Snapshot(snapshot)).is_err() {
+        while let Some(message) = snapshot_rx.recv() {
+            if write_message(&mut writer, &message).is_err() {
                 break;
             }
         }
@@ -1070,6 +1168,10 @@ where
             match input_rx.try_recv() {
                 Ok(RemoteMessage::Hello) => {
                     connected = true;
+                    snapshot_tx.send(RemoteMessage::ExperimentState {
+                        revision: app.active_revision(),
+                        normalized_experiment: app.active_experiment(),
+                    });
                     snapshot_tx.store(app.remote_snapshot());
                 }
                 Ok(RemoteMessage::Viewport { width, height }) => {
@@ -1105,13 +1207,19 @@ where
                     app.applied_input_sequence = app.applied_input_sequence.max(sequence);
                     force_snapshot = true;
                 }
+                Ok(RemoteMessage::ApplyDraft(request)) => {
+                    match app.submit_draft(request) {
+                        Ok(accepted) => snapshot_tx.send(RemoteMessage::ApplyAccepted(accepted)),
+                        Err(rejected) => snapshot_tx.send(RemoteMessage::ApplyRejected(rejected)),
+                    }
+                    force_snapshot = true;
+                }
                 Ok(RemoteMessage::Quit) => {
                     snapshot_tx.close();
                     return Ok(());
                 }
                 Ok(RemoteMessage::Snapshot(_)) => {}
                 Ok(RemoteMessage::ExperimentState { .. })
-                | Ok(RemoteMessage::ApplyDraft(_))
                 | Ok(RemoteMessage::ApplyAccepted(_))
                 | Ok(RemoteMessage::ApplyRejected(_)) => {}
                 Err(TryRecvError::Empty) => break,
@@ -1270,6 +1378,12 @@ enum RemoteUpdate {
         snapshot: crate::remote::Snapshot,
         receive_rate: f64,
     },
+    ExperimentState {
+        revision: u64,
+        experiment: crate::sim::experiment_model::ExperimentSpec,
+    },
+    ApplyAccepted(crate::sim::service::ApplyAccepted),
+    ApplyRejected(crate::sim::service::ApplyRejected),
     Closed(Result<(), crate::remote::ProtocolError>),
 }
 
@@ -1319,6 +1433,19 @@ where
                         snapshot,
                         receive_rate: receive_meter.rate(),
                     });
+                }
+                Ok(Some(crate::remote::RemoteMessage::ExperimentState {
+                    revision,
+                    normalized_experiment,
+                })) => snapshot_tx.store(RemoteUpdate::ExperimentState {
+                    revision,
+                    experiment: normalized_experiment,
+                }),
+                Ok(Some(crate::remote::RemoteMessage::ApplyAccepted(accepted))) => {
+                    snapshot_tx.store(RemoteUpdate::ApplyAccepted(accepted));
+                }
+                Ok(Some(crate::remote::RemoteMessage::ApplyRejected(rejected))) => {
+                    snapshot_tx.store(RemoteUpdate::ApplyRejected(rejected));
                 }
                 Ok(Some(_)) => {}
                 Ok(None) => {
@@ -1388,6 +1515,23 @@ where
                     if app.applied_input_sequence() > previous_ack {
                         last_render = Instant::now() - render_interval;
                     }
+                }
+                RemoteUpdate::ExperimentState {
+                    revision,
+                    experiment,
+                } => {
+                    app.experiment_revision = revision;
+                    app.experiment_model = experiment;
+                }
+                RemoteUpdate::ApplyAccepted(accepted) => {
+                    app.experiment_revision = accepted.revision;
+                    app.experiment_model = accepted.normalized_experiment;
+                }
+                RemoteUpdate::ApplyRejected(rejected) => {
+                    app.backend_error = rejected
+                        .diagnostics
+                        .first()
+                        .map(|diagnostic| diagnostic.message.clone());
                 }
                 RemoteUpdate::Closed(Ok(())) => {
                     return Err(std::io::Error::new(
@@ -1927,6 +2071,54 @@ mod tests {
             ]),
             values: KernelValues::Explicit(vec![2.0, 4.0]),
         }
+    }
+
+    #[test]
+    fn classic_lenia_still_starts_as_one_channel() {
+        let app = App::new(SimulationSpec::lenia_orbium(), 32, 32);
+        assert_eq!(app.channel_count(), 1);
+        assert_eq!(app.active_revision(), 0);
+    }
+
+    #[test]
+    fn app_apply_rejection_does_not_advance_revision() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 2, 2);
+        let mut invalid = app.active_experiment();
+        invalid.channels[0].initial[0] = f32::NAN;
+        let result = app.submit_draft(crate::sim::service::ApplyRequest {
+            request_id: 1,
+            base_revision: 0,
+            draft: invalid,
+        });
+        assert!(result.is_err());
+        assert_eq!(app.active_revision(), 0);
+    }
+
+    #[test]
+    fn app_accepts_a_valid_draft_and_rejects_stale_revision() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 2, 2);
+        let draft = app.active_experiment();
+        let accepted = app
+            .submit_draft(crate::sim::service::ApplyRequest {
+                request_id: 2,
+                base_revision: 0,
+                draft,
+            })
+            .unwrap();
+        assert_eq!(accepted.revision, 1);
+        let stale_draft = app.active_experiment();
+        let stale = app.submit_draft(crate::sim::service::ApplyRequest {
+            request_id: 3,
+            base_revision: 0,
+            draft: stale_draft,
+        });
+        assert!(
+            stale
+                .unwrap_err()
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == "revision_conflict")
+        );
     }
 
     #[test]
