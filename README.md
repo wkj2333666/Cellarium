@@ -14,7 +14,10 @@ cellarium connect tinker   # local renderer connected to a remote server
 
 Graphics-capable terminals such as Kitty use high-precision graphics rendering
 by default. For SSH sessions, `connect` renders locally so keyboard and mouse
-input are not blocked by image frames crossing SSH. See
+input are not blocked by image frames crossing SSH. Native local Unix Kitty
+viewers use shared-memory frame transfer instead of embedding full RGBA frames
+in the terminal byte stream, with inline Kitty graphics as a compatibility
+fallback. See
 [Remote viewer](docs/remote-viewer.md).
 
 ## Build and install

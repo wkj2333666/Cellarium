@@ -117,6 +117,24 @@ fn connector_fixture() -> (PathBuf, PathBuf) {
     (directory, invocation)
 }
 
+fn server_connector_fixture() -> PathBuf {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "cellarium-server-connector-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let path = directory.join("ssh");
+    std::fs::write(&path, "#!/bin/sh\nexec \"$CELLARIUM_TEST_BINARY\" server\n").unwrap();
+    let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+    permissions.set_mode(0o755);
+    std::fs::set_permissions(path, permissions).unwrap();
+    directory
+}
+
 fn spawn_connect_on_pty(
     slave: i32,
     fixture: &Path,
@@ -139,7 +157,12 @@ fn spawn_connect_on_pty(
         .env("PATH", path)
         .env("TERM", "xterm-kitty")
         .env("KITTY_WINDOW_ID", "1")
+        .env("CELLARIUM_CELL_WIDTH", "8")
+        .env("CELLARIUM_CELL_HEIGHT", "16")
         .env("CELLARIUM_FAKE_INVOCATION", invocation)
+        .env("CELLARIUM_TEST_BINARY", env!("CARGO_BIN_EXE_cellarium"))
+        .env_remove("SSH_CONNECTION")
+        .env_remove("SSH_TTY")
         .env_remove("CELLARIUM_SSH_COMMAND");
     if let Some(explicit_command) = explicit_command {
         command.env("CELLARIUM_SSH_COMMAND", explicit_command);
@@ -323,6 +346,64 @@ fn connector_eof_reports_the_child_status_without_waiting_for_input() {
         String::from_utf8_lossy(&output)
     );
     assert!(!contains(&output, b"Broken pipe"));
+}
+
+#[test]
+fn local_kitty_connect_keeps_control_responsive_with_shared_memory_frames() {
+    let fixture = server_connector_fixture();
+    let invocation = fixture.join("unused-invocation");
+    let (master, slave) = open_pty();
+    set_nonblocking(master);
+    let mut child = spawn_connect_on_pty(slave, &fixture, &invocation, None);
+    unsafe { libc::close(slave) };
+
+    let mut output = Vec::new();
+    let shared_frame = pump_until(
+        &mut child,
+        master,
+        &mut output,
+        Instant::now() + Duration::from_secs(8),
+        |output| contains(output, b"t=s"),
+    );
+    assert!(
+        shared_frame,
+        "C/S viewer did not emit a Kitty shared-memory frame"
+    );
+    assert!(
+        !contains(&output, b"t=d"),
+        "C/S viewer embedded Kitty pixels in the PTY"
+    );
+
+    let pressed = Instant::now();
+    assert_eq!(unsafe { libc::write(master, b" ".as_ptr().cast(), 1) }, 1);
+    let paused = pump_until(
+        &mut child,
+        master,
+        &mut output,
+        pressed + Duration::from_secs(2),
+        |output| contains(output, b"paused"),
+    );
+    assert!(
+        paused,
+        "C/S viewer did not process pause within two seconds"
+    );
+
+    assert_eq!(unsafe { libc::write(master, b"q".as_ptr().cast(), 1) }, 1);
+    let status = pump_until_exit(
+        &mut child,
+        master,
+        &mut output,
+        Instant::now() + Duration::from_secs(3),
+    );
+    unsafe { libc::close(master) };
+    let _ = std::fs::remove_dir_all(&fixture);
+
+    let Some(status) = status else {
+        child.kill().expect("kill C/S viewer");
+        child.wait().expect("wait for killed C/S viewer");
+        panic!("C/S viewer ignored q after shared-memory rendering");
+    };
+    assert!(status.success(), "C/S viewer exited with {status}");
 }
 
 #[test]

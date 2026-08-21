@@ -16,7 +16,18 @@ The server executable is installed at `$HOME/.local/bin/cellarium`. The
 connect command starts `$HOME/.local/bin/cellarium server` through SSH. Only
 scalar snapshots and input events cross SSH; Kitty graphics escape sequences
 are generated locally, so a Kitty-capable terminal keeps high-precision output
-without blocking keyboard or mouse input on remote graphics writes.
+without sending image pixels through SSH. On native local Unix Kitty terminals,
+Cellarium transfers each RGBA frame through POSIX shared memory and sends only
+a small graphics command through the terminal PTY. This keeps terminal output
+from blocking keyboard or mouse input at high resolutions. Cellarium waits for
+Kitty to unlink each consumed object; if consumption stalls or shared-memory
+allocation fails, it switches to inline Kitty graphics. Other compatible
+terminals use inline graphics directly, and half-block rendering remains the
+last-resort fallback when no graphics protocol is available.
+
+The `render` rate shown by `connect` is measured by the local viewer. It is not
+the server's configured snapshot target, so it reflects graphics work the
+client is actually scheduling.
 
 Cellarium uses the system `ssh` command by default. This keeps the protocol
 stdin/stdout as a transparent byte stream while the local viewer independently

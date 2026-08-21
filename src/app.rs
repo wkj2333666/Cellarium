@@ -248,7 +248,7 @@ impl App {
         }
         self.world.replace_cells(&snapshot.cells);
         self.paused = snapshot.paused;
-        self.set_rates(snapshot.simulation_rate, snapshot.render_rate);
+        self.simulation_rate = snapshot.simulation_rate;
         self.backend_error = snapshot.error.clone();
         true
     }
@@ -627,10 +627,11 @@ mod remote_snapshot_tests {
         let snapshot = app.remote_snapshot();
 
         let mut mirror = App::new(SimulationSpec::conway(), 2, 2);
+        mirror.set_rates(0.0, 7.0);
         assert!(mirror.apply_remote_snapshot(&snapshot));
         assert_eq!(mirror.world().cells(), &[0.1, 0.2, 0.3, 0.4]);
         assert!(mirror.paused());
-        assert_eq!(mirror.rates(), (12.0, 30.0));
+        assert_eq!(mirror.rates(), (12.0, 7.0));
     }
 
     #[test]
@@ -1080,6 +1081,7 @@ where
 {
     use crate::remote::{ExpressionKey, InputMessage, RemoteMessage, write_message};
     let mut tracker = crate::input::MouseTracker::new();
+    let mut render_meter = RateMeter::new(Duration::from_secs(1));
     let render_interval = Duration::from_secs_f64(1.0 / 30.0);
     let mut last_render = Instant::now() - render_interval;
     let mut last_viewport = None;
@@ -1111,6 +1113,9 @@ where
         }
         let now = Instant::now();
         if now.duration_since(last_render) >= render_interval {
+            render_meter.record(now);
+            render_meter.refresh(now);
+            app.render_rate = render_meter.rate();
             let viewport = app.viewport_geometry().map(|(_, frame)| frame);
             if viewport != last_viewport {
                 if let Some((area, _frame_size)) = app.viewport_geometry() {
@@ -1164,13 +1169,13 @@ where
                     }
                 }
                 Event::Mouse(mouse) => {
-                    if app.handle_mouse(mouse, &mut tracker) {
-                        if let Some((area, _)) = app.viewport_geometry() {
-                            let mut local = mouse;
-                            local.column = local.column.saturating_sub(area.x);
-                            local.row = local.row.saturating_sub(area.y);
-                            send_remote_input(&writer, InputMessage::Mouse(local))?;
-                        }
+                    if app.handle_mouse(mouse, &mut tracker)
+                        && let Some((area, _)) = app.viewport_geometry()
+                    {
+                        let mut local = mouse;
+                        local.column = local.column.saturating_sub(area.x);
+                        local.row = local.row.saturating_sub(area.y);
+                        send_remote_input(&writer, InputMessage::Mouse(local))?;
                     }
                 }
                 Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}

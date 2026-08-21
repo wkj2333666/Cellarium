@@ -1,11 +1,25 @@
 pub mod half_block;
 
 use image::{DynamicImage, ImageBuffer, Rgba};
+#[cfg(unix)]
+use std::collections::VecDeque;
+#[cfg(unix)]
+use std::ffi::CString;
+#[cfg(unix)]
+use std::fs::File;
+#[cfg(all(unix, test))]
+use std::io::Read;
+#[cfg(unix)]
+use std::io::Write;
+#[cfg(unix)]
+use std::os::fd::FromRawFd;
 use std::sync::{
     Arc, Mutex,
     mpsc::{SyncSender, sync_channel},
 };
 use std::thread::JoinHandle;
+#[cfg(unix)]
+use std::time::{Duration, Instant};
 
 use crate::render::raster::Framebuffer;
 
@@ -39,6 +53,171 @@ pub struct PixelDisplay {
     worker: Option<JoinHandle<()>>,
 }
 
+#[cfg(unix)]
+struct KittySharedState {
+    ready: Option<KittySharedFrame>,
+    displayed_id: Option<u32>,
+    retained: VecDeque<KittySharedFrame>,
+    failed: bool,
+    next_image_id: u32,
+}
+
+#[cfg(unix)]
+pub struct KittySharedDisplay {
+    font_size: (u16, u16),
+    state: Arc<Mutex<KittySharedState>>,
+    tx: Option<SyncSender<(DynamicImage, ratatui::layout::Size)>>,
+    worker: Option<JoinHandle<()>>,
+    fallback: PixelDisplay,
+}
+
+#[cfg(unix)]
+impl KittySharedDisplay {
+    fn new(font_size: (u16, u16)) -> Self {
+        let (tx, rx) = sync_channel::<(DynamicImage, ratatui::layout::Size)>(1);
+        let state = Arc::new(Mutex::new(KittySharedState {
+            ready: None,
+            displayed_id: None,
+            retained: VecDeque::new(),
+            failed: false,
+            next_image_id: rand::random::<u32>().max(1),
+        }));
+        let worker_state = Arc::clone(&state);
+        let worker = std::thread::spawn(move || {
+            while let Ok((image, area)) = rx.recv() {
+                let (image_id, previous_id) = match worker_state.lock() {
+                    Ok(mut state) => {
+                        let image_id = state.next_image_id;
+                        state.next_image_id = state.next_image_id.wrapping_add(1).max(1);
+                        (image_id, state.displayed_id)
+                    }
+                    Err(_) => break,
+                };
+                let rgba = image.into_rgba8();
+                let frame = KittySharedFrame::new(
+                    rgba.as_raw(),
+                    rgba.width(),
+                    rgba.height(),
+                    area.width,
+                    area.height,
+                    image_id,
+                    previous_id,
+                );
+                let Ok(frame) = frame else {
+                    if let Ok(mut state) = worker_state.lock() {
+                        state.failed = true;
+                    }
+                    break;
+                };
+                if let Ok(mut state) = worker_state.lock() {
+                    state.ready = Some(frame);
+                }
+            }
+        });
+        Self {
+            font_size,
+            state,
+            tx: Some(tx),
+            worker: Some(worker),
+            fallback: kitty_pixel_display(font_size),
+        }
+    }
+
+    fn submit(&self, image: DynamicImage, size: ratatui::layout::Size) {
+        if self.state.lock().map_or(true, |state| state.failed) {
+            self.fallback.submit(image, size);
+            return;
+        }
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send((image, size));
+        }
+    }
+
+    fn render(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) -> bool {
+        let Ok(mut state) = self.state.lock() else {
+            return self.fallback.render(frame, area);
+        };
+        state
+            .retained
+            .retain(|shared| !shared.was_consumed_by_terminal());
+        if state
+            .retained
+            .front()
+            .is_some_and(|shared| shared.created_at.elapsed() >= Duration::from_secs(2))
+        {
+            state.failed = true;
+            state.ready = None;
+            state.retained.clear();
+        }
+        if state.failed {
+            if let Some(image_id) = state.displayed_id.take() {
+                let command = kitty_delete_image_command(image_id);
+                drop(state);
+                frame.render_widget(
+                    KittySharedWidget {
+                        command: Some(&command),
+                    },
+                    area,
+                );
+                return true;
+            }
+            drop(state);
+            return self.fallback.render(frame, area);
+        }
+        let Some(shared) = state.ready.take() else {
+            frame.render_widget(KittySharedWidget { command: None }, area);
+            return state.displayed_id.is_some();
+        };
+        let image_id = shared.image_id;
+        frame.render_widget(
+            KittySharedWidget {
+                command: Some(&shared.command),
+            },
+            area,
+        );
+        state.displayed_id = Some(image_id);
+        state.retained.push_back(shared);
+        true
+    }
+}
+
+#[cfg(unix)]
+impl Drop for KittySharedDisplay {
+    fn drop(&mut self) {
+        self.tx.take();
+        // A high-resolution write may still be in progress. Detach rather than
+        // making q/exit wait behind a frame that will never be displayed.
+        let _ = self.worker.take();
+    }
+}
+
+#[cfg(unix)]
+struct KittySharedWidget<'a> {
+    command: Option<&'a str>,
+}
+
+#[cfg(unix)]
+impl ratatui::widgets::Widget for KittySharedWidget<'_> {
+    fn render(self, area: ratatui::layout::Rect, buffer: &mut ratatui::buffer::Buffer) {
+        use ratatui::buffer::CellDiffOption;
+        use std::num::NonZeroU16;
+
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if let Some(cell) = buffer.cell_mut((x, y)) {
+                    cell.set_diff_option(CellDiffOption::Skip);
+                }
+            }
+        }
+        if let (Some(command), Some(cell)) = (self.command, buffer.cell_mut(area.as_position())) {
+            cell.set_symbol(command)
+                .set_diff_option(CellDiffOption::ForcedWidth(
+                    NonZeroU16::new(1).expect("one is non-zero"),
+                ));
+        }
+    }
+}
+
 impl PixelDisplay {
     fn new(picker: ratatui_image::picker::Picker) -> Self {
         let (tx, rx) = sync_channel::<(DynamicImage, ratatui::layout::Size)>(1);
@@ -49,10 +228,9 @@ impl PixelDisplay {
             while let Ok((image, size)) = rx.recv() {
                 if let Ok(encoded) =
                     worker_picker.new_protocol(image, size, ratatui_image::Resize::Fit(None))
+                    && let Ok(mut slot) = worker_protocol.lock()
                 {
-                    if let Ok(mut slot) = worker_protocol.lock() {
-                        *slot = Some(encoded);
-                    }
+                    *slot = Some(encoded);
                 }
             }
         });
@@ -85,6 +263,22 @@ impl PixelDisplay {
     }
 }
 
+#[cfg(unix)]
+fn kitty_pixel_display(font_size: (u16, u16)) -> PixelDisplay {
+    #[allow(deprecated)]
+    let mut picker = ratatui_image::picker::Picker::from_fontsize(ratatui_image::FontSize::new(
+        font_size.0,
+        font_size.1,
+    ));
+    picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
+    PixelDisplay::new(picker)
+}
+
+#[cfg(unix)]
+fn kitty_delete_image_command(image_id: u32) -> String {
+    format!("\x1b_Ga=d,d=I,i={image_id},q=1\x1b\\")
+}
+
 impl Drop for PixelDisplay {
     fn drop(&mut self) {
         self.tx.take();
@@ -98,6 +292,155 @@ impl Drop for PixelDisplay {
 pub enum ViewportDisplay {
     HalfBlock,
     Pixel(PixelDisplay),
+    #[cfg(unix)]
+    KittyShared(KittySharedDisplay),
+}
+
+#[cfg(unix)]
+struct KittySharedFrame {
+    command: String,
+    name: CString,
+    image_id: u32,
+    created_at: Instant,
+}
+
+#[cfg(unix)]
+impl KittySharedFrame {
+    fn new(
+        rgba: &[u8],
+        width: u32,
+        height: u32,
+        columns: u16,
+        rows: u16,
+        image_id: u32,
+        previous_id: Option<u32>,
+    ) -> std::io::Result<Self> {
+        use base64::Engine;
+
+        let expected = (width as usize)
+            .checked_mul(height as usize)
+            .and_then(|pixels| pixels.checked_mul(4))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Kitty RGBA dimensions overflow",
+                )
+            })?;
+        if rgba.len() != expected {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Kitty RGBA dimensions do not match the pixel data",
+            ));
+        }
+
+        let name = create_shared_memory(rgba)?;
+        let encoded_name = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
+        let mut command = format!(
+            "\x1b[s\x1b_Ga=T,f=32,t=s,s={width},v={height},S={},i={image_id},p=1,c={columns},r={rows},q=1;{encoded_name}\x1b\\",
+            rgba.len()
+        );
+        if let Some(previous_id) = previous_id {
+            command.push_str(&kitty_delete_image_command(previous_id));
+        }
+        command.push_str("\x1b[u");
+        Ok(Self {
+            command,
+            name,
+            image_id,
+            created_at: Instant::now(),
+        })
+    }
+
+    fn was_consumed_by_terminal(&self) -> bool {
+        let descriptor = unsafe { libc::shm_open(self.name.as_ptr(), libc::O_RDONLY, 0) };
+        if descriptor >= 0 {
+            unsafe {
+                libc::close(descriptor);
+            }
+            false
+        } else {
+            std::io::Error::last_os_error().kind() == std::io::ErrorKind::NotFound
+        }
+    }
+
+    #[cfg(test)]
+    fn read_pixels_for_test(&self) -> std::io::Result<Vec<u8>> {
+        let descriptor = unsafe { libc::shm_open(self.name.as_ptr(), libc::O_RDONLY, 0) };
+        if descriptor < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        let mut pixels = Vec::new();
+        file.read_to_end(&mut pixels)?;
+        Ok(pixels)
+    }
+}
+
+#[cfg(unix)]
+impl Drop for KittySharedFrame {
+    fn drop(&mut self) {
+        unsafe {
+            libc::shm_unlink(self.name.as_ptr());
+        }
+    }
+}
+
+#[cfg(unix)]
+fn create_shared_memory(bytes: &[u8]) -> std::io::Result<CString> {
+    for _ in 0..16 {
+        let name = CString::new(format!(
+            "/clrm-{:x}-{:x}",
+            std::process::id(),
+            rand::random::<u32>()
+        ))
+        .expect("shared memory name contains no NUL bytes");
+        let descriptor = unsafe {
+            libc::shm_open(
+                name.as_ptr(),
+                libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
+                libc::S_IRUSR | libc::S_IWUSR,
+            )
+        };
+        if descriptor < 0 {
+            let error = std::io::Error::last_os_error();
+            if error.kind() == std::io::ErrorKind::AlreadyExists {
+                continue;
+            }
+            return Err(error);
+        }
+
+        let mut file = unsafe { File::from_raw_fd(descriptor) };
+        if let Err(error) = (|| {
+            let length = i64::try_from(bytes.len()).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Kitty frame is too large for shared memory",
+                )
+            })?;
+            if unsafe { libc::ftruncate(descriptor, length) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            file.write_all(bytes)
+        })() {
+            unsafe {
+                libc::shm_unlink(name.as_ptr());
+            }
+            return Err(error);
+        }
+        return Ok(name);
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not allocate a unique Kitty shared memory object",
+    ))
+}
+
+pub fn should_use_kitty_shared_memory(
+    protocol: DisplayProtocol,
+    remote: bool,
+    native_kitty: bool,
+) -> bool {
+    cfg!(unix) && protocol == DisplayProtocol::Kitty && !remote && native_kitty
 }
 
 impl ViewportDisplay {
@@ -109,18 +452,34 @@ impl ViewportDisplay {
             std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
         let remote_graphics = std::env::var("CELLARIUM_REMOTE_GRAPHICS")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let native_kitty = std::env::var_os("KITTY_WINDOW_ID").is_some()
+            || term_program.eq_ignore_ascii_case("kitty");
         let protocol = detect_protocol_for_connection(
             &term,
             &term_program,
             &sixel,
             remote && !remote_graphics,
         );
-        Self::from_protocol_and_cell_size(protocol, cell_size_from_environment())
+        Self::from_protocol_and_cell_size_for_connection(
+            protocol,
+            cell_size_from_environment(),
+            remote,
+            native_kitty,
+        )
     }
 
     pub fn from_protocol_and_cell_size(
         protocol: DisplayProtocol,
         cell_size: Option<(u16, u16)>,
+    ) -> Self {
+        Self::from_protocol_and_cell_size_for_connection(protocol, cell_size, false, true)
+    }
+
+    fn from_protocol_and_cell_size_for_connection(
+        protocol: DisplayProtocol,
+        cell_size: Option<(u16, u16)>,
+        remote: bool,
+        native_kitty: bool,
     ) -> Self {
         if protocol == DisplayProtocol::HalfBlock {
             return Self::HalfBlock;
@@ -130,6 +489,11 @@ impl ViewportDisplay {
         else {
             return Self::HalfBlock;
         };
+
+        #[cfg(unix)]
+        if should_use_kitty_shared_memory(protocol, remote, native_kitty) {
+            return Self::KittyShared(KittySharedDisplay::new((width, height)));
+        }
 
         let picker_protocol = match protocol {
             DisplayProtocol::Kitty => ratatui_image::picker::ProtocolType::Kitty,
@@ -155,6 +519,11 @@ impl ViewportDisplay {
                     area.height as usize * font.height as usize,
                 )
             }
+            #[cfg(unix)]
+            Self::KittyShared(display) => (
+                area.width as usize * display.font_size.0 as usize,
+                area.height as usize * display.font_size.1 as usize,
+            ),
         }
     }
 
@@ -167,6 +536,8 @@ impl ViewportDisplay {
                 ratatui_image::picker::ProtocolType::Iterm2 => DisplayProtocol::Iterm2,
                 ratatui_image::picker::ProtocolType::Halfblocks => DisplayProtocol::HalfBlock,
             },
+            #[cfg(unix)]
+            Self::KittyShared(_) => DisplayProtocol::Kitty,
         }
     }
 
@@ -189,6 +560,16 @@ impl ViewportDisplay {
             let size = ratatui::layout::Size::new(area.width, area.height);
             pixel.submit(image, size);
             if pixel.render(frame, area) {
+                return;
+            }
+        }
+
+        #[cfg(unix)]
+        if let Self::KittyShared(display) = self {
+            let image = framebuffer_to_dynamic_image(framebuffer);
+            let size = ratatui::layout::Size::new(area.width, area.height);
+            display.submit(image, size);
+            if display.render(frame, area) {
                 return;
             }
         }
@@ -328,6 +709,111 @@ mod tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_kitty_frames_use_a_small_shared_memory_command() {
+        let pixels = [1, 2, 3, 255, 4, 5, 6, 255];
+        let frame = KittySharedFrame::new(&pixels, 2, 1, 12, 4, 41, Some(40)).unwrap();
+
+        assert!(frame.command.contains("a=T"));
+        assert!(frame.command.contains("t=s"));
+        assert!(frame.command.contains("f=32"));
+        assert!(frame.command.contains("s=2,v=1"));
+        assert!(frame.command.contains("c=12,r=4"));
+        assert!(frame.command.contains("i=41,p=1"));
+        assert!(frame.command.contains("q=1"));
+        assert!(!frame.command.contains("q=2"));
+        assert!(frame.command.contains("a=d,d=I,i=40"));
+        assert!(frame.command.len() < 256);
+        assert_eq!(frame.read_pixels_for_test().unwrap(), pixels);
+    }
+
+    #[test]
+    fn shared_memory_is_only_selected_for_a_local_kitty_terminal() {
+        assert_eq!(
+            should_use_kitty_shared_memory(DisplayProtocol::Kitty, false, true),
+            cfg!(unix)
+        );
+        assert!(!should_use_kitty_shared_memory(
+            DisplayProtocol::Kitty,
+            true,
+            true
+        ));
+        assert!(!should_use_kitty_shared_memory(
+            DisplayProtocol::Kitty,
+            false,
+            false
+        ));
+        assert!(!should_use_kitty_shared_memory(
+            DisplayProtocol::Sixel,
+            false,
+            true
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_memory_frame_is_reaped_only_after_terminal_unlinks_it() {
+        let pixels = [1, 2, 3, 255];
+        let frame = KittySharedFrame::new(&pixels, 1, 1, 1, 1, 41, None).unwrap();
+
+        assert!(!frame.was_consumed_by_terminal());
+        assert_eq!(unsafe { libc::shm_unlink(frame.name.as_ptr()) }, 0);
+        assert!(frame.was_consumed_by_terminal());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_memory_failure_routes_future_frames_to_inline_kitty() {
+        let display = KittySharedDisplay::new((8, 16));
+        display.state.lock().unwrap().failed = true;
+        display.submit(
+            DynamicImage::new_rgba8(8, 16),
+            ratatui::layout::Size::new(1, 1),
+        );
+
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while display.fallback.protocol.lock().unwrap().is_none() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(display.fallback.protocol.lock().unwrap().is_some());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_memory_fallback_deletes_the_last_real_kitty_placement() {
+        let display = KittySharedDisplay::new((8, 16));
+        {
+            let mut state = display.state.lock().unwrap();
+            state.failed = true;
+            state.displayed_id = Some(41);
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(1, 1)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                display.render(frame, ratatui::layout::Rect::new(0, 0, 1, 1));
+            })
+            .unwrap();
+
+        let symbol = terminal.backend().buffer().cell((0, 0)).unwrap().symbol();
+        assert!(symbol.contains("a=d,d=I,i=41,q=1"));
+        assert_eq!(display.state.lock().unwrap().displayed_id, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn non_native_kitty_compatibility_uses_inline_protocol() {
+        let display = ViewportDisplay::from_protocol_and_cell_size_for_connection(
+            DisplayProtocol::Kitty,
+            Some((8, 16)),
+            false,
+            false,
+        );
+        assert!(matches!(display, ViewportDisplay::Pixel(_)));
+    }
+
     #[test]
     fn converts_framebuffer_pixels_without_reordering() {
         let mut frame = Framebuffer::new(2, 1);
@@ -395,5 +881,40 @@ mod tests {
             .draw(|frame| display.render(frame, area, &framebuffer))
             .unwrap();
         assert_eq!(display.protocol(), DisplayProtocol::HalfBlock);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn local_kitty_viewport_emits_shared_memory_references() {
+        let framebuffer = Framebuffer::new(8, 16);
+        let area = ratatui::layout::Rect::new(0, 0, 1, 1);
+        let display =
+            ViewportDisplay::from_protocol_and_cell_size(DisplayProtocol::Kitty, Some((8, 16)));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(1, 1)).unwrap();
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        let symbol = loop {
+            terminal
+                .draw(|frame| display.render(frame, area, &framebuffer))
+                .unwrap();
+            let symbol = terminal
+                .backend()
+                .buffer()
+                .cell((0, 0))
+                .unwrap()
+                .symbol()
+                .to_string();
+            if symbol.contains("t=s") || std::time::Instant::now() >= deadline {
+                break symbol;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        };
+
+        assert!(
+            symbol.contains("t=s"),
+            "local Kitty output was not a shared-memory command: {symbol:?}"
+        );
+        assert!(symbol.len() < 256);
     }
 }
