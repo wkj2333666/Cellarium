@@ -1,0 +1,111 @@
+use super::{
+    PeriodicTilingDraft, PrototypeId, PrototypeShape, RigidTransform, TileId, TileInstance,
+    TilePrototype, TilingMode, Vec2,
+};
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum TilingPreset {
+    Square,
+    OctagonSquare,
+}
+
+impl TilingPreset {
+    pub const ALL: [Self; 2] = [Self::Square, Self::OctagonSquare];
+}
+
+pub fn build_preset(preset: TilingPreset, scale: f64) -> PeriodicTilingDraft {
+    let s = scale.max(1e-12);
+    match preset {
+        TilingPreset::Square => PeriodicTilingDraft {
+            translation_a: Vec2::new(s, 0.0),
+            translation_b: Vec2::new(0.0, s),
+            prototypes: vec![TilePrototype {
+                id: PrototypeId(0),
+                name: "square".into(),
+                shape: PrototypeShape::SimplePolygon {
+                    vertices: vec![
+                        Vec2::ZERO,
+                        Vec2::new(s, 0.0),
+                        Vec2::new(s, s),
+                        Vec2::new(0.0, s),
+                    ],
+                },
+            }],
+            instances: vec![TileInstance {
+                id: TileId(0),
+                prototype: PrototypeId(0),
+                transform: RigidTransform::default(),
+            }],
+            mode: TilingMode::Topological,
+        },
+        TilingPreset::OctagonSquare => {
+            let period = s * (2.0 + 2.0_f64.sqrt());
+            PeriodicTilingDraft {
+                translation_a: Vec2::new(period, 0.0),
+                translation_b: Vec2::new(0.0, period),
+                prototypes: vec![
+                    TilePrototype {
+                        id: PrototypeId(0),
+                        name: "octagon".into(),
+                        shape: PrototypeShape::RegularPolygon {
+                            sides: 8,
+                            side_length: s,
+                        },
+                    },
+                    TilePrototype {
+                        id: PrototypeId(1),
+                        name: "square".into(),
+                        shape: PrototypeShape::SimplePolygon {
+                            vertices: vec![
+                                Vec2::new(-s / 2.0, -s / 2.0),
+                                Vec2::new(s / 2.0, -s / 2.0),
+                                Vec2::new(s / 2.0, s / 2.0),
+                                Vec2::new(-s / 2.0, s / 2.0),
+                            ],
+                        },
+                    },
+                ],
+                instances: vec![
+                    TileInstance {
+                        id: TileId(0),
+                        prototype: PrototypeId(0),
+                        transform: RigidTransform::default(),
+                    },
+                    TileInstance {
+                        id: TileId(1),
+                        prototype: PrototypeId(1),
+                        transform: RigidTransform {
+                            translation: Vec2::new(0.0, period / 2.0),
+                            rotation: 0.0,
+                        },
+                    },
+                ],
+                mode: TilingMode::Topological,
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::sim::tiling::{canonical_half_edges, validate_coverage};
+    #[test]
+    fn square_preset_validates() {
+        let draft = build_preset(TilingPreset::Square, 1.0);
+        assert!(validate_coverage(&draft).is_ok());
+        assert!(canonical_half_edges(&draft, 1e-9).is_ok());
+    }
+    #[test]
+    fn octagon_square_has_two_editable_representatives() {
+        let draft = build_preset(TilingPreset::OctagonSquare, 1.0);
+        assert_eq!(draft.instances.len(), 2);
+        assert_eq!(
+            draft.prototypes[0].shape,
+            PrototypeShape::RegularPolygon {
+                sides: 8,
+                side_length: 1.0
+            }
+        );
+    }
+}

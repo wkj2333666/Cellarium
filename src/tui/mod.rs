@@ -91,6 +91,9 @@ fn draw_impl(
                 .add_modifier(Modifier::DIM),
         ),
     ]);
+    // Keep the ordinary terminal status row separate from the Kitty image:
+    // clear stale cells and clip the help text to the actual terminal width.
+    frame.render_widget(Clear, chunks[1]);
     frame.render_widget(
         Paragraph::new(status).style(Style::default().bg(Color::Rgb(12, 18, 32))),
         chunks[1],
@@ -308,6 +311,7 @@ fn editor_panel_lines(app: &App, max_width: usize, max_height: usize) -> Vec<Str
             app.selected_kernel_anchor().1
         ),
         "[K] select · [G] regenerate · [V] preview".to_string(),
+        "[E] edit growth · [T] cycle panels · mouse paint/inspect".to_string(),
         format!(
             "{} TOPOLOGY",
             panel_marker(app, crate::app::Panel::Topology)

@@ -18,5 +18,6 @@ pub mod rule;
 pub mod runtime;
 pub mod service;
 pub mod strategy;
+pub mod tiling;
 pub mod topology;
 pub mod world;
