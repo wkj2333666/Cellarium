@@ -912,8 +912,8 @@ mod remote_snapshot_tests {
         let mut mirror = App::new(SimulationSpec::lenia_orbium(), 2, 2);
         let mut snapshot = mirror.remote_snapshot();
         snapshot.rule = "Conway".into();
-        snapshot.spec = Box::new(SimulationSpec::conway());
-        snapshot.selected_kernel = Box::new(definition_from_kernel(&snapshot.spec.kernel));
+        *snapshot.spec = SimulationSpec::conway();
+        *snapshot.selected_kernel = definition_from_kernel(&snapshot.spec.kernel);
 
         assert!(mirror.apply_remote_snapshot(&snapshot));
 

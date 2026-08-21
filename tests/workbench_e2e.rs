@@ -50,12 +50,11 @@ fn keyboard_mouse_growth_and_tiling_apply_are_end_to_end() {
     assert!(app.tiling_draft().is_some());
 
     let mut invalid = draft;
-    if let Some(tiling) = &mut invalid.tiling {
-        if let cellarium::sim::tiling::PrototypeShape::SimplePolygon { vertices } =
+    if let Some(tiling) = &mut invalid.tiling
+        && let cellarium::sim::tiling::PrototypeShape::SimplePolygon { vertices } =
             &mut tiling.prototypes[0].shape
-        {
-            vertices.swap(1, 2);
-        }
+    {
+        vertices.swap(1, 2);
     }
     let rejected = app
         .submit_draft(cellarium::sim::service::ApplyRequest {

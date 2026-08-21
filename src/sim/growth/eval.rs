@@ -331,12 +331,8 @@ fn call(name: &str, values: &[f32]) -> Result<f32, EvalError> {
                 return Err(EvalError::InvalidArguments);
             }
         }
-        "gauss" => {
-            if values.len() == 3 && values[2] != 0.0 {
-                (-0.5 * ((values[0] - values[1]) / values[2]).powi(2)).exp()
-            } else {
-                return Err(EvalError::InvalidArguments);
-            }
+        "gauss" if values.len() == 3 && values[2] != 0.0 => {
+            (-0.5 * ((values[0] - values[1]) / values[2]).powi(2)).exp()
         }
         _ => return Err(EvalError::InvalidArguments),
     };
