@@ -72,6 +72,7 @@ pub struct App {
     active_panel: Panel,
     expression_editing: bool,
     expression_buffer: String,
+    help_visible: bool,
     framebuffer: Option<Framebuffer>,
     performance: PerformanceStats,
     remote_tick: Option<u64>,
@@ -124,6 +125,7 @@ impl App {
             kernel_preview_enabled: false,
             active_panel: Panel::Overview,
             expression_editing: false,
+            help_visible: false,
             expression_buffer: String::new(),
             framebuffer: None,
             performance: PerformanceStats::default(),
@@ -362,6 +364,10 @@ impl App {
 
     pub fn expression_buffer(&self) -> &str {
         &self.expression_buffer
+    }
+
+    pub fn help_visible(&self) -> bool {
+        self.help_visible
     }
 
     pub fn replace_expression_buffer(&mut self, value: impl Into<String>) {
@@ -639,6 +645,7 @@ impl App {
             }
             Command::NextPanel => self.active_panel = self.active_panel.next(),
             Command::ToggleExpressionEditor => self.toggle_expression_editor(),
+            Command::ToggleHelp => self.help_visible = !self.help_visible,
             Command::Quit => {}
         }
     }
@@ -652,6 +659,7 @@ impl App {
                 self.kernel_preview_enabled = !self.kernel_preview_enabled;
             }
             Command::ToggleExpressionEditor => self.toggle_expression_editor(),
+            Command::ToggleHelp => self.help_visible = !self.help_visible,
             Command::Quit
             | Command::Step
             | Command::Reset

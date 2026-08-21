@@ -77,6 +77,9 @@ fn draw_impl(
     if app.kernel_preview_enabled() {
         render_kernel_preview(frame, app, outer);
     }
+    if app.help_visible() {
+        render_help(frame, outer);
+    }
 
     let status = Line::from(vec![
         Span::styled(
@@ -132,6 +135,40 @@ fn render_kernel_preview(frame: &mut ratatui::Frame, app: &App, area: ratatui::l
             .block(block)
             .style(Style::default().bg(Color::Rgb(10, 15, 28))),
         area,
+    );
+}
+
+fn render_help(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+    if area.width < 32 || area.height < 12 {
+        return;
+    }
+    let width = area.width.min(76);
+    let height = area.height.min(18);
+    let x = area.x + (area.width - width) / 2;
+    let y = area.y + (area.height - height) / 2;
+    let popup = ratatui::layout::Rect::new(x, y, width, height);
+    let lines = vec![
+        Line::from("Workbench help"),
+        Line::from(""),
+        Line::from("World: mouse left paint/inspect · right erase · middle pan · wheel zoom"),
+        Line::from("Simulation: Space/P pause · N/Enter step · R reset · A randomize · C clear"),
+        Line::from("Rule: 1 Conway · 2 Lenia · E edit growth source (Enter apply, Esc cancel)"),
+        Line::from("Kernel: K select · Tab parameter · +/- adjust · G regenerate · V preview"),
+        Line::from("Panels: T cycle Overview / Rule / Kernel / Topology / Errors"),
+        Line::from("Topology: polygon drafts validate edges, seams, coverage, and compile to CSR"),
+        Line::from("Growth: use let, if/else, booleans, math calls; the plot appears in Rule"),
+        Line::from("? or Esc closes this help"),
+    ];
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(Block::default().title(" Help ").borders(Borders::ALL))
+            .style(
+                Style::default()
+                    .bg(Color::Rgb(10, 15, 28))
+                    .fg(Color::Rgb(205, 220, 245)),
+            ),
+        popup,
     );
 }
 

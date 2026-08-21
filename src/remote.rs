@@ -5,7 +5,7 @@ use crate::sim::service::{ApplyAccepted, ApplyRejected, ApplyRequest, Diagnostic
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u8 = 5;
+pub const PROTOCOL_VERSION: u8 = 6;
 pub const MAX_FRAME_SIZE: u32 = 64 * 1024 * 1024;
 const MAGIC: [u8; 4] = *b"CLRM";
 
@@ -502,6 +502,7 @@ fn command_code(command: Command) -> u8 {
         Command::ToggleKernelPreview => 13,
         Command::NextPanel => 14,
         Command::ToggleExpressionEditor => 15,
+        Command::ToggleHelp => 16,
     }
 }
 
@@ -523,6 +524,7 @@ fn command_from_code(code: u8) -> Result<Command, ProtocolError> {
         13 => Command::ToggleKernelPreview,
         14 => Command::NextPanel,
         15 => Command::ToggleExpressionEditor,
+        16 => Command::ToggleHelp,
         _ => return Err(ProtocolError::Invalid("unknown command")),
     })
 }
