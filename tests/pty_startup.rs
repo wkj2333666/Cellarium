@@ -69,6 +69,23 @@ fn spawn_on_pty(slave: i32) -> std::process::Child {
         .expect("spawn cellarium")
 }
 
+fn spawn_graphics_on_pty(slave: i32) -> std::process::Child {
+    let stdin = unsafe { Stdio::from_raw_fd(libc::dup(slave)) };
+    let stdout = unsafe { Stdio::from_raw_fd(libc::dup(slave)) };
+    let stderr = unsafe { Stdio::from_raw_fd(libc::dup(slave)) };
+    Command::new(env!("CARGO_BIN_EXE_cellarium"))
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr)
+        .env("TERM", "xterm-kitty")
+        .env("SSH_CONNECTION", "127.0.0.1 22 127.0.0.1 50000")
+        .env("CELLARIUM_REMOTE_GRAPHICS", "1")
+        .env("CELLARIUM_CELL_WIDTH", "8")
+        .env("CELLARIUM_CELL_HEIGHT", "16")
+        .spawn()
+        .expect("spawn cellarium graphics")
+}
+
 fn read_available(master: i32, output: &mut Vec<u8>) {
     let mut poll = pollfd {
         fd: master,
@@ -188,4 +205,62 @@ fn nonresponsive_terminal_startup_accepts_quit_and_restores_terminal() {
     assert!(status.success(), "cellarium exited with {status}");
     assert!(contains(&output, b"\x1b[?1049l"));
     assert!(contains(&output, b"\x1b[?1000l"));
+}
+
+#[test]
+#[ignore = "direct Kitty graphics requires a draining terminal; use C1 connect over SSH"]
+fn remote_graphics_startup_accepts_quit_without_waiting_for_frame_flush() {
+    let (master, slave) = open_pty();
+    set_nonblocking(master);
+    let mut child = spawn_graphics_on_pty(slave);
+    unsafe { libc::close(slave) };
+
+    let mut output = Vec::new();
+    let rendered = pump_until(
+        &mut child,
+        master,
+        &mut output,
+        Instant::now() + Duration::from_secs(2),
+        |output| !output.is_empty(),
+    );
+    assert!(
+        rendered,
+        "graphics mode produced no terminal output before timeout"
+    );
+    thread::sleep(Duration::from_millis(500));
+    read_available(master, &mut output);
+    assert_eq!(
+        output
+            .windows(b"\x1b[2J".len())
+            .filter(|window| *window == b"\x1b[2J")
+            .count(),
+        0,
+        "graphics mode emitted visible clear-screen sequences"
+    );
+
+    assert_eq!(unsafe { libc::write(master, b" ".as_ptr().cast(), 1) }, 1);
+    let paused = pump_until(
+        &mut child,
+        master,
+        &mut output,
+        Instant::now() + Duration::from_secs(3),
+        |output| contains(output, b"paused"),
+    );
+    assert!(paused, "graphics mode did not process the pause key");
+
+    assert_eq!(unsafe { libc::write(master, b"q".as_ptr().cast(), 1) }, 1);
+    let status = pump_until_exit(
+        &mut child,
+        master,
+        &mut output,
+        Instant::now() + Duration::from_secs(3),
+    );
+    unsafe { libc::close(master) };
+
+    let Some(status) = status else {
+        child.kill().expect("kill graphics cellarium");
+        child.wait().expect("wait for killed graphics cellarium");
+        panic!("graphics mode ignored q while output was being flushed");
+    };
+    assert!(status.success(), "graphics cellarium exited with {status}");
 }

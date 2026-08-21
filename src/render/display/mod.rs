@@ -1,6 +1,11 @@
 pub mod half_block;
 
 use image::{DynamicImage, ImageBuffer, Rgba};
+use std::sync::{
+    Arc, Mutex,
+    mpsc::{SyncSender, sync_channel},
+};
+use std::thread::JoinHandle;
 
 use crate::render::raster::Framebuffer;
 
@@ -27,9 +32,72 @@ impl DisplayProtocol {
     }
 }
 
+pub struct PixelDisplay {
+    picker: ratatui_image::picker::Picker,
+    protocol: Arc<Mutex<Option<ratatui_image::protocol::Protocol>>>,
+    tx: Option<SyncSender<(DynamicImage, ratatui::layout::Size)>>,
+    worker: Option<JoinHandle<()>>,
+}
+
+impl PixelDisplay {
+    fn new(picker: ratatui_image::picker::Picker) -> Self {
+        let (tx, rx) = sync_channel::<(DynamicImage, ratatui::layout::Size)>(1);
+        let protocol = Arc::new(Mutex::new(None));
+        let worker_protocol = Arc::clone(&protocol);
+        let worker_picker = picker.clone();
+        let worker = std::thread::spawn(move || {
+            while let Ok((image, size)) = rx.recv() {
+                if let Ok(encoded) =
+                    worker_picker.new_protocol(image, size, ratatui_image::Resize::Fit(None))
+                {
+                    if let Ok(mut slot) = worker_protocol.lock() {
+                        *slot = Some(encoded);
+                    }
+                }
+            }
+        });
+        Self {
+            picker,
+            protocol,
+            tx: Some(tx),
+            worker: Some(worker),
+        }
+    }
+
+    fn submit(&self, image: DynamicImage, size: ratatui::layout::Size) {
+        if let Some(tx) = &self.tx {
+            let _ = tx.try_send((image, size));
+        }
+    }
+
+    fn render(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) -> bool {
+        let Ok(protocol) = self.protocol.lock() else {
+            return false;
+        };
+        let Some(protocol) = protocol.as_ref() else {
+            return false;
+        };
+        frame.render_widget(
+            ratatui_image::Image::new(protocol).allow_clipping(true),
+            area,
+        );
+        true
+    }
+}
+
+impl Drop for PixelDisplay {
+    fn drop(&mut self) {
+        self.tx.take();
+        // Encoding a high-resolution frame can outlive the terminal session.
+        // Joining here would make shutdown wait behind an obsolete frame and
+        // prevent the quit key from returning control to the shell.
+        let _ = self.worker.take();
+    }
+}
+
 pub enum ViewportDisplay {
     HalfBlock,
-    Pixel(ratatui_image::picker::Picker),
+    Pixel(PixelDisplay),
 }
 
 impl ViewportDisplay {
@@ -37,7 +105,16 @@ impl ViewportDisplay {
         let term = std::env::var("TERM").unwrap_or_default();
         let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
         let sixel = std::env::var("SIXEL").unwrap_or_default();
-        let protocol = detect_protocol(&term, &term_program, &sixel);
+        let remote =
+            std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+        let remote_graphics = std::env::var("CELLARIUM_REMOTE_GRAPHICS")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        let protocol = detect_protocol_for_connection(
+            &term,
+            &term_program,
+            &sixel,
+            remote && !remote_graphics,
+        );
         Self::from_protocol_and_cell_size(protocol, cell_size_from_environment())
     }
 
@@ -65,14 +142,14 @@ impl ViewportDisplay {
             ratatui_image::FontSize::new(width, height),
         );
         picker.set_protocol_type(picker_protocol);
-        Self::Pixel(picker)
+        Self::Pixel(PixelDisplay::new(picker))
     }
 
     pub fn framebuffer_size(&self, area: ratatui::layout::Rect) -> (usize, usize) {
         match self {
             Self::HalfBlock => (area.width as usize, area.height as usize * 2),
-            Self::Pixel(picker) => {
-                let font = picker.font_size();
+            Self::Pixel(pixel) => {
+                let font = pixel.picker.font_size();
                 (
                     area.width as usize * font.width as usize,
                     area.height as usize * font.height as usize,
@@ -84,7 +161,7 @@ impl ViewportDisplay {
     pub fn protocol(&self) -> DisplayProtocol {
         match self {
             Self::HalfBlock => DisplayProtocol::HalfBlock,
-            Self::Pixel(picker) => match picker.protocol_type() {
+            Self::Pixel(pixel) => match pixel.picker.protocol_type() {
                 ratatui_image::picker::ProtocolType::Kitty => DisplayProtocol::Kitty,
                 ratatui_image::picker::ProtocolType::Sixel => DisplayProtocol::Sixel,
                 ratatui_image::picker::ProtocolType::Iterm2 => DisplayProtocol::Iterm2,
@@ -93,21 +170,25 @@ impl ViewportDisplay {
         }
     }
 
+    pub fn uses_async_output(&self) -> bool {
+        let remote =
+            std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
+        let remote_graphics = std::env::var("CELLARIUM_REMOTE_GRAPHICS")
+            .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
+        should_use_async_output(self.protocol(), remote, remote_graphics)
+    }
+
     pub fn render(
         &self,
         frame: &mut ratatui::Frame,
         area: ratatui::layout::Rect,
         framebuffer: &Framebuffer,
     ) {
-        if let Self::Pixel(picker) = self {
+        if let Self::Pixel(pixel) = self {
             let image = framebuffer_to_dynamic_image(framebuffer);
             let size = ratatui::layout::Size::new(area.width, area.height);
-            if let Ok(protocol) = picker.new_protocol(image, size, ratatui_image::Resize::Fit(None))
-            {
-                frame.render_widget(
-                    ratatui_image::Image::new(&protocol).allow_clipping(true),
-                    area,
-                );
+            pixel.submit(image, size);
+            if pixel.render(frame, area) {
                 return;
             }
         }
@@ -119,6 +200,14 @@ impl ViewportDisplay {
     }
 }
 
+pub fn should_use_async_output(
+    protocol: DisplayProtocol,
+    remote: bool,
+    remote_graphics: bool,
+) -> bool {
+    remote && remote_graphics && protocol.is_pixel_protocol()
+}
+
 pub fn detect_protocol(term: &str, term_program: &str, sixel: &str) -> DisplayProtocol {
     if term.contains("kitty") || term_program == "kitty" {
         DisplayProtocol::Kitty
@@ -128,6 +217,19 @@ pub fn detect_protocol(term: &str, term_program: &str, sixel: &str) -> DisplayPr
         DisplayProtocol::Sixel
     } else {
         DisplayProtocol::HalfBlock
+    }
+}
+
+pub fn detect_protocol_for_connection(
+    term: &str,
+    term_program: &str,
+    sixel: &str,
+    remote_without_graphics: bool,
+) -> DisplayProtocol {
+    if remote_without_graphics {
+        DisplayProtocol::HalfBlock
+    } else {
+        detect_protocol(term, term_program, sixel)
     }
 }
 
@@ -194,6 +296,39 @@ mod tests {
     }
 
     #[test]
+    fn remote_kitty_connections_default_to_halfblocks_for_responsive_input() {
+        assert_eq!(
+            detect_protocol_for_connection("xterm-kitty", "kitty", "", true),
+            DisplayProtocol::HalfBlock
+        );
+        assert_eq!(
+            detect_protocol_for_connection("xterm-kitty", "kitty", "", false),
+            DisplayProtocol::Kitty
+        );
+    }
+
+    #[test]
+    fn async_output_is_reserved_for_remote_graphics() {
+        assert!(should_use_async_output(DisplayProtocol::Kitty, true, true));
+        assert!(should_use_async_output(DisplayProtocol::Sixel, true, true));
+        assert!(!should_use_async_output(
+            DisplayProtocol::HalfBlock,
+            true,
+            true
+        ));
+        assert!(!should_use_async_output(
+            DisplayProtocol::Kitty,
+            true,
+            false
+        ));
+        assert!(!should_use_async_output(
+            DisplayProtocol::Kitty,
+            false,
+            true
+        ));
+    }
+
+    #[test]
     fn converts_framebuffer_pixels_without_reordering() {
         let mut frame = Framebuffer::new(2, 1);
         frame.set(0, 0, Rgb8::new(1, 2, 3));
@@ -217,7 +352,7 @@ mod tests {
         );
 
         let picker = ratatui_image::picker::Picker::halfblocks();
-        let pixel_display = ViewportDisplay::Pixel(picker);
+        let pixel_display = ViewportDisplay::Pixel(PixelDisplay::new(picker));
         assert_eq!(pixel_display.framebuffer_size(area), (100, 100));
     }
 
@@ -250,7 +385,9 @@ mod tests {
     fn viewport_display_renders_pixel_protocols_into_the_frame() {
         let framebuffer = Framebuffer::new(10, 20);
         let area = ratatui::layout::Rect::new(0, 0, 1, 1);
-        let display = ViewportDisplay::Pixel(ratatui_image::picker::Picker::halfblocks());
+        let display = ViewportDisplay::Pixel(PixelDisplay::new(
+            ratatui_image::picker::Picker::halfblocks(),
+        ));
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(1, 1)).unwrap();
 

@@ -14,13 +14,13 @@ fn main() {
 fn kernel_file_cli_errors_include_concise_usage() {
     assert_eq!(
         cli_error("unexpected argument"),
-        "cellarium: unexpected argument\nusage: cellarium [--kernel <path>] [--experiment <path>] [--save-experiment <path>]"
+        "cellarium: unexpected argument\nusage: cellarium [server | connect <host>] [--kernel <path>] [--experiment <path>] [--save-experiment <path>]"
     );
 }
 
 fn cli_error(message: &str) -> String {
     format!(
-        "cellarium: {message}\nusage: cellarium [--kernel <path>] [--experiment <path>] [--save-experiment <path>]"
+        "cellarium: {message}\nusage: cellarium [server | connect <host>] [--kernel <path>] [--experiment <path>] [--save-experiment <path>]"
     )
 }
 
@@ -48,6 +48,16 @@ where
     I: IntoIterator<Item = OsString>,
 {
     let options = parse_cli(args).map_err(CliError)?;
+    match &options.mode {
+        CliMode::Server => return Ok(cellarium::app::run_server()?),
+        CliMode::Connect { host } => {
+            return Ok(cellarium::app::run_connect_with_command(
+                host,
+                options.ssh_command.as_deref(),
+            )?);
+        }
+        CliMode::Direct => {}
+    }
     if let Some(experiment_path) = options.experiment {
         let file = cellarium::sim::experiment::load_experiment(&experiment_path)?;
         if let Some(save_path) = options.save_experiment {
@@ -74,9 +84,21 @@ where
 
 #[derive(Debug, Default, PartialEq, Eq)]
 struct CliOptions {
+    mode: CliMode,
     kernel: Option<PathBuf>,
     experiment: Option<PathBuf>,
     save_experiment: Option<PathBuf>,
+    ssh_command: Option<String>,
+}
+
+#[derive(Debug, Default, PartialEq, Eq)]
+enum CliMode {
+    #[default]
+    Direct,
+    Server,
+    Connect {
+        host: String,
+    },
 }
 
 fn parse_cli<I>(args: I) -> Result<CliOptions, &'static str>
@@ -87,6 +109,31 @@ where
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
         let flag = argument.to_string_lossy();
+        if flag == "server" {
+            if options.mode != CliMode::Direct {
+                return Err("duplicate mode");
+            }
+            options.mode = CliMode::Server;
+            continue;
+        }
+        if flag == "connect" {
+            if options.mode != CliMode::Direct {
+                return Err("duplicate mode");
+            }
+            let host = args.next().ok_or("connect requires a host")?;
+            options.mode = CliMode::Connect {
+                host: host.to_string_lossy().into_owned(),
+            };
+            continue;
+        }
+        if flag == "--ssh-command" {
+            if options.ssh_command.is_some() {
+                return Err("duplicate argument");
+            }
+            let command = args.next().ok_or("--ssh-command requires a command")?;
+            options.ssh_command = Some(command.to_string_lossy().into_owned());
+            continue;
+        }
         let target = match flag.as_ref() {
             "--kernel" => &mut options.kernel,
             "--experiment" => &mut options.experiment,
@@ -105,6 +152,16 @@ where
     }
     if options.kernel.is_some() && options.experiment.is_some() {
         return Err("--kernel and --experiment cannot be combined");
+    }
+    if options.ssh_command.is_some() && !matches!(options.mode, CliMode::Connect { .. }) {
+        return Err("--ssh-command requires connect");
+    }
+    if matches!(options.mode, CliMode::Server)
+        && (options.kernel.is_some()
+            || options.experiment.is_some()
+            || options.save_experiment.is_some())
+    {
+        return Err("server cannot be combined with direct-mode arguments");
     }
     Ok(options)
 }

@@ -61,15 +61,65 @@ pub fn rasterize_world(world: &World, camera: &Camera, width: usize, height: usi
 pub fn rasterize_world_into(world: &World, camera: &Camera, frame: &mut Framebuffer) {
     let width = frame.width;
     let height = frame.height;
+    // Integer zooms keep crisp cell edges; fractional zooms need the whole
+    // output-pixel footprint to avoid nearest-neighbor shape aliasing.
+    let use_coverage = (camera.zoom() - camera.zoom().round()).abs() > 1.0e-6;
     for y in 0..height {
         for x in 0..width {
-            let world_position =
-                camera.screen_to_world([x as f32 + 0.5, y as f32 + 0.5], width, height);
-            let sample_x = world_position[0].floor().rem_euclid(world.width() as f32) as usize;
-            let sample_y = world_position[1].floor().rem_euclid(world.height() as f32) as usize;
-            let value = world.get(sample_x as isize, sample_y as isize);
+            let screen = [x as f32 + 0.5, y as f32 + 0.5];
+            let value = if use_coverage {
+                sample_world_coverage(world, camera, screen, width, height)
+            } else {
+                let world_position = camera.screen_to_world(screen, width, height);
+                let sample_x = world_position[0].floor().rem_euclid(world.width() as f32) as usize;
+                let sample_y = world_position[1].floor().rem_euclid(world.height() as f32) as usize;
+                world.get(sample_x as isize, sample_y as isize)
+            };
             frame.set(x, y, value_to_rgb(value));
         }
+    }
+}
+
+fn sample_world_coverage(
+    world: &World,
+    camera: &Camera,
+    screen: [f32; 2],
+    width: usize,
+    height: usize,
+) -> f32 {
+    let center = camera.screen_to_world(screen, width, height);
+    let half_extent = 0.5 / camera.zoom();
+    let left = center[0] - half_extent;
+    let right = center[0] + half_extent;
+    let top = center[1] - half_extent;
+    let bottom = center[1] + half_extent;
+    let x_start = left.floor() as isize;
+    let x_end = right.ceil() as isize;
+    let y_start = top.floor() as isize;
+    let y_end = bottom.ceil() as isize;
+
+    let mut weighted = 0.0;
+    let mut covered = 0.0;
+    for y in y_start..y_end {
+        let y_overlap = (bottom.min(y as f32 + 1.0) - top.max(y as f32)).max(0.0);
+        if y_overlap == 0.0 {
+            continue;
+        }
+        for x in x_start..x_end {
+            let x_overlap = (right.min(x as f32 + 1.0) - left.max(x as f32)).max(0.0);
+            if x_overlap == 0.0 {
+                continue;
+            }
+            let weight = x_overlap * y_overlap;
+            weighted += world.get(x, y) * weight;
+            covered += weight;
+        }
+    }
+
+    if covered > 0.0 {
+        weighted / covered
+    } else {
+        world.get(center[0].floor() as isize, center[1].floor() as isize)
     }
 }
 
@@ -130,5 +180,26 @@ mod tests {
         assert_eq!(value_to_rgb(0.0), Rgb8::new(8, 12, 24));
         assert_eq!(value_to_rgb(1.0), Rgb8::new(255, 238, 170));
         assert_ne!(value_to_rgb(0.5), value_to_rgb(0.0));
+    }
+
+    #[test]
+    fn fractional_zoom_blends_cell_boundaries_instead_of_aliasing() {
+        let mut world = World::new(2, 2);
+        world.set(0, 0, 1.0);
+        let camera = Camera::new([1.0, 1.0], 1.2);
+
+        let frame = rasterize_world(&world, &camera, 4, 4);
+        let empty = value_to_rgb(0.0);
+        let full = value_to_rgb(1.0);
+
+        assert!(
+            (0..frame.height()).any(|y| {
+                (0..frame.width()).any(|x| {
+                    let color = frame.get(x, y);
+                    color != empty && color != full
+                })
+            }),
+            "fractional zoom must preserve partial cell coverage instead of selecting only one cell"
+        );
     }
 }

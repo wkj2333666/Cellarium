@@ -1,7 +1,9 @@
 use crate::sim::kernel::{
     Kernel, KernelDefinition, KernelValues, Normalization, render_definition, ring_definition,
 };
-use std::io::ErrorKind;
+use std::io::{ErrorKind, Write};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::input::Command;
@@ -221,6 +223,36 @@ impl App {
         &mut self.world
     }
 
+    pub fn remote_snapshot(&self) -> crate::remote::Snapshot {
+        let (simulation_rate, render_rate) = self.rates();
+        crate::remote::Snapshot {
+            width: self.world.width() as u32,
+            height: self.world.height() as u32,
+            tick: self.tick(),
+            paused: self.paused,
+            simulation_rate,
+            render_rate,
+            backend: self.backend_name().to_string(),
+            rule: rule_name(&self.spec).to_string(),
+            error: self.backend_error().map(str::to_string),
+            cells: self.world.cells().to_vec(),
+        }
+    }
+
+    pub fn apply_remote_snapshot(&mut self, snapshot: &crate::remote::Snapshot) -> bool {
+        let dimensions_match = self.world.width() == snapshot.width as usize
+            && self.world.height() == snapshot.height as usize
+            && snapshot.cells.len() == self.world.width() * self.world.height();
+        if !dimensions_match {
+            return false;
+        }
+        self.world.replace_cells(&snapshot.cells);
+        self.paused = snapshot.paused;
+        self.set_rates(snapshot.simulation_rate, snapshot.render_rate);
+        self.backend_error = snapshot.error.clone();
+        true
+    }
+
     pub fn camera(&self) -> &Camera {
         &self.camera
     }
@@ -303,6 +335,10 @@ impl App {
     pub fn set_viewport(&mut self, viewport: Rect, frame_size: [usize; 2]) {
         self.viewport = Some(viewport);
         self.frame_size = Some(frame_size);
+    }
+
+    pub fn viewport_geometry(&self) -> Option<(Rect, [usize; 2])> {
+        Some((self.viewport?, self.frame_size?))
     }
 
     pub fn step(&mut self) -> bool {
@@ -577,6 +613,36 @@ impl App {
     }
 }
 
+#[cfg(test)]
+mod remote_snapshot_tests {
+    use super::*;
+    use crate::sim::rule::SimulationSpec;
+
+    #[test]
+    fn remote_snapshot_round_trips_world_cells_and_runtime_state() {
+        let mut app = App::new(SimulationSpec::conway(), 2, 2);
+        app.world_mut().replace_cells(&[0.1, 0.2, 0.3, 0.4]);
+        app.handle_command(Command::TogglePause);
+        app.set_rates(12.0, 30.0);
+        let snapshot = app.remote_snapshot();
+
+        let mut mirror = App::new(SimulationSpec::conway(), 2, 2);
+        assert!(mirror.apply_remote_snapshot(&snapshot));
+        assert_eq!(mirror.world().cells(), &[0.1, 0.2, 0.3, 0.4]);
+        assert!(mirror.paused());
+        assert_eq!(mirror.rates(), (12.0, 30.0));
+    }
+
+    #[test]
+    fn remote_snapshot_rejects_dimension_mismatch() {
+        let app = App::new(SimulationSpec::conway(), 2, 2);
+        let mut snapshot = app.remote_snapshot();
+        snapshot.width = 3;
+        let mut mirror = App::new(SimulationSpec::conway(), 2, 2);
+        assert!(!mirror.apply_remote_snapshot(&snapshot));
+    }
+}
+
 pub struct RateMeter {
     window: Duration,
     events: Vec<Instant>,
@@ -690,6 +756,372 @@ fn run_app(app: App) -> std::io::Result<()> {
     run_app_with_save(app, None)
 }
 
+pub fn run_server() -> std::io::Result<()> {
+    let spec = SimulationSpec::lenia_orbium();
+    let backend = SimulationBackend::cuda_or_cpu(spec.clone(), 256, 256);
+    let app = App::with_backend(spec, 256, 256, backend);
+    run_server_with_streams(app, std::io::stdin(), std::io::stdout())
+}
+
+pub fn run_server_with_streams<R, W>(mut app: App, reader: R, writer: W) -> std::io::Result<()>
+where
+    R: std::io::Read + Send + 'static,
+    W: std::io::Write + Send + 'static,
+{
+    use crate::remote::{ExpressionKey, InputMessage, RemoteMessage, read_message, write_message};
+    use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+    use std::sync::mpsc::{self, TryRecvError};
+
+    let (input_tx, input_rx) = mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        loop {
+            match read_message(&mut reader) {
+                Ok(Some(message)) => {
+                    if input_tx.send(message).is_err() {
+                        break;
+                    }
+                }
+                Ok(None) => {
+                    let _ = input_tx.send(RemoteMessage::Quit);
+                    break;
+                }
+                Err(_) => {
+                    let _ = input_tx.send(RemoteMessage::Quit);
+                    break;
+                }
+            }
+        }
+    });
+
+    let (snapshot_tx, snapshot_rx) = mpsc::sync_channel::<Option<crate::remote::Snapshot>>(1);
+    std::thread::spawn(move || {
+        let mut writer = writer;
+        while let Ok(snapshot) = snapshot_rx.recv() {
+            let Some(snapshot) = snapshot else { break };
+            if write_message(&mut writer, &RemoteMessage::Snapshot(snapshot)).is_err() {
+                break;
+            }
+        }
+    });
+
+    let mut tracker = crate::input::MouseTracker::new();
+    let mut simulation_meter = RateMeter::new(Duration::from_secs(1));
+    let simulation_interval = Duration::from_secs_f64(1.0 / 30.0);
+    let snapshot_interval = Duration::from_secs_f64(1.0 / 30.0);
+    let mut simulation_backlog = Duration::ZERO;
+    let mut last_iteration = Instant::now();
+    let mut last_snapshot = last_iteration - snapshot_interval;
+    let mut connected = false;
+
+    loop {
+        let now = Instant::now();
+        let elapsed = now.saturating_duration_since(last_iteration);
+        last_iteration = now;
+
+        loop {
+            match input_rx.try_recv() {
+                Ok(RemoteMessage::Hello) => {
+                    connected = true;
+                    let _ = snapshot_tx.try_send(Some(app.remote_snapshot()));
+                }
+                Ok(RemoteMessage::Viewport { width, height }) => {
+                    let width = width.max(1);
+                    let height = height.max(1);
+                    app.set_viewport(
+                        Rect::new(0, 0, width, height),
+                        [width as usize, height as usize * 2],
+                    );
+                }
+                Ok(RemoteMessage::Input(input)) => match input {
+                    InputMessage::Command(Command::Quit) => {
+                        let _ = snapshot_tx.send(None);
+                        return Ok(());
+                    }
+                    InputMessage::Command(command) => app.handle_command(command),
+                    InputMessage::ExpressionKey(key) => {
+                        if app.expression_editing() {
+                            let code = match key {
+                                ExpressionKey::Char(c) => KeyCode::Char(c),
+                                ExpressionKey::Backspace => KeyCode::Backspace,
+                                ExpressionKey::Enter => KeyCode::Enter,
+                                ExpressionKey::Escape => KeyCode::Esc,
+                            };
+                            app.handle_expression_key(KeyEvent::new(code, KeyModifiers::NONE));
+                        }
+                    }
+                    InputMessage::Mouse(mouse) => {
+                        app.handle_mouse(mouse, &mut tracker);
+                    }
+                },
+                Ok(RemoteMessage::Quit) => {
+                    let _ = snapshot_tx.send(None);
+                    return Ok(());
+                }
+                Ok(RemoteMessage::Snapshot(_)) => {}
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    let _ = snapshot_tx.send(None);
+                    return Ok(());
+                }
+            }
+        }
+
+        if !app.paused() {
+            simulation_backlog += elapsed;
+            let mut steps = 0;
+            while simulation_backlog >= simulation_interval && steps < 8 {
+                if app.step() {
+                    simulation_meter.record(now);
+                    simulation_backlog -= simulation_interval;
+                    steps += 1;
+                } else {
+                    simulation_backlog = Duration::ZERO;
+                    break;
+                }
+            }
+            if simulation_backlog > simulation_interval * 8 {
+                simulation_backlog = simulation_interval * 8;
+            }
+        } else {
+            simulation_backlog = Duration::ZERO;
+        }
+
+        if connected && now.duration_since(last_snapshot) >= snapshot_interval {
+            simulation_meter.refresh(now);
+            app.set_rates(simulation_meter.rate(), 30.0);
+            let _ = snapshot_tx.try_send(Some(app.remote_snapshot()));
+            last_snapshot = now;
+        }
+        std::thread::sleep(Duration::from_millis(1));
+    }
+}
+
+pub fn run_connect(host: &str) -> std::io::Result<()> {
+    let command = std::env::var("CELLARIUM_SSH_COMMAND").ok();
+    run_connect_with_command(host, command.as_deref())
+}
+
+pub fn run_connect_with_command(host: &str, ssh_command: Option<&str>) -> std::io::Result<()> {
+    let command = ssh_command
+        .map(str::to_string)
+        .or_else(|| std::env::var("CELLARIUM_SSH_COMMAND").ok())
+        .unwrap_or_else(|| "ssh".to_string());
+    let mut parts = split_command_line(&command).map_err(std::io::Error::other)?;
+    if parts.is_empty() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "CELLARIUM_SSH_COMMAND is empty",
+        ));
+    }
+    let executable = parts.remove(0);
+    parts.push(host.to_string());
+    parts.push("$HOME/.local/bin/cellarium".to_string());
+    parts.push("server".to_string());
+    let mut child = std::process::Command::new(executable)
+        .args(parts)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::inherit())
+        .spawn()
+        .map_err(|error| {
+            std::io::Error::new(
+                error.kind(),
+                format!("failed to start SSH connector: {error}"),
+            )
+        })?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| std::io::Error::other("SSH stdin was not piped"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| std::io::Error::other("SSH stdout was not piped"))?;
+    let app = App::new(SimulationSpec::lenia_orbium(), 256, 256);
+    let result = run_local_remote_viewer(app, stdin, stdout);
+    let _ = child.kill();
+    let _ = child.wait();
+    result
+}
+
+fn split_command_line(command: &str) -> Result<Vec<String>, &'static str> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut quote = None;
+    for character in command.chars() {
+        match quote {
+            None if character == '\'' || character == '"' => quote = Some(character),
+            Some(active) if active == character => quote = None,
+            None if character.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            _ => current.push(character),
+        }
+    }
+    if quote.is_some() {
+        return Err("CELLARIUM_SSH_COMMAND has an unterminated quote");
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    Ok(words)
+}
+
+fn run_local_remote_viewer<R, W>(mut app: App, stdin: R, stdout: W) -> std::io::Result<()>
+where
+    R: std::io::Write + Send + 'static,
+    W: std::io::Read + Send + 'static,
+{
+    use crate::remote::{RemoteMessage, read_message, write_message};
+    use std::sync::{Arc, Mutex, mpsc};
+    let writer = Arc::new(Mutex::new(stdin));
+    {
+        let mut guard = writer
+            .lock()
+            .map_err(|_| std::io::Error::other("SSH writer mutex poisoned"))?;
+        write_message(&mut *guard, &RemoteMessage::Hello).map_err(std::io::Error::other)?;
+    }
+    let (snapshot_tx, snapshot_rx) = mpsc::sync_channel(2);
+    std::thread::spawn(move || {
+        let mut stdout = stdout;
+        loop {
+            match read_message(&mut stdout) {
+                Ok(Some(crate::remote::RemoteMessage::Snapshot(snapshot))) => {
+                    let _ = snapshot_tx.try_send(snapshot);
+                }
+                Ok(Some(_)) => {}
+                Ok(None) | Err(_) => break,
+            }
+        }
+    });
+    crossterm::terminal::enable_raw_mode()?;
+    let _terminal_guard = TerminalGuard;
+    let mut terminal_stdout = std::io::stdout();
+    crossterm::execute!(
+        terminal_stdout,
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture,
+        crossterm::cursor::Hide
+    )?;
+    let display = crate::render::display::ViewportDisplay::detect();
+    if display.uses_async_output() {
+        let backend = AsyncTerminalBackend {
+            inner: ratatui::backend::CrosstermBackend::new(AsyncTerminalWriter::new()),
+        };
+        let mut terminal = ratatui::Terminal::new(backend)?;
+        run_remote_loop(&mut app, &mut terminal, display, writer, snapshot_rx)
+    } else {
+        let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
+        let mut terminal = ratatui::Terminal::new(backend)?;
+        run_remote_loop(&mut app, &mut terminal, display, writer, snapshot_rx)
+    }
+}
+
+fn run_remote_loop<B, W>(
+    app: &mut App,
+    terminal: &mut ratatui::Terminal<B>,
+    display: crate::render::display::ViewportDisplay,
+    writer: std::sync::Arc<std::sync::Mutex<W>>,
+    snapshot_rx: std::sync::mpsc::Receiver<crate::remote::Snapshot>,
+) -> std::io::Result<()>
+where
+    B: ratatui::backend::Backend<Error = std::io::Error>,
+    W: std::io::Write,
+{
+    use crate::remote::{ExpressionKey, InputMessage, RemoteMessage, write_message};
+    let mut tracker = crate::input::MouseTracker::new();
+    let render_interval = Duration::from_secs_f64(1.0 / 30.0);
+    let mut last_render = Instant::now() - render_interval;
+    let mut last_viewport = None;
+    loop {
+        while let Ok(snapshot) = snapshot_rx.try_recv() {
+            let _ = app.apply_remote_snapshot(&snapshot);
+        }
+        let now = Instant::now();
+        if now.duration_since(last_render) >= render_interval {
+            let viewport = app.viewport_geometry().map(|(_, frame)| frame);
+            if viewport != last_viewport {
+                if let Some((area, _frame_size)) = app.viewport_geometry() {
+                    let mut guard = writer
+                        .lock()
+                        .map_err(|_| std::io::Error::other("SSH writer mutex poisoned"))?;
+                    write_message(
+                        &mut *guard,
+                        &RemoteMessage::Viewport {
+                            width: area.width,
+                            height: area.height,
+                        },
+                    )
+                    .map_err(std::io::Error::other)?;
+                }
+                last_viewport = viewport;
+            }
+            terminal.draw(|frame| crate::tui::draw(frame, app, &display))?;
+            last_render = now;
+        }
+
+        let wait = render_interval
+            .saturating_sub(now.duration_since(last_render))
+            .min(Duration::from_millis(5));
+        if crossterm::event::poll(wait)? {
+            match crossterm::event::read()? {
+                Event::Key(key) => {
+                    if app.expression_editing() {
+                        let expression_key = match key.code {
+                            KeyCode::Char(character) => Some(ExpressionKey::Char(character)),
+                            KeyCode::Backspace => Some(ExpressionKey::Backspace),
+                            KeyCode::Enter => Some(ExpressionKey::Enter),
+                            KeyCode::Esc => Some(ExpressionKey::Escape),
+                            _ => None,
+                        };
+                        if let Some(expression_key) = expression_key {
+                            app.handle_expression_key(key);
+                            send_remote_input(
+                                &writer,
+                                InputMessage::ExpressionKey(expression_key),
+                            )?;
+                        }
+                        continue;
+                    }
+                    if let Some(command) = crate::input::translate_key(&key) {
+                        send_remote_input(&writer, InputMessage::Command(command))?;
+                        if command == Command::Quit {
+                            return Ok(());
+                        }
+                        app.handle_command(command);
+                    }
+                }
+                Event::Mouse(mouse) => {
+                    if app.handle_mouse(mouse, &mut tracker) {
+                        if let Some((area, _)) = app.viewport_geometry() {
+                            let mut local = mouse;
+                            local.column = local.column.saturating_sub(area.x);
+                            local.row = local.row.saturating_sub(area.y);
+                            send_remote_input(&writer, InputMessage::Mouse(local))?;
+                        }
+                    }
+                }
+                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
+                Event::Paste(_) => {}
+            }
+        }
+    }
+}
+
+fn send_remote_input<W: std::io::Write>(
+    writer: &std::sync::Arc<std::sync::Mutex<W>>,
+    input: crate::remote::InputMessage,
+) -> std::io::Result<()> {
+    let mut guard = writer
+        .lock()
+        .map_err(|_| std::io::Error::other("SSH writer mutex poisoned"))?;
+    crate::remote::write_message(&mut *guard, &crate::remote::RemoteMessage::Input(input))
+        .map_err(std::io::Error::other)
+}
+
 fn run_app_with_save(app: App, save_path: Option<&Path>) -> std::io::Result<()> {
     crossterm::terminal::enable_raw_mode()?;
     let _terminal_guard = TerminalGuard;
@@ -701,14 +1133,179 @@ fn run_app_with_save(app: App, save_path: Option<&Path>) -> std::io::Result<()> 
     )?;
     crossterm::execute!(stdout, crossterm::cursor::Hide)?;
 
-    (|| {
+    let display = crate::render::display::ViewportDisplay::detect();
+    if display.uses_async_output() {
+        let backend = AsyncTerminalBackend {
+            inner: ratatui::backend::CrosstermBackend::new(AsyncTerminalWriter::new()),
+        };
+        let mut terminal = ratatui::Terminal::new(backend)?;
+        run_loop(app, &mut terminal, display, save_path)
+    } else {
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let mut terminal = ratatui::Terminal::new(backend)?;
-        run_loop(app, &mut terminal, save_path)
-    })()
+        run_loop(app, &mut terminal, display, save_path)
+    }
 }
 
 struct TerminalGuard;
+
+struct LatestFrameState {
+    frame: Option<Vec<u8>>,
+    closed: bool,
+}
+
+struct AsyncTerminalWriter {
+    state: Arc<(Mutex<LatestFrameState>, Condvar)>,
+    pending: Vec<u8>,
+    worker: Option<JoinHandle<()>>,
+}
+
+struct AsyncTerminalBackend {
+    inner: ratatui::backend::CrosstermBackend<AsyncTerminalWriter>,
+}
+
+impl ratatui::backend::Backend for AsyncTerminalBackend {
+    type Error = std::io::Error;
+
+    fn draw<'a, I>(&mut self, content: I) -> Result<(), Self::Error>
+    where
+        I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
+    {
+        self.inner.draw(content)
+    }
+
+    fn append_lines(&mut self, n: u16) -> Result<(), Self::Error> {
+        self.inner.append_lines(n)
+    }
+
+    fn hide_cursor(&mut self) -> Result<(), Self::Error> {
+        self.inner.hide_cursor()
+    }
+
+    fn show_cursor(&mut self) -> Result<(), Self::Error> {
+        self.inner.show_cursor()
+    }
+
+    fn get_cursor_position(&mut self) -> Result<ratatui::layout::Position, Self::Error> {
+        Ok(ratatui::layout::Position::ORIGIN)
+    }
+
+    fn set_cursor_position<P: Into<ratatui::layout::Position>>(
+        &mut self,
+        position: P,
+    ) -> Result<(), Self::Error> {
+        self.inner.set_cursor_position(position)
+    }
+
+    fn clear(&mut self) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn clear_region(
+        &mut self,
+        _clear_type: ratatui::backend::ClearType,
+    ) -> Result<(), Self::Error> {
+        Ok(())
+    }
+
+    fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
+        self.inner.size()
+    }
+
+    fn window_size(&mut self) -> Result<ratatui::backend::WindowSize, Self::Error> {
+        self.inner.window_size()
+    }
+
+    fn flush(&mut self) -> Result<(), Self::Error> {
+        ratatui::backend::Backend::flush(&mut self.inner)
+    }
+}
+
+impl AsyncTerminalWriter {
+    fn new() -> Self {
+        let state = Arc::new((
+            Mutex::new(LatestFrameState {
+                frame: None,
+                closed: false,
+            }),
+            Condvar::new(),
+        ));
+        let worker_state = Arc::clone(&state);
+        let worker = std::thread::spawn(move || {
+            let mut stdout = std::io::stdout();
+            loop {
+                let frame = {
+                    let (lock, wake) = &*worker_state;
+                    let mut state = lock.lock().expect("async terminal writer mutex poisoned");
+                    while state.frame.is_none() && !state.closed {
+                        state = wake
+                            .wait(state)
+                            .expect("async terminal writer mutex poisoned");
+                    }
+                    match state.frame.take() {
+                        Some(frame) => Some(frame),
+                        None if state.closed => None,
+                        None => continue,
+                    }
+                };
+                let Some(frame) = frame else {
+                    break;
+                };
+                if stdout
+                    .write_all(&frame)
+                    .and_then(|_| stdout.flush())
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        Self {
+            state,
+            pending: Vec::new(),
+            worker: Some(worker),
+        }
+    }
+}
+
+impl Write for AsyncTerminalWriter {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.pending.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        if self.pending.is_empty() {
+            return Ok(());
+        }
+        let (lock, wake) = &*self.state;
+        let mut state = lock
+            .lock()
+            .map_err(|_| std::io::Error::other("async terminal writer mutex poisoned"))?;
+        state.frame = Some(std::mem::take(&mut self.pending));
+        wake.notify_one();
+        Ok(())
+    }
+}
+
+impl Drop for AsyncTerminalWriter {
+    fn drop(&mut self) {
+        let (lock, wake) = &*self.state;
+        if let Ok(mut state) = lock.lock() {
+            if !self.pending.is_empty() {
+                state.frame = Some(std::mem::take(&mut self.pending));
+            }
+            state.closed = true;
+            wake.notify_one();
+        }
+        // A graphics frame can be much larger than the PTY drain rate. Do not
+        // join the writer here: joining would wait forever while the terminal
+        // is still flushing an obsolete frame and would make `q` appear dead.
+        // Dropping the handle detaches the worker; process teardown closes its
+        // stdout and wakes the blocked write naturally.
+        let _ = self.worker.take();
+    }
+}
 
 impl Drop for TerminalGuard {
     fn drop(&mut self) {
@@ -723,12 +1320,12 @@ impl Drop for TerminalGuard {
     }
 }
 
-fn run_loop(
+fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
     mut app: App,
-    terminal: &mut ratatui::DefaultTerminal,
+    terminal: &mut ratatui::Terminal<B>,
+    display: crate::render::display::ViewportDisplay,
     save_path: Option<&Path>,
 ) -> std::io::Result<()> {
-    let display = crate::render::display::ViewportDisplay::detect();
     let mut tracker = crate::input::MouseTracker::new();
     let mut simulation_meter = RateMeter::new(Duration::from_secs(1));
     let mut render_meter = RateMeter::new(Duration::from_secs(1));
