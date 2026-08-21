@@ -15,6 +15,22 @@ pub struct ChannelWorld {
     next: Vec<f32>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
+pub enum ChannelWorldError {
+    #[error("channel-world dimensions and channel count must be positive")]
+    InvalidDimensions,
+    #[error("channel {channel} has {actual} cells; expected {expected}")]
+    InvalidChannelLength {
+        channel: usize,
+        expected: usize,
+        actual: usize,
+    },
+    #[error("replacement has {actual} cells; expected {expected}")]
+    InvalidReplacementLength { expected: usize, actual: usize },
+    #[error("channel-world state contains a non-finite value")]
+    NonFiniteState,
+}
+
 impl ChannelWorld {
     pub fn new(width: usize, height: usize, channels: usize) -> Self {
         assert!(
@@ -29,6 +45,43 @@ impl ChannelWorld {
             current: vec![0.0; len],
             next: vec![0.0; len],
         }
+    }
+
+    pub fn from_channels(
+        width: usize,
+        height: usize,
+        channels: &[Vec<f32>],
+    ) -> Result<Self, ChannelWorldError> {
+        if width == 0 || height == 0 || channels.is_empty() {
+            return Err(ChannelWorldError::InvalidDimensions);
+        }
+        let channel_len = width
+            .checked_mul(height)
+            .ok_or(ChannelWorldError::InvalidDimensions)?;
+        let total_len = channel_len
+            .checked_mul(channels.len())
+            .ok_or(ChannelWorldError::InvalidDimensions)?;
+        let mut current = Vec::with_capacity(total_len);
+        for (channel, values) in channels.iter().enumerate() {
+            if values.len() != channel_len {
+                return Err(ChannelWorldError::InvalidChannelLength {
+                    channel,
+                    expected: channel_len,
+                    actual: values.len(),
+                });
+            }
+            if values.iter().any(|value| !value.is_finite()) {
+                return Err(ChannelWorldError::NonFiniteState);
+            }
+            current.extend_from_slice(values);
+        }
+        Ok(Self {
+            width,
+            height,
+            channels: channels.len(),
+            current,
+            next: vec![0.0; total_len],
+        })
     }
 
     pub fn width(&self) -> usize {
@@ -72,9 +125,31 @@ impl ChannelWorld {
         self.next[range].fill(0.0);
     }
 
-    #[cfg(feature = "cuda")]
-    pub(crate) fn cells(&self) -> &[f32] {
+    pub fn cells(&self) -> &[f32] {
         &self.current
+    }
+
+    pub fn next_cells_mut(&mut self) -> &mut [f32] {
+        &mut self.next
+    }
+
+    pub fn replace_all(&mut self, values: &[f32]) -> Result<(), ChannelWorldError> {
+        if values.len() != self.current.len() {
+            return Err(ChannelWorldError::InvalidReplacementLength {
+                expected: self.current.len(),
+                actual: values.len(),
+            });
+        }
+        if values.iter().any(|value| !value.is_finite()) {
+            return Err(ChannelWorldError::NonFiniteState);
+        }
+        self.current.copy_from_slice(values);
+        self.next.fill(0.0);
+        Ok(())
+    }
+
+    pub fn discard_next(&mut self) {
+        self.next.fill(0.0);
     }
 
     fn index(&self, channel: usize, x: isize, y: isize) -> usize {

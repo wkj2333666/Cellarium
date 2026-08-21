@@ -5,6 +5,8 @@ use crate::sim::program::RuleProgram;
 use crate::sim::rule::{Rule, SimulationSpec};
 use crate::sim::world::{ChannelWorld, World};
 
+pub use crate::sim::runtime::CpuExperimentBackend;
+
 pub struct CpuBackend {
     spec: SimulationSpec,
     tick: u64,
