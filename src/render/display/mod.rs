@@ -668,6 +668,9 @@ impl ViewportDisplay {
         remote: bool,
         native_kitty: bool,
     ) -> Self {
+        #[cfg(not(unix))]
+        let _ = (remote, native_kitty);
+
         if protocol == DisplayProtocol::HalfBlock {
             return Self::HalfBlock;
         }
@@ -878,6 +881,7 @@ mod tests {
     use super::*;
     use crate::render::raster::{Framebuffer, Rgb8};
     use image::GenericImageView;
+    use std::time::{Duration, Instant};
 
     #[test]
     fn latest_image_queue_replaces_pending_frames_instead_of_preserving_stale_work() {
