@@ -1,13 +1,19 @@
+use crate::sim::experiment_model::{
+    ChannelDisplay, ChannelId, ChannelSpec, ExperimentSpec, GeometrySpec, GridGeometry,
+    GrowthSource, KernelId, KernelSlot, UpdateMode, validate_structure,
+};
 use crate::sim::expression::KernelExpression;
 use crate::sim::kernel::{Kernel, KernelDefinition, KernelError, KernelValues};
-use crate::sim::program::RuleProgram;
+use crate::sim::parser::format_expression;
+use crate::sim::program::{InputSource, RuleProgram};
 use crate::sim::rule::{Rule, RuleConfigError, SimulationSpec};
 use crate::sim::topology::{BoardSpec, BoundarySpec, LatticeSpec, TopologyError, compile_topology};
 use crate::sim::world::World;
 use serde::{Deserialize, Serialize};
 use std::path::Path;
 
-pub const EXPERIMENT_FORMAT_VERSION: u32 = 1;
+pub const EXPERIMENT_FORMAT_VERSION: u32 = 2;
+const LEGACY_EXPERIMENT_FORMAT_VERSION: u32 = 1;
 
 #[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ExperimentMetadata {
@@ -49,6 +55,18 @@ pub struct ExperimentFile {
     pub cells: Vec<f32>,
     pub rule: ExperimentRule,
     pub topology: Option<ExperimentTopology>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct ExperimentFileV2 {
+    pub format_version: u32,
+    pub metadata: ExperimentMetadata,
+    pub experiment: ExperimentSpec,
+}
+
+#[derive(Deserialize)]
+struct FormatProbe {
+    format_version: u32,
 }
 
 #[derive(Clone, Debug, PartialEq, Deserialize)]
@@ -104,6 +122,8 @@ pub enum ExperimentError {
     },
     #[error("failed to encode experiment: {0}")]
     Encode(String),
+    #[error("invalid experiment model: {0}")]
+    Model(String),
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -253,12 +273,11 @@ pub fn load_experiment(path: impl AsRef<Path>) -> Result<ExperimentFile, Experim
         path: display,
         source,
     })?;
+    if wire.format_version > LEGACY_EXPERIMENT_FORMAT_VERSION {
+        return Err(ExperimentError::UnsupportedVersion(wire.format_version));
+    }
     let file = ExperimentFile {
-        format_version: if wire.format_version == 0 {
-            EXPERIMENT_FORMAT_VERSION
-        } else {
-            wire.format_version
-        },
+        format_version: EXPERIMENT_FORMAT_VERSION,
         metadata: wire.metadata,
         world_size: wire.world_size,
         seed: wire.seed,
@@ -276,8 +295,292 @@ pub fn save_experiment(
 ) -> Result<(), ExperimentError> {
     file.validate()?;
     let path = path.as_ref();
-    let source = ron::ser::to_string_pretty(file, ron::ser::PrettyConfig::default())
+    let mut legacy = file.clone();
+    legacy.format_version = LEGACY_EXPERIMENT_FORMAT_VERSION;
+    let source = ron::ser::to_string_pretty(&legacy, ron::ser::PrettyConfig::default())
         .map_err(|error| ExperimentError::Encode(error.to_string()))?;
+    write_atomically(path, source)
+}
+
+pub fn load_experiment_model(path: impl AsRef<Path>) -> Result<ExperimentSpec, ExperimentError> {
+    let path = path.as_ref();
+    let display = path.display().to_string();
+    let source = std::fs::read_to_string(path).map_err(|source| ExperimentError::Io {
+        path: display.clone(),
+        source,
+    })?;
+    decode_experiment_document(&source, &display).map(|document| document.experiment)
+}
+
+pub fn save_experiment_model(
+    path: impl AsRef<Path>,
+    experiment: &ExperimentSpec,
+) -> Result<(), ExperimentError> {
+    let source = encode_experiment_model(experiment)?;
+    write_atomically(path.as_ref(), source)
+}
+
+pub fn load_experiment_model_from_str(source: &str) -> Result<ExperimentSpec, ExperimentError> {
+    decode_experiment_document(source, "<memory>").map(|document| document.experiment)
+}
+
+pub fn decode_experiment_model(source: &str) -> Result<ExperimentSpec, ExperimentError> {
+    let document: ExperimentFileV2 =
+        ron::from_str(source).map_err(|source| ExperimentError::Parse {
+            path: "<memory>".to_string(),
+            source,
+        })?;
+    validate_v2_document(&document)?;
+    Ok(document.experiment)
+}
+
+pub fn encode_experiment_model(experiment: &ExperimentSpec) -> Result<String, ExperimentError> {
+    validate_model(experiment)?;
+    let document = ExperimentFileV2 {
+        format_version: EXPERIMENT_FORMAT_VERSION,
+        metadata: ExperimentMetadata {
+            name: experiment.name.clone(),
+            ..ExperimentMetadata::default()
+        },
+        experiment: experiment.clone(),
+    };
+    ron::ser::to_string_pretty(&document, ron::ser::PrettyConfig::default())
+        .map_err(|error| ExperimentError::Encode(error.to_string()))
+}
+
+fn decode_experiment_document(
+    source: &str,
+    path: &str,
+) -> Result<ExperimentFileV2, ExperimentError> {
+    let probe: FormatProbe = ron::from_str(source).map_err(|source| ExperimentError::Parse {
+        path: path.to_string(),
+        source,
+    })?;
+    match probe.format_version {
+        0 | LEGACY_EXPERIMENT_FORMAT_VERSION => {
+            let wire: ExperimentWire =
+                ron::from_str(source).map_err(|source| ExperimentError::Parse {
+                    path: path.to_string(),
+                    source,
+                })?;
+            migrate_legacy(wire)
+        }
+        EXPERIMENT_FORMAT_VERSION => {
+            let document: ExperimentFileV2 =
+                ron::from_str(source).map_err(|source| ExperimentError::Parse {
+                    path: path.to_string(),
+                    source,
+                })?;
+            validate_v2_document(&document)?;
+            Ok(document)
+        }
+        version => Err(ExperimentError::UnsupportedVersion(version)),
+    }
+}
+
+fn validate_v2_document(document: &ExperimentFileV2) -> Result<(), ExperimentError> {
+    if document.format_version != EXPERIMENT_FORMAT_VERSION {
+        return Err(ExperimentError::UnsupportedVersion(document.format_version));
+    }
+    validate_model(&document.experiment)
+}
+
+fn validate_model(experiment: &ExperimentSpec) -> Result<(), ExperimentError> {
+    validate_structure(experiment).map_err(|errors| {
+        ExperimentError::Model(
+            errors
+                .into_iter()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    })
+}
+
+fn migrate_legacy(wire: ExperimentWire) -> Result<ExperimentFileV2, ExperimentError> {
+    if wire.world_size.contains(&0) {
+        return Err(ExperimentError::InvalidWorldSize);
+    }
+    let expected = wire.world_size[0]
+        .checked_mul(wire.world_size[1])
+        .ok_or(ExperimentError::InvalidWorldSize)?;
+    if wire.cells.len() != expected {
+        return Err(ExperimentError::CellCount {
+            expected,
+            actual: wire.cells.len(),
+        });
+    }
+    if let Some((index, _)) = wire
+        .cells
+        .iter()
+        .enumerate()
+        .find(|(_, value)| !value.is_finite())
+    {
+        return Err(ExperimentError::NonFiniteCell { index });
+    }
+
+    let channel = ChannelId(0);
+    let boundary = wire
+        .topology
+        .as_ref()
+        .map_or(BoundarySpec::Periodic, |topology| topology.boundary.clone());
+    let boundary_constant = match boundary {
+        BoundarySpec::Constant(value) => value,
+        _ => 0.0,
+    };
+    let mut experiment = ExperimentSpec {
+        name: if wire.metadata.name.is_empty() {
+            "Migrated experiment".to_string()
+        } else {
+            wire.metadata.name.clone()
+        },
+        geometry: GeometrySpec::RasterGrid(GridGeometry {
+            width: u32::try_from(wire.world_size[0])
+                .map_err(|_| ExperimentError::InvalidWorldSize)?,
+            height: u32::try_from(wire.world_size[1])
+                .map_err(|_| ExperimentError::InvalidWorldSize)?,
+            boundary,
+        }),
+        channels: vec![ChannelSpec {
+            id: channel,
+            name: "state".to_string(),
+            frozen: false,
+            initial: wire.cells,
+            boundary_constant,
+            display: ChannelDisplay::default(),
+        }],
+        kernels: Vec::new(),
+        growth: Vec::new(),
+        simulation_dt: 1.0,
+        seed: wire.seed,
+    };
+
+    match wire.rule {
+        ExperimentRule::Conway => migrate_conway_rule(&mut experiment),
+        ExperimentRule::Lenia {
+            kernel,
+            mu,
+            sigma,
+            dt,
+            growth,
+        } => {
+            kernel.build()?;
+            let kernel_id = KernelId(0);
+            experiment.name = if experiment.name == "Migrated experiment" {
+                "Lenia/Orbium".to_string()
+            } else {
+                experiment.name
+            };
+            experiment.simulation_dt = dt;
+            experiment.kernels.push(KernelSlot {
+                id: kernel_id,
+                symbol: "potential".to_string(),
+                name: kernel.name.clone(),
+                source: channel,
+                target: channel,
+                definition: kernel,
+            });
+            experiment.growth.push(GrowthSource {
+                target: channel,
+                kernel_inputs: vec![kernel_id],
+                parameters: std::collections::BTreeMap::from([
+                    ("mu".to_string(), mu),
+                    ("sigma".to_string(), sigma),
+                ]),
+                source: growth.map_or_else(
+                    || "2 * exp(-((potential - mu) / sigma) ^ 2) - 1".to_string(),
+                    |expression| format_expression(&expression),
+                ),
+                mode: UpdateMode::GrowthRate,
+            });
+        }
+        ExperimentRule::Program { program, dt } => {
+            experiment.simulation_dt = dt;
+            migrate_program_rule(&mut experiment, program)?;
+        }
+    }
+    validate_model(&experiment)?;
+    Ok(ExperimentFileV2 {
+        format_version: EXPERIMENT_FORMAT_VERSION,
+        metadata: wire.metadata,
+        experiment,
+    })
+}
+
+fn migrate_conway_rule(experiment: &mut ExperimentSpec) {
+    let channel = ChannelId(0);
+    let neighbors = KernelId(0);
+    experiment.name = "Conway".to_string();
+    experiment.simulation_dt = 1.0;
+    experiment.kernels.push(KernelSlot {
+        id: neighbors,
+        symbol: "neighbors".to_string(),
+        name: "Moore neighborhood".to_string(),
+        source: channel,
+        target: channel,
+        definition: KernelDefinition {
+            name: "Moore neighborhood".to_string(),
+            width: 3,
+            height: 3,
+            anchor_x: 1,
+            anchor_y: 1,
+            mask: Some(vec![true, true, true, true, false, true, true, true, true]),
+            normalization: crate::sim::kernel::Normalization::None,
+            parameters: Default::default(),
+            values: KernelValues::Explicit(vec![1.0; 9]),
+        },
+    });
+    experiment.growth.push(GrowthSource {
+        target: channel,
+        kernel_inputs: vec![neighbors],
+        parameters: Default::default(),
+        source: "clamp(1 - abs(neighbors - 3), 0, 1) + self * clamp(1 - abs(neighbors - 2), 0, 1)"
+            .to_string(),
+        mode: UpdateMode::DirectUpdate,
+    });
+}
+
+fn migrate_program_rule(
+    experiment: &mut ExperimentSpec,
+    program: RuleProgram,
+) -> Result<(), ExperimentError> {
+    let channel = ChannelId(0);
+    let mut kernel_inputs = Vec::new();
+    for input in program.inputs {
+        match input.source {
+            InputSource::State if input.name == "self" => {}
+            InputSource::Convolution { kernel }
+            | InputSource::ChannelConvolution { channel: 0, kernel } => {
+                let id = KernelId(kernel_inputs.len() as u32);
+                kernel_inputs.push(id);
+                experiment.kernels.push(KernelSlot {
+                    id,
+                    symbol: input.name.clone(),
+                    name: kernel.name.clone(),
+                    source: channel,
+                    target: channel,
+                    definition: definition_from_kernel(&kernel),
+                });
+            }
+            _ => {
+                return Err(ExperimentError::Model(format!(
+                    "legacy input `{}` cannot be represented by a one-channel experiment",
+                    input.name
+                )));
+            }
+        }
+    }
+    experiment.growth.push(GrowthSource {
+        target: channel,
+        kernel_inputs,
+        parameters: program.parameters,
+        source: format_expression(&program.update),
+        mode: UpdateMode::GrowthRate,
+    });
+    Ok(())
+}
+
+fn write_atomically(path: &Path, source: String) -> Result<(), ExperimentError> {
     let temporary = path.with_extension(format!(
         "{}tmp-{}",
         path.extension()
@@ -316,6 +619,62 @@ mod tests {
     use crate::sim::rule::SimulationSpec;
     use crate::sim::world::World;
     use std::collections::BTreeMap;
+
+    const LEGACY_LENIA_V1: &str = r#"(
+        format_version: 1,
+        metadata: (
+            name: "legacy lenia",
+            description: "literal migration fixture",
+            author: "cellarium",
+            tags: ["legacy"],
+        ),
+        world_size: (2, 1),
+        seed: 7,
+        cells: [0.25, 0.75],
+        rule: Lenia(
+            kernel: (
+                name: "unit",
+                width: 1,
+                height: 1,
+                anchor_x: 0,
+                anchor_y: 0,
+                mask: None,
+                normalization: None,
+                parameters: {},
+                values: Explicit([1.0]),
+            ),
+            mu: 0.1,
+            sigma: 0.2,
+            dt: 0.1,
+            growth: None,
+        ),
+        topology: None,
+    )"#;
+
+    #[test]
+    fn version_one_lenia_migrates_to_one_channel_one_kernel() {
+        let model = load_experiment_model_from_str(LEGACY_LENIA_V1).unwrap();
+        assert_eq!(model.channels.len(), 1);
+        assert_eq!(model.kernels.len(), 1);
+        assert_eq!(model.kernels[0].symbol, "potential");
+        assert_eq!(model.growth[0].kernel_inputs, vec![model.kernels[0].id]);
+        assert_eq!(model.channels[0].initial, vec![0.25, 0.75]);
+    }
+
+    #[test]
+    fn version_two_roundtrip_preserves_ids_routing_and_source() {
+        let mut model = ExperimentSpec::single_channel_lenia(2, 1);
+        model.channels[0].id = ChannelId(11);
+        model.kernels[0].id = KernelId(29);
+        model.kernels[0].source = ChannelId(11);
+        model.kernels[0].target = ChannelId(11);
+        model.growth[0].target = ChannelId(11);
+        model.growth[0].kernel_inputs = vec![KernelId(29)];
+        model.growth[0].source = "clamp(potential - mu, -1, 1) / sigma".to_string();
+
+        let encoded = encode_experiment_model(&model).unwrap();
+        assert_eq!(decode_experiment_model(&encoded).unwrap(), model);
+    }
 
     #[test]
     fn experiment_roundtrip_preserves_metadata_seed_rule_and_world() {
@@ -362,7 +721,8 @@ mod tests {
         file.format_version += 1;
         assert!(matches!(
             file.build(),
-            Err(ExperimentError::UnsupportedVersion(2))
+            Err(ExperimentError::UnsupportedVersion(version))
+                if version == EXPERIMENT_FORMAT_VERSION + 1
         ));
 
         file.format_version = EXPERIMENT_FORMAT_VERSION;
