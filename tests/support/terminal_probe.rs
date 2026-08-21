@@ -24,6 +24,8 @@ pub struct TerminalProbeReport {
     pub mouse_frame_latency_ms: f64,
     pub frame_intervals_ms: Vec<f64>,
     pub frame_sizes: Vec<usize>,
+    pub workbench_apply_latency_ms: f64,
+    pub workbench_authoritative_clean: bool,
 }
 
 #[derive(Clone, Copy)]
@@ -469,6 +471,52 @@ pub fn run_terminal_probe(host: &str) -> io::Result<TerminalProbeReport> {
         mouse_frame.at.duration_since(mouse_started).as_secs_f64() * 1_000.0;
     let mouse_ack_latency_ms = mouse_ack_at.duration_since(mouse_started).as_secs_f64() * 1_000.0;
 
+    // User-perspective Workbench journey.  Every mutation is driven through
+    // the PTY key path; Apply is counted only after the remote ApplyAccepted
+    // turns the local draft back to authoritative Clean.
+    session.write(b"w")?;
+    session.pump_until("Workbench shell", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"Workbench") && session.screen.contains(b"World")
+    })?;
+    session.write(b"tt")?;
+    session.pump_until("Channels section", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"channel_1")
+    })?;
+    session.write(b"a]cvxf\x1a\x19")?;
+    session.pump_until("channel controls", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"channel_2")
+    })?;
+    session.write(b"t")?;
+    session.pump_until("Kernels section", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"k1")
+    })?;
+    session.write(b"at")?;
+    session.pump_until("Growth section", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"growth_")
+    })?;
+    session.write(b"e\r\x1b")?;
+    session.pump_for(Duration::from_millis(100))?;
+    session.write(b"t")?;
+    session.pump_until("Experiment section", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"Experiment")
+    })?;
+    // World -> Tiling after passing Experiment, then exercise both presets
+    // and polygon-side editing before returning to Experiment to Apply.
+    session.write(b"ttpp+")?;
+    session.pump_until("octagon tiling editor", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"octagon")
+    })?;
+    session.write(b"tttt")?;
+    session.pump_until("Experiment review", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"Experiment")
+    })?;
+    let workbench_apply_started = Instant::now();
+    session.write(b"\x1b[13;5u")?;
+    session.pump_until("authoritative Workbench Apply", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"Clean")
+    })?;
+    let workbench_apply_latency_ms = workbench_apply_started.elapsed().as_secs_f64() * 1_000.0;
+
     let observed_frames = session.frames.len();
     let frame_intervals_ms = session
         .frames
@@ -494,6 +542,8 @@ pub fn run_terminal_probe(host: &str) -> io::Result<TerminalProbeReport> {
         mouse_frame_latency_ms,
         frame_intervals_ms,
         frame_sizes,
+        workbench_apply_latency_ms,
+        workbench_authoritative_clean: true,
     })
 }
 
@@ -533,7 +583,9 @@ pub fn write_report(report: &TerminalProbeReport) -> io::Result<()> {
             "  \"mouse_ack_latency_ms\": {:.6},\n",
             "  \"mouse_frame_latency_ms\": {:.6},\n",
             "  \"frame_intervals_ms\": [{}],\n",
-            "  \"frame_sizes\": [{}]\n",
+            "  \"frame_sizes\": [{}],\n",
+            "  \"workbench_apply_latency_ms\": {:.6},\n",
+            "  \"workbench_authoritative_clean\": {}\n",
             "}}\n"
         ),
         host,
@@ -550,6 +602,8 @@ pub fn write_report(report: &TerminalProbeReport) -> io::Result<()> {
         report.mouse_frame_latency_ms,
         intervals,
         sizes,
+        report.workbench_apply_latency_ms,
+        report.workbench_authoritative_clean,
     );
     std::fs::write(path, json)
 }
