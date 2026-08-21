@@ -1,9 +1,11 @@
 #![cfg(target_os = "linux")]
 
 use std::os::fd::FromRawFd;
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use libc::{O_NOCTTY, O_RDWR, pollfd};
 
@@ -86,6 +88,63 @@ fn spawn_graphics_on_pty(slave: i32) -> std::process::Child {
         .env("CELLARIUM_CELL_HEIGHT", "16")
         .spawn()
         .expect("spawn cellarium graphics")
+}
+
+fn connector_fixture() -> (PathBuf, PathBuf) {
+    let unique = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_nanos();
+    let directory = std::env::temp_dir().join(format!(
+        "cellarium-connector-{}-{unique}",
+        std::process::id()
+    ));
+    std::fs::create_dir(&directory).unwrap();
+    let invocation = directory.join("invocation");
+    for (name, status) in [("kitten", 23), ("ssh", 29)] {
+        let path = directory.join(name);
+        std::fs::write(
+            &path,
+            format!(
+                "#!/bin/sh\nprintf '%s\\n' '{name}' \"$@\" > \"$CELLARIUM_FAKE_INVOCATION\"\nexit {status}\n"
+            ),
+        )
+        .unwrap();
+        let mut permissions = std::fs::metadata(&path).unwrap().permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).unwrap();
+    }
+    (directory, invocation)
+}
+
+fn spawn_connect_on_pty(
+    slave: i32,
+    fixture: &Path,
+    invocation: &Path,
+    explicit_command: Option<&Path>,
+) -> std::process::Child {
+    let stdin = unsafe { Stdio::from_raw_fd(libc::dup(slave)) };
+    let stdout = unsafe { Stdio::from_raw_fd(libc::dup(slave)) };
+    let stderr = unsafe { Stdio::from_raw_fd(libc::dup(slave)) };
+    let path = std::env::join_paths(std::iter::once(fixture.to_path_buf()).chain(
+        std::env::split_paths(&std::env::var_os("PATH").unwrap_or_default()),
+    ))
+    .unwrap();
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cellarium"));
+    command
+        .args(["connect", "tinker"])
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr)
+        .env("PATH", path)
+        .env("TERM", "xterm-kitty")
+        .env("KITTY_WINDOW_ID", "1")
+        .env("CELLARIUM_FAKE_INVOCATION", invocation)
+        .env_remove("CELLARIUM_SSH_COMMAND");
+    if let Some(explicit_command) = explicit_command {
+        command.env("CELLARIUM_SSH_COMMAND", explicit_command);
+    }
+    command.spawn().expect("spawn cellarium connector")
 }
 
 fn read_available(master: i32, output: &mut Vec<u8>) {
@@ -210,6 +269,63 @@ fn nonresponsive_terminal_startup_accepts_quit_and_restores_terminal() {
     assert!(status.success(), "cellarium exited with {status}");
     assert!(contains(&output, b"\x1b[?1049l"));
     assert!(contains(&output, b"\x1b[?1000l"));
+}
+
+#[test]
+fn kitty_connect_prefers_kitten_without_an_explicit_override() {
+    let (fixture, invocation) = connector_fixture();
+    let (master, slave) = open_pty();
+    set_nonblocking(master);
+    let mut child = spawn_connect_on_pty(slave, &fixture, &invocation, None);
+    unsafe { libc::close(slave) };
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !invocation.exists() && Instant::now() < deadline {
+        thread::sleep(Duration::from_millis(10));
+    }
+    let called = std::fs::read_to_string(&invocation).unwrap_or_default();
+    let _ = child.kill();
+    let _ = child.wait();
+    unsafe { libc::close(master) };
+    let _ = std::fs::remove_dir_all(&fixture);
+
+    assert_eq!(
+        called,
+        "kitten\nssh\ntinker\n$HOME/.local/bin/cellarium\nserver\n"
+    );
+}
+
+#[test]
+fn connector_eof_reports_the_child_status_without_waiting_for_input() {
+    let (fixture, invocation) = connector_fixture();
+    let (master, slave) = open_pty();
+    set_nonblocking(master);
+    let mut child =
+        spawn_connect_on_pty(slave, &fixture, &invocation, Some(&fixture.join("kitten")));
+    unsafe { libc::close(slave) };
+
+    let mut output = Vec::new();
+    let status = pump_until_exit(
+        &mut child,
+        master,
+        &mut output,
+        Instant::now() + Duration::from_secs(3),
+    );
+    if status.is_none() {
+        child.kill().expect("kill hung connector viewer");
+        child.wait().expect("wait for killed connector viewer");
+    }
+    unsafe { libc::close(master) };
+    let _ = std::fs::remove_dir_all(&fixture);
+
+    let status = status.expect("cellarium did not exit after the SSH connector closed stdout");
+    assert!(!status.success());
+    assert!(
+        contains(&output, b"SSH connector exited with status 23"),
+        "missing connector status in output: {}",
+        String::from_utf8_lossy(&output)
+    );
+    assert!(!contains(&output, b"Broken pipe"));
 }
 
 #[test]

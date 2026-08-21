@@ -18,7 +18,9 @@ scalar snapshots and input events cross SSH; Kitty graphics escape sequences
 are generated locally, so a Kitty-capable terminal keeps high-precision output
 without blocking keyboard or mouse input on remote graphics writes.
 
-If the local SSH workflow uses Kitty's wrapper, set the command explicitly:
+In a Kitty terminal, Cellarium automatically uses `kitten ssh` when `kitten`
+is available on `PATH`; otherwise it falls back to the system `ssh`. To
+override that selection, set the command explicitly:
 
 ```sh
 CELLARIUM_SSH_COMMAND='kitten ssh' cellarium connect tinker

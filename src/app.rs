@@ -898,15 +898,14 @@ where
 }
 
 pub fn run_connect(host: &str) -> std::io::Result<()> {
-    let command = std::env::var("CELLARIUM_SSH_COMMAND").ok();
-    run_connect_with_command(host, command.as_deref())
+    run_connect_with_command(host, None)
 }
 
 pub fn run_connect_with_command(host: &str, ssh_command: Option<&str>) -> std::io::Result<()> {
     let command = ssh_command
         .map(str::to_string)
         .or_else(|| std::env::var("CELLARIUM_SSH_COMMAND").ok())
-        .unwrap_or_else(|| "ssh".to_string());
+        .unwrap_or_else(default_ssh_command);
     let mut parts = split_command_line(&command).map_err(std::io::Error::other)?;
     if parts.is_empty() {
         return Err(std::io::Error::new(
@@ -940,9 +939,81 @@ pub fn run_connect_with_command(host: &str, ssh_command: Option<&str>) -> std::i
         .ok_or_else(|| std::io::Error::other("SSH stdout was not piped"))?;
     let app = App::new(SimulationSpec::lenia_orbium(), 256, 256);
     let result = run_local_remote_viewer(app, stdin, stdout);
-    let _ = child.kill();
-    let _ = child.wait();
+    if result.is_ok() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return result;
+    }
+
+    match wait_for_child_exit(&mut child, Duration::from_millis(500))? {
+        Some(status) if !status.success() => {
+            let detail = status
+                .code()
+                .map(|code| format!("status {code}"))
+                .unwrap_or_else(|| status.to_string());
+            return Err(std::io::Error::other(format!(
+                "SSH connector exited with {detail}"
+            )));
+        }
+        Some(_) => {}
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+    }
     result
+}
+
+fn default_ssh_command() -> String {
+    if kitty_terminal() && program_on_path("kitten") {
+        "kitten ssh".to_string()
+    } else {
+        "ssh".to_string()
+    }
+}
+
+fn kitty_terminal() -> bool {
+    std::env::var_os("KITTY_WINDOW_ID").is_some()
+        || std::env::var("TERM").is_ok_and(|term| term.contains("kitty"))
+        || std::env::var("TERM_PROGRAM").is_ok_and(|program| program == "kitty")
+}
+
+fn program_on_path(program: &str) -> bool {
+    let Some(path) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path).any(|directory| program_is_executable(&directory.join(program)))
+}
+
+#[cfg(unix)]
+fn program_is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
+}
+
+#[cfg(windows)]
+fn program_is_executable(path: &Path) -> bool {
+    path.with_extension("exe").is_file()
+        || path.with_extension("cmd").is_file()
+        || path.with_extension("bat").is_file()
+        || path.is_file()
+}
+
+fn wait_for_child_exit(
+    child: &mut std::process::Child,
+    timeout: Duration,
+) -> std::io::Result<Option<std::process::ExitStatus>> {
+    let deadline = Instant::now() + timeout;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(status));
+        }
+        if Instant::now() >= deadline {
+            return Ok(None);
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
 }
 
 fn split_command_line(command: &str) -> Result<Vec<String>, &'static str> {
@@ -970,6 +1041,11 @@ fn split_command_line(command: &str) -> Result<Vec<String>, &'static str> {
     Ok(words)
 }
 
+enum RemoteUpdate {
+    Snapshot(crate::remote::Snapshot),
+    Closed(Result<(), crate::remote::ProtocolError>),
+}
+
 fn run_local_remote_viewer<R, W>(mut app: App, stdin: R, stdout: W) -> std::io::Result<()>
 where
     R: std::io::Write + Send + 'static,
@@ -990,10 +1066,17 @@ where
         loop {
             match read_message(&mut stdout) {
                 Ok(Some(crate::remote::RemoteMessage::Snapshot(snapshot))) => {
-                    let _ = snapshot_tx.try_send(snapshot);
+                    let _ = snapshot_tx.try_send(RemoteUpdate::Snapshot(snapshot));
                 }
                 Ok(Some(_)) => {}
-                Ok(None) | Err(_) => break,
+                Ok(None) => {
+                    let _ = snapshot_tx.send(RemoteUpdate::Closed(Ok(())));
+                    break;
+                }
+                Err(error) => {
+                    let _ = snapshot_tx.send(RemoteUpdate::Closed(Err(error)));
+                    break;
+                }
             }
         }
     });
@@ -1025,7 +1108,7 @@ fn run_remote_loop<B, W>(
     terminal: &mut ratatui::Terminal<B>,
     display: crate::render::display::ViewportDisplay,
     writer: std::sync::Arc<std::sync::Mutex<W>>,
-    snapshot_rx: std::sync::mpsc::Receiver<crate::remote::Snapshot>,
+    snapshot_rx: std::sync::mpsc::Receiver<RemoteUpdate>,
 ) -> std::io::Result<()>
 where
     B: ratatui::backend::Backend<Error = std::io::Error>,
@@ -1037,8 +1120,30 @@ where
     let mut last_render = Instant::now() - render_interval;
     let mut last_viewport = None;
     loop {
-        while let Ok(snapshot) = snapshot_rx.try_recv() {
-            let _ = app.apply_remote_snapshot(&snapshot);
+        loop {
+            match snapshot_rx.try_recv() {
+                Ok(RemoteUpdate::Snapshot(snapshot)) => {
+                    let _ = app.apply_remote_snapshot(&snapshot);
+                }
+                Ok(RemoteUpdate::Closed(Ok(()))) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "SSH connector closed the Cellarium protocol stream",
+                    ));
+                }
+                Ok(RemoteUpdate::Closed(Err(error))) => {
+                    return Err(std::io::Error::other(format!(
+                        "SSH connector protocol failed: {error}"
+                    )));
+                }
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    return Err(std::io::Error::new(
+                        ErrorKind::UnexpectedEof,
+                        "SSH connector protocol reader stopped",
+                    ));
+                }
+            }
         }
         let now = Instant::now();
         if now.duration_since(last_render) >= render_interval {
