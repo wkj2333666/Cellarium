@@ -1,0 +1,135 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  version:
+    name: Validate release version
+    runs-on: ubuntu-latest
+    outputs:
+      package-version: ${{ steps.package.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: package
+        name: Match tag to Cargo package version
+        shell: bash
+        run: |
+          package_version=$(awk -F'"' '/^version = "/ { print $2; exit }' Cargo.toml)
+          test -n "$package_version"
+          test "$GITHUB_REF_NAME" = "v$package_version"
+          echo "version=$package_version" >> "$GITHUB_OUTPUT"
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: version
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            platform: linux
+            arch: x86_64
+            cuda: true
+            archive: tar
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+            platform: linux
+            arch: aarch64
+            cuda: true
+            archive: tar
+          - runner: macos-15-intel
+            target: x86_64-apple-darwin
+            platform: macos
+            arch: x86_64
+            cuda: false
+            archive: tar
+          - runner: macos-latest
+            target: aarch64-apple-darwin
+            platform: macos
+            arch: aarch64
+            cuda: false
+            archive: tar
+          - runner: windows-latest
+            target: x86_64-pc-windows-msvc
+            platform: windows
+            arch: x86_64
+            cuda: false
+            archive: zip
+          - runner: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            platform: windows
+            arch: aarch64
+            cuda: false
+            archive: zip
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+          rustup target add ${{ matrix.target }}
+      - name: Build Linux executable with CPU and CUDA backends
+        if: matrix.cuda
+        run: cargo build --locked --release --target ${{ matrix.target }}
+      - name: Build CPU-only executable
+        if: ${{ !matrix.cuda }}
+        run: cargo build --locked --release --target ${{ matrix.target }} --no-default-features
+      - id: package-unix
+        name: Package Unix executable
+        if: matrix.archive == 'tar'
+        shell: bash
+        run: |
+          archive="cellarium-v${{ needs.version.outputs.package-version }}-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz"
+          mkdir -p dist
+          tar -C "target/${{ matrix.target }}/release" -czf "dist/$archive" cellarium
+          echo "archive=$archive" >> "$GITHUB_OUTPUT"
+      - id: package-windows
+        name: Package Windows executable
+        if: matrix.archive == 'zip'
+        shell: pwsh
+        run: |
+          $archive = "cellarium-v${{ needs.version.outputs.package-version }}-${{ matrix.platform }}-${{ matrix.arch }}.zip"
+          New-Item -ItemType Directory -Force dist | Out-Null
+          Compress-Archive -Path "target/${{ matrix.target }}/release/cellarium.exe" -DestinationPath "dist/$archive"
+          "archive=$archive" >> $env:GITHUB_OUTPUT
+      - name: Upload release archive
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}-${{ matrix.arch }}
+          path: dist/*
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download release archives
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: dist
+          merge-multiple: true
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum cellarium-* > SHA256SUMS
+      - name: Create GitHub Release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release create "$GITHUB_REF_NAME" cellarium-* SHA256SUMS --verify-tag --generate-notes

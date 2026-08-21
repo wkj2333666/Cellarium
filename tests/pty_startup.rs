@@ -1,3 +1,5 @@
+#![cfg(unix)]
+
 use std::os::fd::FromRawFd;
 use std::process::{Command, Stdio};
 use std::thread;
