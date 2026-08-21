@@ -62,10 +62,21 @@ static MODULE_CACHE: OnceLock<Mutex<HashMap<String, Arc<CudaModule>>>> = OnceLoc
 static CUDA_CONTEXT: OnceLock<Arc<CudaContext>> = OnceLock::new();
 const MAX_RUNTIME_CACHE_ENTRIES: usize = 32;
 
+fn require_dynamic_library(present: bool) -> Result<(), BackendError> {
+    if present {
+        Ok(())
+    } else {
+        Err(BackendError::CudaUnavailable)
+    }
+}
+
 fn shared_context() -> Result<Arc<CudaContext>, BackendError> {
     if let Some(context) = CUDA_CONTEXT.get() {
         return Ok(context.clone());
     }
+    // cudarc's dynamic loader panics when no candidate library exists. Its
+    // presence probe uses the same candidate list without entering that path.
+    require_dynamic_library(unsafe { cudarc::driver::sys::is_culib_present() })?;
     let context = CudaContext::new(0)?;
     let _ = CUDA_CONTEXT.set(context.clone());
     Ok(CUDA_CONTEXT.get().cloned().unwrap_or(context))
@@ -88,6 +99,7 @@ fn compile_cached(source: &str) -> Result<Ptx, BackendError> {
         return Ok(Ptx::from_src(ptx.clone()));
     }
 
+    require_dynamic_library(unsafe { cudarc::nvrtc::sys::is_culib_present() })?;
     let ptx = compile_ptx(source)?;
     evict_if_full(&mut cache);
     cache.insert(source.to_string(), ptx.to_src());
@@ -556,6 +568,12 @@ mod tests {
 
     fn cuda_available() -> bool {
         CudaBackend::new(SimulationSpec::conway(), 1, 1).is_ok()
+    }
+
+    #[test]
+    fn missing_dynamic_libraries_become_unavailable_errors() {
+        let result = require_dynamic_library(false);
+        assert!(matches!(result, Err(BackendError::CudaUnavailable)));
     }
 
     fn identical_step_matches_cpu(spec: SimulationSpec, width: usize, height: usize) {

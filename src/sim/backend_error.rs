@@ -26,4 +26,6 @@ pub enum BackendError {
     InvalidTopology,
     #[error("CUDA support was not compiled in")]
     CudaNotCompiled,
+    #[error("CUDA runtime libraries are unavailable")]
+    CudaUnavailable,
 }

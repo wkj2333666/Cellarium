@@ -1,4 +1,4 @@
-#![cfg(unix)]
+#![cfg(target_os = "linux")]
 
 use std::os::fd::FromRawFd;
 use std::process::{Command, Stdio};

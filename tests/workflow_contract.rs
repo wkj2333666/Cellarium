@@ -1,4 +1,5 @@
 const CI: &str = include_str!("../.github/workflows/ci.yml");
+const PTY_TEST: &str = include_str!("pty_startup.rs");
 const RELEASE: &str = include_str!("../.github/workflows/release.yml");
 
 #[test]
@@ -6,6 +7,11 @@ fn ci_checks_both_backend_configurations() {
     assert!(CI.contains("cargo test --locked --all-targets --no-default-features"));
     assert!(CI.contains("cargo test --locked --all-targets"));
     assert!(CI.contains("contents: read"));
+}
+
+#[test]
+fn linux_specific_pty_suite_is_not_compiled_on_macos() {
+    assert!(PTY_TEST.starts_with("#![cfg(target_os = \"linux\")]"));
 }
 
 #[test]
