@@ -398,7 +398,7 @@ fn create_shared_memory(bytes: &[u8]) -> std::io::Result<CString> {
             libc::shm_open(
                 name.as_ptr(),
                 libc::O_CREAT | libc::O_EXCL | libc::O_RDWR,
-                libc::S_IRUSR | libc::S_IWUSR,
+                (libc::S_IRUSR | libc::S_IWUSR) as libc::c_uint,
             )
         };
         if descriptor < 0 {
