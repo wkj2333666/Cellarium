@@ -905,7 +905,7 @@ pub fn run_connect_with_command(host: &str, ssh_command: Option<&str>) -> std::i
     let command = ssh_command
         .map(str::to_string)
         .or_else(|| std::env::var("CELLARIUM_SSH_COMMAND").ok())
-        .unwrap_or_else(default_ssh_command);
+        .unwrap_or_else(|| "ssh".to_string());
     let mut parts = split_command_line(&command).map_err(std::io::Error::other)?;
     if parts.is_empty() {
         return Err(std::io::Error::new(
@@ -962,42 +962,6 @@ pub fn run_connect_with_command(host: &str, ssh_command: Option<&str>) -> std::i
         }
     }
     result
-}
-
-fn default_ssh_command() -> String {
-    if kitty_terminal() && program_on_path("kitten") {
-        "kitten ssh".to_string()
-    } else {
-        "ssh".to_string()
-    }
-}
-
-fn kitty_terminal() -> bool {
-    std::env::var_os("KITTY_WINDOW_ID").is_some()
-        || std::env::var("TERM").is_ok_and(|term| term.contains("kitty"))
-        || std::env::var("TERM_PROGRAM").is_ok_and(|program| program == "kitty")
-}
-
-fn program_on_path(program: &str) -> bool {
-    let Some(path) = std::env::var_os("PATH") else {
-        return false;
-    };
-    std::env::split_paths(&path).any(|directory| program_is_executable(&directory.join(program)))
-}
-
-#[cfg(unix)]
-fn program_is_executable(path: &Path) -> bool {
-    use std::os::unix::fs::PermissionsExt;
-    std::fs::metadata(path)
-        .is_ok_and(|metadata| metadata.is_file() && metadata.permissions().mode() & 0o111 != 0)
-}
-
-#[cfg(windows)]
-fn program_is_executable(path: &Path) -> bool {
-    path.with_extension("exe").is_file()
-        || path.with_extension("cmd").is_file()
-        || path.with_extension("bat").is_file()
-        || path.is_file()
 }
 
 fn wait_for_child_exit(

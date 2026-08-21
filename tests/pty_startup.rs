@@ -272,7 +272,7 @@ fn nonresponsive_terminal_startup_accepts_quit_and_restores_terminal() {
 }
 
 #[test]
-fn kitty_connect_prefers_kitten_without_an_explicit_override() {
+fn kitty_connect_uses_plain_ssh_without_an_explicit_override() {
     let (fixture, invocation) = connector_fixture();
     let (master, slave) = open_pty();
     set_nonblocking(master);
@@ -289,10 +289,7 @@ fn kitty_connect_prefers_kitten_without_an_explicit_override() {
     unsafe { libc::close(master) };
     let _ = std::fs::remove_dir_all(&fixture);
 
-    assert_eq!(
-        called,
-        "kitten\nssh\ntinker\n$HOME/.local/bin/cellarium\nserver\n"
-    );
+    assert_eq!(called, "ssh\ntinker\n$HOME/.local/bin/cellarium\nserver\n");
 }
 
 #[test]
