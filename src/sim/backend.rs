@@ -1,7 +1,10 @@
 use super::cpu::CpuBackend;
-use super::cuda::{BackendError, CudaBackend};
+#[cfg(feature = "cuda")]
+use super::cuda::CudaBackend;
 use super::rule::SimulationSpec;
 use super::world::World;
+
+pub use super::backend_error::BackendError;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum BackendKind {
@@ -11,6 +14,7 @@ pub enum BackendKind {
 
 pub enum SimulationBackend {
     Cpu(Box<CpuBackend>),
+    #[cfg(feature = "cuda")]
     Cuda(Box<CudaBackend>),
 }
 
@@ -20,9 +24,15 @@ impl SimulationBackend {
     }
 
     pub fn cuda_or_cpu(spec: SimulationSpec, width: usize, height: usize) -> Self {
+        #[cfg(feature = "cuda")]
         match CudaBackend::new(spec.clone(), width, height) {
             Ok(backend) => Self::Cuda(Box::new(backend)),
             Err(_) => Self::cpu(spec),
+        }
+        #[cfg(not(feature = "cuda"))]
+        {
+            let _ = (width, height);
+            Self::cpu(spec)
         }
     }
 
@@ -34,8 +44,14 @@ impl SimulationBackend {
     ) -> Result<Self, BackendError> {
         match kind {
             BackendKind::Cpu => Ok(Self::cpu(spec)),
+            #[cfg(feature = "cuda")]
             BackendKind::Cuda => {
                 CudaBackend::new(spec, width, height).map(|backend| Self::Cuda(Box::new(backend)))
+            }
+            #[cfg(not(feature = "cuda"))]
+            BackendKind::Cuda => {
+                let _ = (spec, width, height);
+                Err(BackendError::CudaNotCompiled)
             }
         }
     }
@@ -43,6 +59,7 @@ impl SimulationBackend {
     pub fn kind(&self) -> BackendKind {
         match self {
             Self::Cpu(_) => BackendKind::Cpu,
+            #[cfg(feature = "cuda")]
             Self::Cuda(_) => BackendKind::Cuda,
         }
     }
@@ -50,6 +67,7 @@ impl SimulationBackend {
     pub fn device_name(&self) -> &str {
         match self {
             Self::Cpu(_) => "CPU",
+            #[cfg(feature = "cuda")]
             Self::Cuda(backend) => backend.device_name(),
         }
     }
@@ -57,6 +75,7 @@ impl SimulationBackend {
     pub fn tick(&self) -> u64 {
         match self {
             Self::Cpu(backend) => backend.tick(),
+            #[cfg(feature = "cuda")]
             Self::Cuda(backend) => backend.tick(),
         }
     }
@@ -67,6 +86,7 @@ impl SimulationBackend {
                 backend.step(world)?;
                 Ok(())
             }
+            #[cfg(feature = "cuda")]
             Self::Cuda(backend) => backend.step(world),
         }
     }
@@ -75,14 +95,18 @@ impl SimulationBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "cuda")]
     use crate::sim::cpu::CpuBackend;
     use crate::sim::rule::SimulationSpec;
+    #[cfg(feature = "cuda")]
     use crate::sim::world::World;
 
+    #[cfg(feature = "cuda")]
     fn cuda_available() -> bool {
         CudaBackend::new(SimulationSpec::conway(), 1, 1).is_ok()
     }
 
+    #[cfg(feature = "cuda")]
     #[test]
     fn selects_cuda_when_available_and_reports_the_actual_backend() {
         if !cuda_available() {
@@ -98,6 +122,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "cuda")]
     fn strict_backend_construction_does_not_fall_back_from_cuda() {
         let result =
             SimulationBackend::strict_for_kind(BackendKind::Cuda, SimulationSpec::conway(), 0, 0);
@@ -105,7 +130,19 @@ mod tests {
         assert!(matches!(result, Err(BackendError::InvalidWorld)));
     }
 
+    #[cfg(not(feature = "cuda"))]
     #[test]
+    fn cpu_only_build_falls_back_and_rejects_explicit_cuda() {
+        let selected = SimulationBackend::cuda_or_cpu(SimulationSpec::conway(), 8, 8);
+        assert_eq!(selected.kind(), BackendKind::Cpu);
+
+        let strict =
+            SimulationBackend::strict_for_kind(BackendKind::Cuda, SimulationSpec::conway(), 8, 8);
+        assert!(matches!(strict, Err(BackendError::CudaNotCompiled)));
+    }
+
+    #[test]
+    #[cfg(feature = "cuda")]
     fn delegates_conway_step_to_the_selected_backend() {
         if !cuda_available() {
             return;

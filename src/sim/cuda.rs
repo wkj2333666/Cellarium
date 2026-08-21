@@ -2,38 +2,22 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use cudarc::driver::{
-    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, DriverError, LaunchConfig,
-    PushKernelArg,
+    CudaContext, CudaFunction, CudaModule, CudaSlice, CudaStream, LaunchConfig, PushKernelArg,
 };
-use cudarc::nvrtc::{CompileError, Ptx, compile_ptx};
+#[cfg(test)]
+use cudarc::nvrtc::CompileError;
+use cudarc::nvrtc::{Ptx, compile_ptx};
 
+pub use crate::sim::backend_error::BackendError;
 use crate::sim::cuda_codegen::{
-    CodegenError, generate_cuda_source, generate_program_cuda_source,
-    generate_topology_cuda_source, program_kernel_data,
+    generate_cuda_source, generate_program_cuda_source, generate_topology_cuda_source,
+    program_kernel_data,
 };
-use crate::sim::expression::{KernelExpression, KernelExpressionError};
+use crate::sim::expression::KernelExpression;
 use crate::sim::program::InputSource;
 use crate::sim::rule::{Rule, SimulationSpec};
 use crate::sim::topology::CompiledTopology;
 use crate::sim::world::{ChannelWorld, World};
-
-#[derive(Debug, thiserror::Error)]
-pub enum BackendError {
-    #[error("CUDA driver error: {0}")]
-    Driver(#[from] DriverError),
-    #[error("CUDA compilation error: {0}")]
-    Compile(#[from] CompileError),
-    #[error("rule evaluation error: {0}")]
-    RuleEvaluation(#[from] KernelExpressionError),
-    #[error("CUDA code generation error: {0}")]
-    Codegen(#[from] CodegenError),
-    #[error("the runtime compilation cache is unavailable")]
-    CompilationCachePoisoned,
-    #[error("world dimensions must fit a CUDA launch")]
-    InvalidWorld,
-    #[error("compiled topology has inconsistent CSR arrays")]
-    InvalidTopology,
-}
 
 struct ProgramCudaBuffers {
     masks: CudaSlice<i32>,

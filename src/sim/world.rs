@@ -72,6 +72,7 @@ impl ChannelWorld {
         self.next[range].fill(0.0);
     }
 
+    #[cfg(feature = "cuda")]
     pub(crate) fn cells(&self) -> &[f32] {
         &self.current
     }

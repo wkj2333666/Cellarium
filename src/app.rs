@@ -1492,8 +1492,14 @@ mod tests {
     use super::*;
     use crate::sim::kernel::{KernelValues, Normalization};
 
+    #[cfg(feature = "cuda")]
     fn cuda_available() -> bool {
         crate::sim::cuda::CudaBackend::new(SimulationSpec::conway(), 1, 1).is_ok()
+    }
+
+    #[cfg(not(feature = "cuda"))]
+    fn cuda_available() -> bool {
+        false
     }
 
     fn custom_definition() -> KernelDefinition {

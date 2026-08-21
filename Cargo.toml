@@ -3,9 +3,13 @@ name = "cellarium"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = ["cuda"]
+cuda = ["dep:cudarc"]
+
 [dependencies]
 crossterm = "0.29.0"
-cudarc = { version = "0.19.9", default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-11080"] }
+cudarc = { version = "0.19.9", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-11080"] }
 image = { version = "0.25", default-features = false }
 ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
 ratatui = "0.30.2"

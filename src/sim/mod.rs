@@ -1,5 +1,7 @@
 pub mod backend;
+pub mod backend_error;
 pub mod cpu;
+#[cfg(feature = "cuda")]
 pub mod cuda;
 pub mod cuda_codegen;
 pub mod experiment;
