@@ -480,7 +480,7 @@ pub fn run_terminal_probe(host: &str) -> io::Result<TerminalProbeReport> {
     })?;
     session.write(b"tt")?;
     session.pump_until("Channels section", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"channel_1")
+        session.screen.contains(b"Channels")
     })?;
     session.write(b"a]cvxf\x1a\x19")?;
     session.pump_until("channel controls", INPUT_TIMEOUT, |session| {
