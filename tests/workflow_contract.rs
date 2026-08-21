@@ -28,6 +28,7 @@ fn release_contains_every_supported_target() {
     }
     assert!(RELEASE.contains("tags:\n      - 'v*'"));
     assert!(RELEASE.contains("contents: write"));
+    assert!(RELEASE.contains("GH_REPO: ${{ github.repository }}"));
     assert!(RELEASE.contains("SHA256SUMS"));
     assert!(RELEASE.contains("needs: build"));
 }

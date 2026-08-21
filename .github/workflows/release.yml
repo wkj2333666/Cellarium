@@ -132,4 +132,5 @@ jobs:
         working-directory: dist
         env:
           GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
         run: gh release create "$GITHUB_REF_NAME" cellarium-* SHA256SUMS --verify-tag --generate-notes
