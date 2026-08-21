@@ -3,6 +3,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::sim::kernel::{KernelDefinition, KernelValues, Normalization, ring_definition};
+use crate::sim::tiling::{
+    PeriodicTilingDraft,
+    polygon::{prototype_vertices, validate_polygon},
+};
 use crate::sim::topology::BoundarySpec;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
@@ -134,6 +138,11 @@ pub struct ExperimentSpec {
     pub growth: Vec<GrowthSource>,
     pub simulation_dt: f32,
     pub seed: u64,
+    /// Optional polygonal tiling metadata. Raster execution remains the
+    /// compatibility path; the geometry is validated and persisted atomically
+    /// so the Workbench can edit it without losing the draft.
+    #[serde(default)]
+    pub tiling: Option<PeriodicTilingDraft>,
 }
 
 impl ExperimentSpec {
@@ -176,6 +185,7 @@ impl ExperimentSpec {
             }],
             simulation_dt: 0.1,
             seed: 0,
+            tiling: None,
         }
     }
 
@@ -267,6 +277,8 @@ pub enum ExperimentModelError {
     },
     #[error("growth program for {0:?} is empty")]
     EmptyGrowthSource(ChannelId),
+    #[error("tiling is invalid: {0}")]
+    InvalidTiling(String),
 }
 
 pub fn validate_structure(spec: &ExperimentSpec) -> Result<(), Vec<ExperimentModelError>> {
@@ -289,6 +301,73 @@ pub fn validate_structure(spec: &ExperimentSpec) -> Result<(), Vec<ExperimentMod
     }
     if !spec.simulation_dt.is_finite() || spec.simulation_dt <= 0.0 {
         errors.push(ExperimentModelError::InvalidSimulationDt);
+    }
+    if let Some(tiling) = &spec.tiling {
+        if !tiling.translation_a.x.is_finite()
+            || !tiling.translation_a.y.is_finite()
+            || !tiling.translation_b.x.is_finite()
+            || !tiling.translation_b.y.is_finite()
+            || tiling.translation_a.cross(tiling.translation_b).abs() <= 1e-12
+        {
+            errors.push(ExperimentModelError::InvalidTiling(
+                "translation vectors must be finite and non-collinear".into(),
+            ));
+        }
+        let mut prototype_ids = BTreeSet::new();
+        for prototype in &tiling.prototypes {
+            if !prototype_ids.insert(prototype.id) {
+                errors.push(ExperimentModelError::InvalidTiling(format!(
+                    "duplicate prototype {:?}",
+                    prototype.id
+                )));
+            }
+            match prototype_vertices(&prototype.shape) {
+                Ok(vertices) => {
+                    for issue in validate_polygon(&vertices) {
+                        errors.push(ExperimentModelError::InvalidTiling(format!(
+                            "prototype {:?}: {}",
+                            prototype.id, issue.message
+                        )));
+                    }
+                }
+                Err(issues) => errors.extend(issues.into_iter().map(|issue| {
+                    ExperimentModelError::InvalidTiling(format!(
+                        "prototype {:?}: {}",
+                        prototype.id, issue.message
+                    ))
+                })),
+            }
+        }
+        let prototype_ids: BTreeSet<_> = tiling.prototypes.iter().map(|p| p.id).collect();
+        let mut tile_ids = BTreeSet::new();
+        for tile in &tiling.instances {
+            if !tile_ids.insert(tile.id) {
+                errors.push(ExperimentModelError::InvalidTiling(format!(
+                    "duplicate tile {:?}",
+                    tile.id
+                )));
+            }
+            if !prototype_ids.contains(&tile.prototype) {
+                errors.push(ExperimentModelError::InvalidTiling(format!(
+                    "tile {:?} references missing prototype {:?}",
+                    tile.id, tile.prototype
+                )));
+            }
+            if !tile.transform.rotation.is_finite()
+                || !tile.transform.translation.x.is_finite()
+                || !tile.transform.translation.y.is_finite()
+            {
+                errors.push(ExperimentModelError::InvalidTiling(format!(
+                    "tile {:?} has non-finite transform",
+                    tile.id
+                )));
+            }
+        }
+        if tiling.instances.is_empty() {
+            errors.push(ExperimentModelError::InvalidTiling(
+                "at least one tile instance is required".into(),
+            ));
+        }
     }
     if spec.channels.is_empty() {
         errors.push(ExperimentModelError::EmptyChannels);

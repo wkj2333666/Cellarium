@@ -353,8 +353,12 @@ fn editor_panel_lines(app: &App, max_width: usize, max_height: usize) -> Vec<Str
             "{} TOPOLOGY",
             panel_marker(app, crate::app::Panel::Topology)
         ),
-        "square lattice · dense periodic CSR-ready".to_string(),
-        "custom lattice/domain editor available".to_string(),
+        if app.tiling_draft().is_some() {
+            "custom polygon tiling · validated draft".to_string()
+        } else {
+            "square lattice · dense periodic CSR-ready".to_string()
+        },
+        "Topology panel: use experiment draft / Apply to commit geometry".to_string(),
         "STATISTICS".to_string(),
         if app.is_remote_mirror() {
             format!("tick {} · server sim {:.1}/s", app.tick(), simulation_rate)

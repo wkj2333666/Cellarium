@@ -15,6 +15,7 @@ use crate::sim::experiment::{ExperimentError, ExperimentFile, ExperimentMetadata
 use crate::sim::experiment_model::{ExperimentSpec, validate_structure};
 use crate::sim::rule::SimulationSpec;
 use crate::sim::service::{ApplyAccepted, ApplyRejected, ApplyRequest, Diagnostic, DiagnosticPath};
+use crate::sim::tiling::PeriodicTilingDraft;
 use crate::sim::world::World;
 use crossterm::event::{Event, KeyCode, KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
@@ -201,6 +202,28 @@ impl App {
             channel.initial = self.world.cells().to_vec();
         }
         model
+    }
+
+    pub fn tiling_draft(&self) -> Option<&PeriodicTilingDraft> {
+        self.experiment_model.tiling.as_ref()
+    }
+
+    pub fn set_tiling_draft(
+        &mut self,
+        tiling: Option<PeriodicTilingDraft>,
+    ) -> Result<(), Vec<String>> {
+        let mut candidate = self.experiment_model.clone();
+        candidate.tiling = tiling;
+        validate_structure(&candidate).map_err(|errors| {
+            errors
+                .into_iter()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+        })?;
+        self.experiment_model = candidate;
+        self.kernel_error = None;
+        self.backend_error = None;
+        Ok(())
     }
 
     pub fn growth_plot_samples(&self, count: usize) -> Vec<Option<f32>> {
@@ -2666,5 +2689,23 @@ mod tests {
         app.handle_mouse(down, &mut tracker);
         assert!(app.handle_mouse(drag, &mut tracker));
         assert_eq!(app.camera().center(), [10.0, 5.0]);
+    }
+
+    #[test]
+    fn topology_draft_is_validated_before_becoming_active_metadata() {
+        let mut app = App::new(SimulationSpec::conway(), 8, 8);
+        let square =
+            crate::sim::tiling::build_preset(crate::sim::tiling::TilingPreset::Square, 1.0);
+        app.set_tiling_draft(Some(square)).unwrap();
+        assert!(app.tiling_draft().is_some());
+        let mut invalid = app.tiling_draft().unwrap().clone();
+        if let crate::sim::tiling::PrototypeShape::SimplePolygon { vertices } =
+            &mut invalid.prototypes[0].shape
+        {
+            vertices.swap(1, 2);
+        }
+        let errors = app.set_tiling_draft(Some(invalid)).unwrap_err();
+        assert!(!errors.is_empty());
+        assert!(app.tiling_draft().is_some());
     }
 }

@@ -453,6 +453,7 @@ fn migrate_legacy(wire: ExperimentWire) -> Result<ExperimentFileV2, ExperimentEr
         growth: Vec::new(),
         simulation_dt: 1.0,
         seed: wire.seed,
+        tiling: None,
     };
 
     match wire.rule {
