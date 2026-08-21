@@ -2,7 +2,8 @@
 
 ## Status
 
-Approved conversational design, pending implementation-plan review.
+Approved design. Implementation is split into the four plans indexed by
+`docs/superpowers/plans/2026-08-21-interactive-workbench-roadmap.md`.
 
 ## Purpose
 
