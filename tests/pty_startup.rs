@@ -437,6 +437,10 @@ fn c_s_pty_user_journey_survives_repeated_keyboard_and_mouse_operations() {
         Instant::now() + Duration::from_secs(2),
         |output| contains(output, b"Workbench") && contains(output, b"World")
     ));
+    assert!(
+        contains(&output, b"a=d,d=A,q=1"),
+        "entering Workbench must delete the previous Kitty image placement"
+    );
 
     // Return to simulation, then exercise the high-frequency paths. SGR
     // mouse events use terminal coordinates (1-based); the viewport begins

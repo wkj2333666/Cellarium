@@ -365,7 +365,7 @@ impl KittySharedDisplay {
                 let command = kitty_delete_image_command(image_id);
                 drop(state);
                 frame.render_widget(
-                    KittySharedWidget {
+                    GraphicsCommandWidget {
                         command: Some(&command),
                     },
                     area,
@@ -388,7 +388,7 @@ impl KittySharedDisplay {
             };
         }
         let Some(shared) = state.ready.take() else {
-            frame.render_widget(KittySharedWidget { command: None }, area);
+            frame.render_widget(GraphicsCommandWidget { command: None }, area);
             return RenderStatus {
                 rendered: state.displayed_id.is_some(),
                 fresh: false,
@@ -401,7 +401,7 @@ impl KittySharedDisplay {
         }
         command.push_str("\x1b[u");
         frame.render_widget(
-            KittySharedWidget {
+            GraphicsCommandWidget {
                 command: Some(&command),
             },
             area,
@@ -425,13 +425,11 @@ impl Drop for KittySharedDisplay {
     }
 }
 
-#[cfg(unix)]
-struct KittySharedWidget<'a> {
+struct GraphicsCommandWidget<'a> {
     command: Option<&'a str>,
 }
 
-#[cfg(unix)]
-impl ratatui::widgets::Widget for KittySharedWidget<'_> {
+impl ratatui::widgets::Widget for GraphicsCommandWidget<'_> {
     fn render(self, area: ratatui::layout::Rect, buffer: &mut ratatui::buffer::Buffer) {
         use ratatui::buffer::CellDiffOption;
         use std::num::NonZeroU16;
@@ -515,6 +513,10 @@ impl PixelDisplay {
 #[cfg(unix)]
 fn kitty_delete_image_command(image_id: u32) -> String {
     format!("\x1b_Ga=d,d=I,i={image_id},q=1\x1b\\")
+}
+
+fn kitty_delete_all_images_command() -> &'static str {
+    "\x1b_Ga=d,d=A,q=1\x1b\\"
 }
 
 impl Drop for PixelDisplay {
@@ -677,6 +679,21 @@ pub fn should_use_kitty_shared_memory(
 }
 
 impl ViewportDisplay {
+    /// Remove image placements left by the pixel renderer before drawing a
+    /// text-only workbench over the same terminal area. Kitty placements are
+    /// terminal state rather than ordinary cells, so ratatui's next frame
+    /// cannot erase them by itself.
+    pub fn clear_graphics(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
+        if self.protocol() == DisplayProtocol::Kitty {
+            frame.render_widget(
+                GraphicsCommandWidget {
+                    command: Some(kitty_delete_all_images_command()),
+                },
+                area,
+            );
+        }
+    }
+
     pub fn detect() -> Self {
         let term = std::env::var("TERM").unwrap_or_default();
         let term_program = std::env::var("TERM_PROGRAM").unwrap_or_default();
@@ -1197,6 +1214,27 @@ mod tests {
         let symbol = terminal.backend().buffer().cell((0, 0)).unwrap().symbol();
         assert!(symbol.contains("a=d,d=I,i=41,q=1"));
         assert_eq!(display.state.lock().unwrap().displayed_id, None);
+    }
+
+    #[test]
+    fn clearing_kitty_graphics_emits_delete_all_command() {
+        let display = ViewportDisplay::from_protocol_and_cell_size_for_connection(
+            DisplayProtocol::Kitty,
+            Some((8, 16)),
+            false,
+            false,
+        );
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(2, 1)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                display.clear_graphics(frame, ratatui::layout::Rect::new(0, 0, 2, 1));
+            })
+            .unwrap();
+
+        let symbol = terminal.backend().buffer().cell((0, 0)).unwrap().symbol();
+        assert!(symbol.contains("a=d,d=A,q=1"));
     }
 
     #[cfg(unix)]

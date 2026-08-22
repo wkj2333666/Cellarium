@@ -91,6 +91,7 @@ pub struct App {
     workbench: WorkbenchState,
     experiment_service: Option<ExperimentService>,
     workbench_notice: Option<String>,
+    workbench_display_needs_clear: bool,
 }
 
 impl App {
@@ -150,6 +151,7 @@ impl App {
             workbench,
             experiment_service: None,
             workbench_notice: None,
+            workbench_display_needs_clear: false,
         }
     }
 
@@ -170,10 +172,19 @@ impl App {
         self.workbench_notice.as_deref()
     }
     pub fn enter_workbench(&mut self) {
-        self.mode = AppMode::Workbench;
+        if self.mode != AppMode::Workbench {
+            self.mode = AppMode::Workbench;
+            self.workbench_display_needs_clear = true;
+        }
     }
     pub fn leave_workbench(&mut self) {
         self.mode = AppMode::Simulation;
+        self.workbench_display_needs_clear = false;
+    }
+    pub fn take_workbench_display_clear(&mut self) -> bool {
+        let needs_clear = self.workbench_display_needs_clear;
+        self.workbench_display_needs_clear = false;
+        needs_clear
     }
     pub fn workbench_apply_request(&self, request_id: u64) -> ApplyRequest {
         ApplyRequest {
@@ -938,10 +949,10 @@ impl App {
             }
             Command::ToggleHelp => self.help_visible = !self.help_visible,
             Command::ToggleWorkbench => {
-                self.mode = if self.mode == AppMode::Simulation {
-                    AppMode::Workbench
+                if self.mode == AppMode::Simulation {
+                    self.enter_workbench();
                 } else {
-                    AppMode::Simulation
+                    self.leave_workbench();
                 }
             }
             Command::Quit => {}
@@ -973,10 +984,10 @@ impl App {
             }
             Command::ToggleHelp => self.help_visible = !self.help_visible,
             Command::ToggleWorkbench => {
-                self.mode = if self.mode == AppMode::Simulation {
-                    AppMode::Workbench
+                if self.mode == AppMode::Simulation {
+                    self.enter_workbench();
                 } else {
-                    AppMode::Simulation
+                    self.leave_workbench();
                 }
             }
             Command::Quit
