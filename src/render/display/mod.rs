@@ -81,10 +81,30 @@ struct RasterRequest {
     terminal_size: ratatui::layout::Size,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RasterGeneration {
+    pub priority: u64,
+    pub content: u64,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct RasterRequestKey {
+    generation: u64,
+    camera: Camera,
+    frame_width: usize,
+    frame_height: usize,
+    terminal_size: ratatui::layout::Size,
+}
+
+fn should_submit_raster(previous: Option<RasterRequestKey>, next: RasterRequestKey) -> bool {
+    previous != Some(next)
+}
+
 pub struct AsyncRasterizer {
     queue: LatestWorkQueue<RasterRequest>,
     ready: Arc<Mutex<Option<(DynamicImage, ratatui::layout::Size)>>>,
     latest_generation: Arc<AtomicU64>,
+    last_request: Mutex<Option<RasterRequestKey>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -121,6 +141,7 @@ impl AsyncRasterizer {
             queue,
             ready,
             latest_generation,
+            last_request: Mutex::new(None),
             worker: Some(worker),
         }
     }
@@ -132,12 +153,27 @@ impl AsyncRasterizer {
         frame_width: usize,
         frame_height: usize,
         terminal_size: ratatui::layout::Size,
-        priority_generation: u64,
+        generation: RasterGeneration,
     ) {
+        let key = RasterRequestKey {
+            generation: generation.content,
+            camera,
+            frame_width,
+            frame_height,
+            terminal_size,
+        };
+        let Ok(mut last_request) = self.last_request.lock() else {
+            return;
+        };
+        if !should_submit_raster(*last_request, key) {
+            return;
+        }
+        *last_request = Some(key);
+        drop(last_request);
         self.latest_generation
-            .store(priority_generation, Ordering::Release);
+            .store(generation.priority, Ordering::Release);
         self.queue.submit(RasterRequest {
-            generation: priority_generation,
+            generation: generation.priority,
             world_width: world.width(),
             world_height: world.height(),
             cells: world.cells().to_vec(),
@@ -780,7 +816,7 @@ impl ViewportDisplay {
         world: &World,
         camera: Camera,
         rasterizer: &AsyncRasterizer,
-        priority_generation: u64,
+        generation: RasterGeneration,
     ) -> bool {
         let (frame_width, frame_height) = self.framebuffer_size(area);
         let terminal_size = ratatui::layout::Size::new(area.width, area.height);
@@ -790,7 +826,7 @@ impl ViewportDisplay {
             frame_width,
             frame_height,
             terminal_size,
-            priority_generation,
+            generation,
         );
         if let Some((image, size)) = rasterizer.take_ready() {
             match self {
@@ -895,6 +931,34 @@ mod tests {
     }
 
     #[test]
+    fn raster_requests_are_deduplicated_until_the_generation_changes() {
+        let camera = Camera::new([1.0, 1.0], 1.0);
+        let request = RasterRequestKey {
+            generation: 7,
+            camera,
+            frame_width: 64,
+            frame_height: 32,
+            terminal_size: ratatui::layout::Size::new(8, 4),
+        };
+
+        assert!(!should_submit_raster(Some(request), request));
+        assert!(should_submit_raster(
+            Some(request),
+            RasterRequestKey {
+                generation: 8,
+                ..request
+            }
+        ));
+        assert!(should_submit_raster(
+            Some(request),
+            RasterRequestKey {
+                camera: Camera::new([2.0, 1.0], 1.0),
+                ..request
+            }
+        ));
+    }
+
+    #[test]
     fn async_rasterizer_produces_a_pixel_frame_without_blocking_the_caller() {
         let mut world = World::new(2, 2);
         world.replace_cells(&[0.0, 1.0, 0.0, 1.0]);
@@ -905,7 +969,10 @@ mod tests {
             4,
             4,
             ratatui::layout::Size::new(2, 2),
-            0,
+            RasterGeneration {
+                priority: 0,
+                content: 0,
+            },
         );
 
         let deadline = Instant::now() + Duration::from_secs(1);

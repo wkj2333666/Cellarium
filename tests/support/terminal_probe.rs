@@ -453,12 +453,22 @@ pub fn run_terminal_probe(host: &str) -> io::Result<TerminalProbeReport> {
     })?;
     let pause_ack_at = Instant::now();
     let frames_after_pause_ack = session.frames.len();
-    session.pump_until("post-pause Kitty frame", INPUT_TIMEOUT, |session| {
-        consecutive_equal_frame(&session.frames, frames_after_pause_ack, None).is_some()
-    })?;
-    let pause_frame = consecutive_equal_frame(&session.frames, frames_after_pause_ack, None)
-        .expect("stable post-pause frame");
-    let paused_hash = pause_frame.hash;
+    session.pump_for(Duration::from_millis(300))?;
+    let paused_hash = session
+        .frames
+        .last()
+        .map(|frame| frame.hash)
+        .ok_or_else(|| io::Error::other("pause removed the displayed Kitty frame"))?;
+    assert!(
+        session.frames[frames_after_pause_ack..]
+            .iter()
+            .all(|frame| frame.hash == paused_hash),
+        "paused output must remain stable"
+    );
+    let pause_frame = session.frames[frames_after_pause_ack..]
+        .first()
+        .copied()
+        .unwrap_or_else(|| *session.frames.last().expect("pause frame"));
     let pause_ack_latency_ms = pause_ack_at.duration_since(pause_started).as_secs_f64() * 1_000.0;
     let pause_text_latency_ms = pause_ack_latency_ms;
     let pause_frame_latency_ms =
@@ -471,14 +481,24 @@ pub fn run_terminal_probe(host: &str) -> io::Result<TerminalProbeReport> {
     })?;
     let clear_ack_at = Instant::now();
     let frames_after_clear_ack = session.frames.len();
-    session.pump_until("stable cleared Kitty frame", INPUT_TIMEOUT, |session| {
-        consecutive_equal_frame(&session.frames, frames_after_clear_ack, Some(paused_hash))
-            .is_some()
+    session.pump_until("cleared Kitty frame", INPUT_TIMEOUT, |session| {
+        session.frames[frames_after_clear_ack..]
+            .iter()
+            .any(|frame| frame.hash != paused_hash)
     })?;
-    let clear_frame =
-        consecutive_equal_frame(&session.frames, frames_after_clear_ack, Some(paused_hash))
-            .expect("stable cleared frame");
+    let clear_frame = session.frames[frames_after_clear_ack..]
+        .iter()
+        .find(|frame| frame.hash != paused_hash)
+        .copied()
+        .expect("cleared frame");
     let cleared_hash = clear_frame.hash;
+    session.pump_for(Duration::from_millis(300))?;
+    assert!(
+        session.frames[frames_after_clear_ack..]
+            .iter()
+            .all(|frame| frame.hash == cleared_hash),
+        "cleared output must remain stable"
+    );
     let clear_ack_latency_ms = clear_ack_at.duration_since(clear_started).as_secs_f64() * 1_000.0;
     let clear_frame_latency_ms =
         clear_frame.at.duration_since(clear_started).as_secs_f64() * 1_000.0;
@@ -677,17 +697,5 @@ fn contains(haystack: &[u8], needle: &[u8]) -> bool {
 fn hash_bytes(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
-    })
-}
-
-fn consecutive_equal_frame(
-    frames: &[FrameObservation],
-    start: usize,
-    different_from: Option<u64>,
-) -> Option<FrameObservation> {
-    frames.get(start..)?.windows(2).find_map(|pair| {
-        (pair[0].hash == pair[1].hash
-            && different_from.is_none_or(|previous| pair[1].hash != previous))
-        .then_some(pair[1])
     })
 }

@@ -1,5 +1,5 @@
 use crate::app::App;
-use crate::render::display::{AsyncRasterizer, ViewportDisplay};
+use crate::render::display::{AsyncRasterizer, RasterGeneration, ViewportDisplay};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph};
@@ -8,7 +8,8 @@ pub mod workbench;
 const MINIMUM_KERNEL_PREVIEW_ROWS: usize = 8;
 
 pub fn draw(frame: &mut ratatui::Frame, app: &mut App, display: &ViewportDisplay) -> bool {
-    draw_impl(frame, app, display, None)
+    let generation = app.applied_input_sequence();
+    draw_impl(frame, app, display, None, generation, generation)
 }
 
 pub fn draw_remote(
@@ -16,8 +17,17 @@ pub fn draw_remote(
     app: &mut App,
     display: &ViewportDisplay,
     rasterizer: &AsyncRasterizer,
+    content_generation: u64,
 ) -> bool {
-    draw_impl(frame, app, display, Some(rasterizer))
+    let priority_generation = app.applied_input_sequence();
+    draw_impl(
+        frame,
+        app,
+        display,
+        Some(rasterizer),
+        priority_generation,
+        content_generation,
+    )
 }
 
 fn draw_impl(
@@ -25,6 +35,8 @@ fn draw_impl(
     app: &mut App,
     display: &ViewportDisplay,
     rasterizer: Option<&AsyncRasterizer>,
+    priority_generation: u64,
+    content_generation: u64,
 ) -> bool {
     let outer = frame.area();
     let chunks = ratatui::layout::Layout::vertical([
@@ -71,7 +83,10 @@ fn draw_impl(
                 app.world(),
                 *app.camera(),
                 rasterizer,
-                app.applied_input_sequence(),
+                RasterGeneration {
+                    priority: priority_generation,
+                    content: content_generation,
+                },
             )
         } else {
             let framebuffer = app.render_framebuffer(frame_width, frame_height);

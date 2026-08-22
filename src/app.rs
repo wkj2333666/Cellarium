@@ -391,6 +391,15 @@ impl App {
         self.applied_input_sequence
     }
 
+    /// Monotonic-enough identity for the remote image state. A simulation tick
+    /// changes the cells; an acknowledged input sequence covers commands that
+    /// mutate cells without advancing the tick (clear, reset, mouse edits).
+    pub fn render_generation(&self) -> u64 {
+        self.tick()
+            .wrapping_mul(1_000_003)
+            .wrapping_add(self.applied_input_sequence)
+    }
+
     pub fn set_remote_transport_rates(&mut self, snapshot: f64, graphics: f64) {
         self.snapshot_rate = snapshot;
         self.graphics_rate = graphics;
@@ -1903,7 +1912,11 @@ where
     let mut graphics_meter = RateMeter::new(Duration::from_secs(1));
     let rasterizer = crate::render::display::AsyncRasterizer::new();
     let mut next_input_sequence = 1_u64;
-    let render_interval = Duration::from_secs_f64(1.0 / 30.0);
+    // Poll the presentation pipeline at 60 Hz. Raster requests are
+    // generation-deduplicated, so this does not rerasterize unchanged
+    // snapshots; it only reduces the chance of missing a freshly completed
+    // frame between two 30 Hz polls.
+    let render_interval = Duration::from_secs_f64(1.0 / 60.0);
     let mut last_render = Instant::now() - render_interval;
     let mut last_viewport = None;
     loop {
@@ -2006,8 +2019,10 @@ where
             }
             let render_started = Instant::now();
             let mut fresh_graphics = false;
+            let render_generation = app.render_generation();
             terminal.draw(|frame| {
-                fresh_graphics = crate::tui::draw_remote(frame, app, &display, &rasterizer);
+                fresh_graphics =
+                    crate::tui::draw_remote(frame, app, &display, &rasterizer, render_generation);
             })?;
             let completed = Instant::now();
             app.record_render_duration(completed.duration_since(render_started));
