@@ -117,10 +117,18 @@ impl AsyncRasterizer {
         let latest_generation = Arc::new(AtomicU64::new(0));
         let worker_generation = Arc::clone(&latest_generation);
         let worker = std::thread::spawn(move || {
+            // Keep the large simulation and pixel buffers owned by the worker.
+            // Requests already contain the latest cell snapshot, so replacing
+            // cells is enough; rebuilding these allocations for every draw
+            // otherwise dominates remote CPU time on weaker clients.
+            let mut world = World::new(1, 1);
+            let mut framebuffer = Framebuffer::new(1, 1);
             while let Some(request) = worker_queue.recv() {
-                let mut world = World::new(request.world_width, request.world_height);
+                if world.width() != request.world_width || world.height() != request.world_height {
+                    world = World::new(request.world_width, request.world_height);
+                }
                 world.replace_cells(&request.cells);
-                let mut framebuffer = Framebuffer::new(request.frame_width, request.frame_height);
+                framebuffer.ensure_size(request.frame_width, request.frame_height);
                 let completed =
                     rasterize_world_into_while(&world, &request.camera, &mut framebuffer, || {
                         worker_generation.load(Ordering::Acquire) == request.generation

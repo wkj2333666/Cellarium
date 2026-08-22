@@ -33,6 +33,22 @@ impl Framebuffer {
         }
     }
 
+    /// Reconfigure the framebuffer while retaining its pixel allocation when
+    /// the output dimensions are unchanged. Rasterization overwrites every
+    /// pixel, so an existing same-sized buffer does not need to be cleared.
+    pub fn ensure_size(&mut self, width: usize, height: usize) {
+        assert!(
+            width > 0 && height > 0,
+            "framebuffer dimensions must be positive"
+        );
+        if self.width == width && self.height == height {
+            return;
+        }
+        self.width = width;
+        self.height = height;
+        self.pixels.resize(width * height, Rgb8::new(0, 0, 0));
+    }
+
     pub fn width(&self) -> usize {
         self.width
     }
@@ -186,6 +202,18 @@ mod tests {
         rasterize_world_into(&world, &camera, &mut frame);
 
         assert_eq!(frame.get(0, 0), value_to_rgb(1.0));
+    }
+
+    #[test]
+    fn ensure_size_reuses_storage_for_same_dimensions() {
+        let mut frame = Framebuffer::new(2, 2);
+        let allocation = frame.pixels.as_ptr();
+
+        frame.ensure_size(2, 2);
+
+        assert_eq!(frame.pixels.as_ptr(), allocation);
+        assert_eq!(frame.width(), 2);
+        assert_eq!(frame.height(), 2);
     }
 
     #[test]
