@@ -1215,10 +1215,15 @@ impl App {
         {
             let crate::sim::experiment_model::GeometrySpec::RasterGrid(grid) =
                 &self.workbench.draft().geometry;
-            let x = usize::from(local.column) * grid.width as usize
-                / usize::from(viewport.width.max(1));
-            let y =
-                usize::from(local.row) * grid.height as usize / usize::from(viewport.height.max(1));
+            let Some(point) = crate::input::map_viewport_point(
+                &event,
+                viewport,
+                [grid.width, grid.height],
+            ) else {
+                return false;
+            };
+            let x = point.x as usize;
+            let y = point.y as usize;
             let tile = y.saturating_mul(grid.width as usize).saturating_add(x);
             let value = match action {
                 crate::input::MouseAction::Erase => 0.0,
@@ -2284,9 +2289,10 @@ fn handle_remote_terminal_event<W: std::io::Write>(
                 *next_input_sequence = (*next_input_sequence).wrapping_add(1).max(1);
                 return Ok(false);
             }
-            if app.handle_mouse(mouse, tracker) {
+            let applied = app.handle_mouse(mouse, tracker);
+            if crate::input::should_forward_mouse_event(&mouse, applied) {
                 if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
-                    eprintln!("E2E_MOUSE_APPLIED");
+                    eprintln!("E2E_MOUSE_FORWARDED applied={applied}");
                 }
                 if let Some((area, _)) = app.viewport_geometry() {
                     let mut local = mouse;

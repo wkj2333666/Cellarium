@@ -1,4 +1,5 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+use ratatui::layout::Rect;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Command {
@@ -102,6 +103,33 @@ pub enum MouseAction {
     Inspect,
     Paint,
     Erase,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct LogicalPoint {
+    pub x: u32,
+    pub y: u32,
+}
+
+pub fn map_viewport_point(
+    event: &MouseEvent,
+    viewport: Rect,
+    logical_size: [u32; 2],
+) -> Option<LogicalPoint> {
+    let x = u32::from(event.column).checked_sub(u32::from(viewport.x))?;
+    let y = u32::from(event.row).checked_sub(u32::from(viewport.y))?;
+    if x >= u32::from(viewport.width) || y >= u32::from(viewport.height) {
+        return None;
+    }
+    Some(LogicalPoint {
+        x: (x * logical_size[0] / u32::from(viewport.width)).min(logical_size[0].saturating_sub(1)),
+        y: (y * logical_size[1] / u32::from(viewport.height)).min(logical_size[1].saturating_sub(1)),
+    })
+}
+
+pub fn should_forward_mouse_event(event: &MouseEvent, applied: bool) -> bool {
+    applied
+        || matches!(event.kind, MouseEventKind::Down(_) | MouseEventKind::Up(_))
 }
 
 pub fn translate_key(event: &KeyEvent) -> Option<Command> {
@@ -366,5 +394,47 @@ mod tests {
             tracker.update(&drag, 10, 8),
             Some(MouseAction::Pan { dx: 1.0, dy: 0.0 })
         );
+    }
+
+    #[test]
+    fn middle_boundaries_are_forwarded_even_without_an_immediate_action() {
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Middle),
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        let up = MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Middle),
+            column: 4,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert!(should_forward_mouse_event(&down, false));
+        assert!(should_forward_mouse_event(&up, false));
+        assert!(!should_forward_mouse_event(
+            &MouseEvent {
+                kind: MouseEventKind::Moved,
+                ..down
+            },
+            false
+        ));
+    }
+
+    #[test]
+    fn viewport_mapping_matches_canvas_logical_coordinates() {
+        let viewport = Rect::new(10, 4, 20, 10);
+        let event = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 29,
+            row: 13,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(
+            map_viewport_point(&event, viewport, [256, 128]),
+            Some(LogicalPoint { x: 243, y: 115 })
+        );
+        let outside = MouseEvent { column: 9, ..event };
+        assert_eq!(map_viewport_point(&outside, viewport, [256, 128]), None);
     }
 }

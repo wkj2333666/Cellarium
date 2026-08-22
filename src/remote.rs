@@ -776,6 +776,33 @@ mod tests {
                     modifiers: KeyModifiers::ALT,
                 }),
             },
+            RemoteMessage::Input {
+                sequence: 14,
+                input: InputMessage::Mouse(MouseEvent {
+                    kind: MouseEventKind::Down(MouseButton::Middle),
+                    column: 8,
+                    row: 9,
+                    modifiers: KeyModifiers::NONE,
+                }),
+            },
+            RemoteMessage::Input {
+                sequence: 15,
+                input: InputMessage::Mouse(MouseEvent {
+                    kind: MouseEventKind::Drag(MouseButton::Middle),
+                    column: 10,
+                    row: 9,
+                    modifiers: KeyModifiers::NONE,
+                }),
+            },
+            RemoteMessage::Input {
+                sequence: 16,
+                input: InputMessage::Mouse(MouseEvent {
+                    kind: MouseEventKind::Up(MouseButton::Middle),
+                    column: 10,
+                    row: 9,
+                    modifiers: KeyModifiers::NONE,
+                }),
+            },
         ];
         for message in messages {
             let mut bytes = Vec::new();
