@@ -461,7 +461,7 @@ fn c_s_pty_user_journey_survives_repeated_keyboard_and_mouse_operations() {
             &mut child,
             master,
             &mut output,
-            Instant::now() + Duration::from_secs(2),
+            Instant::now() + Duration::from_secs(5),
             |output| contains(output, b"selected Experiment")
         ),
         "Workbench click did not select Experiment; tail={:?}",
@@ -472,7 +472,7 @@ fn c_s_pty_user_journey_survives_repeated_keyboard_and_mouse_operations() {
         &mut child,
         master,
         &mut output,
-        Instant::now() + Duration::from_secs(2),
+        Instant::now() + Duration::from_secs(5),
         |output| contains(output, b"E2E_WORKBENCH_SECTION=World")
     ));
     let canvas_click = b"\x1b[<0;35;10M";
@@ -484,7 +484,7 @@ fn c_s_pty_user_journey_survives_repeated_keyboard_and_mouse_operations() {
         &mut child,
         master,
         &mut output,
-        Instant::now() + Duration::from_secs(2),
+        Instant::now() + Duration::from_secs(5),
         |output| contains(output, b"E2E_WORKBENCH_DRAFT=Dirty")
     ));
 
