@@ -455,8 +455,12 @@ fn c_s_pty_user_journey_survives_repeated_keyboard_and_mouse_operations() {
     for index in 0..32_u16 {
         let column = 3 + (index % 24);
         let row = 3 + (index % 12);
-        let event = format!("\x1b[<0;{column};{row}M\x1b[<32;{column};{row}M\x1b[<0;{column};{row}m");
-        assert_eq!(unsafe { libc::write(master, event.as_ptr().cast(), event.len()) }, event.len() as isize);
+        let event =
+            format!("\x1b[<0;{column};{row}M\x1b[<32;{column};{row}M\x1b[<0;{column};{row}m");
+        assert_eq!(
+            unsafe { libc::write(master, event.as_ptr().cast(), event.len()) },
+            event.len() as isize
+        );
     }
     assert_eq!(unsafe { libc::write(master, b" ".as_ptr().cast(), 1) }, 1);
     let recovered = pump_until(
@@ -464,9 +468,12 @@ fn c_s_pty_user_journey_survives_repeated_keyboard_and_mouse_operations() {
         master,
         &mut output,
         Instant::now() + Duration::from_secs(8),
-        |output| contains(output, b"paused")
+        |output| contains(output, b"paused"),
     );
-    assert!(recovered, "PTY stopped responding after repeated user input");
+    assert!(
+        recovered,
+        "PTY stopped responding after repeated user input"
+    );
 
     assert_eq!(unsafe { libc::write(master, b"q".as_ptr().cast(), 1) }, 1);
     let status = pump_until_exit(
@@ -506,9 +513,8 @@ fn local_pty_user_journey_survives_a_burst_of_input() {
     for index in 0..32_u16 {
         let column = 3 + (index % 24);
         let row = 3 + (index % 12);
-        let event = format!(
-            "\x1b[<0;{column};{row}M\x1b[<32;{column};{row}M\x1b[<0;{column};{row}m"
-        );
+        let event =
+            format!("\x1b[<0;{column};{row}M\x1b[<32;{column};{row}M\x1b[<0;{column};{row}m");
         assert_eq!(
             unsafe { libc::write(master, event.as_ptr().cast(), event.len()) },
             event.len() as isize

@@ -120,10 +120,16 @@ fn draw_impl(
     // clear stale cells and clip the help text to the actual terminal width.
     frame.render_widget(Clear, chunks[1]);
     frame.render_widget(
-        Paragraph::new(vec![status, Line::from(Span::styled(help, Style::default()
-            .fg(Color::Rgb(128, 148, 180))
-            .add_modifier(Modifier::DIM)))])
-            .style(Style::default().bg(Color::Rgb(12, 18, 32))),
+        Paragraph::new(vec![
+            status,
+            Line::from(Span::styled(
+                help,
+                Style::default()
+                    .fg(Color::Rgb(128, 148, 180))
+                    .add_modifier(Modifier::DIM),
+            )),
+        ])
+        .style(Style::default().bg(Color::Rgb(12, 18, 32))),
         chunks[1],
     );
     fresh_graphics

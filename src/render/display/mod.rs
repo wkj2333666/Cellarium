@@ -367,6 +367,7 @@ impl KittySharedDisplay {
                 frame.render_widget(
                     GraphicsCommandWidget {
                         command: Some(&command),
+                        skip_area: true,
                     },
                     area,
                 );
@@ -388,7 +389,13 @@ impl KittySharedDisplay {
             };
         }
         let Some(shared) = state.ready.take() else {
-            frame.render_widget(GraphicsCommandWidget { command: None }, area);
+            frame.render_widget(
+                GraphicsCommandWidget {
+                    command: None,
+                    skip_area: true,
+                },
+                area,
+            );
             return RenderStatus {
                 rendered: state.displayed_id.is_some(),
                 fresh: false,
@@ -403,6 +410,7 @@ impl KittySharedDisplay {
         frame.render_widget(
             GraphicsCommandWidget {
                 command: Some(&command),
+                skip_area: true,
             },
             area,
         );
@@ -427,6 +435,7 @@ impl Drop for KittySharedDisplay {
 
 struct GraphicsCommandWidget<'a> {
     command: Option<&'a str>,
+    skip_area: bool,
 }
 
 impl ratatui::widgets::Widget for GraphicsCommandWidget<'_> {
@@ -434,10 +443,12 @@ impl ratatui::widgets::Widget for GraphicsCommandWidget<'_> {
         use ratatui::buffer::CellDiffOption;
         use std::num::NonZeroU16;
 
-        for y in area.top()..area.bottom() {
-            for x in area.left()..area.right() {
-                if let Some(cell) = buffer.cell_mut((x, y)) {
-                    cell.set_diff_option(CellDiffOption::Skip);
+        if self.skip_area {
+            for y in area.top()..area.bottom() {
+                for x in area.left()..area.right() {
+                    if let Some(cell) = buffer.cell_mut((x, y)) {
+                        cell.set_diff_option(CellDiffOption::Skip);
+                    }
                 }
             }
         }
@@ -688,6 +699,7 @@ impl ViewportDisplay {
             frame.render_widget(
                 GraphicsCommandWidget {
                     command: Some(kitty_delete_all_images_command()),
+                    skip_area: false,
                 },
                 area,
             );

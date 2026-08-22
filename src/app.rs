@@ -1636,10 +1636,7 @@ where
                         .ok()
                         .filter(|value| *value > 0)
                         .unwrap_or(height as usize * 2);
-                    app.set_viewport(
-                        Rect::new(0, 0, width, height),
-                        [frame_width, frame_height],
-                    );
+                    app.set_viewport(Rect::new(0, 0, width, height), [frame_width, frame_height]);
                 }
                 Ok(RemoteMessage::Input { sequence, input }) => {
                     match input {
@@ -2506,57 +2503,57 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
         }
         for event in events {
             match event {
-                    Event::Key(key) => {
-                        input_seen = true;
-                        if app.handle_workbench_growth_key(key) {
-                            continue;
-                        }
-                        if app.expression_editing() {
-                            app.handle_expression_key(key);
-                            continue;
-                        }
-                        if app.mode() == AppMode::Workbench
-                            && app.workbench().section()
-                                == crate::workbench::WorkbenchSection::Experiment
-                            && matches!(
-                                key.code,
-                                KeyCode::Enter | KeyCode::Char('A') | KeyCode::Char('a')
-                            )
-                        {
-                            let _ = app.handle_workbench_ui(UiCommand::ApplyDraft);
-                            continue;
-                        }
-                        if app.mode() == AppMode::Workbench
-                            && let Some(ui_command) = crate::input::translate_ui_key(&key)
-                        {
-                            let _ = app.handle_workbench_ui(ui_command);
-                            continue;
-                        }
-                        if let Some(command) = crate::input::translate_key(&key) {
-                            if command == Command::Quit {
-                                quit_requested = true;
-                                break;
-                            }
-                            if command == Command::Step {
-                                deferred_step = true;
-                                continue;
-                            }
-                            if command == Command::TogglePause {
-                                pause_command_seen = true;
-                            }
-                            app.handle_command(command);
-                        }
+                Event::Key(key) => {
+                    input_seen = true;
+                    if app.handle_workbench_growth_key(key) {
+                        continue;
                     }
-                    Event::Mouse(mouse) => {
-                        input_seen = true;
-                        app.handle_mouse(mouse, &mut tracker);
+                    if app.expression_editing() {
+                        app.handle_expression_key(key);
+                        continue;
                     }
-                    Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
-                    Event::Paste(_) => {}
+                    if app.mode() == AppMode::Workbench
+                        && app.workbench().section()
+                            == crate::workbench::WorkbenchSection::Experiment
+                        && matches!(
+                            key.code,
+                            KeyCode::Enter | KeyCode::Char('A') | KeyCode::Char('a')
+                        )
+                    {
+                        let _ = app.handle_workbench_ui(UiCommand::ApplyDraft);
+                        continue;
+                    }
+                    if app.mode() == AppMode::Workbench
+                        && let Some(ui_command) = crate::input::translate_ui_key(&key)
+                    {
+                        let _ = app.handle_workbench_ui(ui_command);
+                        continue;
+                    }
+                    if let Some(command) = crate::input::translate_key(&key) {
+                        if command == Command::Quit {
+                            quit_requested = true;
+                            break;
+                        }
+                        if command == Command::Step {
+                            deferred_step = true;
+                            continue;
+                        }
+                        if command == Command::TogglePause {
+                            pause_command_seen = true;
+                        }
+                        app.handle_command(command);
+                    }
                 }
-                if quit_requested {
-                    break;
+                Event::Mouse(mouse) => {
+                    input_seen = true;
+                    app.handle_mouse(mouse, &mut tracker);
                 }
+                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
+                Event::Paste(_) => {}
+            }
+            if quit_requested {
+                break;
+            }
         }
         if deferred_step && (!app.paused() || (initially_paused && !pause_command_seen)) {
             app.handle_command(Command::Step);
