@@ -19,8 +19,8 @@ use std::thread::JoinHandle;
 #[cfg(unix)]
 use std::time::{Duration, Instant};
 
-use crate::render::raster::Framebuffer;
-use crate::render::{camera::Camera, raster::rasterize_world_into_while};
+use crate::render::raster::{Framebuffer, Rgb8, rasterize_world_into_while};
+use crate::render::{camera::Camera, workbench_graphics::GraphicsFrame};
 use crate::sim::world::World;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -846,6 +846,30 @@ impl ViewportDisplay {
             area,
         );
         true
+    }
+
+    pub fn render_graphics(
+        &self,
+        frame: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        graphics: &GraphicsFrame,
+    ) -> bool {
+        let mut framebuffer = Framebuffer::new(graphics.width as usize, graphics.height as usize);
+        for y in 0..graphics.height as usize {
+            for x in 0..graphics.width as usize {
+                let offset = (y * graphics.width as usize + x) * 4;
+                framebuffer.set(
+                    x,
+                    y,
+                    Rgb8::new(
+                        graphics.rgba[offset],
+                        graphics.rgba[offset + 1],
+                        graphics.rgba[offset + 2],
+                    ),
+                );
+            }
+        }
+        self.render(frame, area, &framebuffer)
     }
 
     pub fn render_async(
