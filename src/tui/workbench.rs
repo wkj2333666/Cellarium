@@ -4,7 +4,7 @@ use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Paragraph, Widget};
+use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct WorkbenchLayout {
@@ -198,7 +198,8 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
         frame.render_widget(ChannelCanvas::new(state), canvas_inner);
     } else {
         frame.render_widget(
-            Paragraph::new(canvas_lines.into_iter().map(Line::from).collect::<Vec<_>>()),
+            Paragraph::new(canvas_lines.into_iter().map(Line::from).collect::<Vec<_>>())
+                .wrap(Wrap { trim: false }),
             canvas_inner,
         );
     }
@@ -231,7 +232,9 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             Line::from("W leave Workbench · ? help"),
         ];
         frame.render_widget(
-            Paragraph::new(lines).block(panel(
+            Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .block(panel(
                 " Inspector ",
                 state.focus() == WorkbenchFocus::Inspector,
             )),

@@ -281,7 +281,6 @@ pub struct KittySharedDisplay {
     state: Arc<Mutex<KittySharedState>>,
     queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size)>,
     worker: Option<JoinHandle<()>>,
-    fallback: PixelDisplay,
 }
 
 #[cfg(unix)]
@@ -332,13 +331,11 @@ impl KittySharedDisplay {
             state,
             queue,
             worker: Some(worker),
-            fallback: kitty_pixel_display(font_size),
         }
     }
 
     fn submit(&self, image: DynamicImage, size: ratatui::layout::Size) {
         if self.state.lock().map_or(true, |state| state.failed) {
-            self.fallback.submit(image, size);
             return;
         }
         self.queue.submit((image, size));
@@ -346,7 +343,10 @@ impl KittySharedDisplay {
 
     fn render(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) -> RenderStatus {
         let Ok(mut state) = self.state.lock() else {
-            return self.fallback.render(frame, area);
+            return RenderStatus {
+                rendered: false,
+                fresh: false,
+            };
         };
         state
             .retained
@@ -371,12 +371,21 @@ impl KittySharedDisplay {
                     area,
                 );
                 return RenderStatus {
-                    rendered: true,
+                    // Let ViewportDisplay::render immediately draw its
+                    // half-block fallback in this same terminal frame. The
+                    // previous inline PixelDisplay fallback could enqueue a
+                    // full-resolution Kitty image when the terminal was not
+                    // consuming shared-memory frames, filling the PTY and
+                    // making input (including q) appear dead.
+                    rendered: false,
                     fresh: false,
                 };
             }
             drop(state);
-            return self.fallback.render(frame, area);
+            return RenderStatus {
+                rendered: false,
+                fresh: false,
+            };
         }
         let Some(shared) = state.ready.take() else {
             frame.render_widget(KittySharedWidget { command: None }, area);
@@ -501,17 +510,6 @@ impl PixelDisplay {
             fresh: ready != displayed,
         }
     }
-}
-
-#[cfg(unix)]
-fn kitty_pixel_display(font_size: (u16, u16)) -> PixelDisplay {
-    #[allow(deprecated)]
-    let mut picker = ratatui_image::picker::Picker::from_fontsize(ratatui_image::FontSize::new(
-        font_size.0,
-        font_size.1,
-    ));
-    picker.set_protocol_type(ratatui_image::picker::ProtocolType::Kitty);
-    PixelDisplay::new(picker)
 }
 
 #[cfg(unix)]
@@ -1166,7 +1164,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn shared_memory_failure_routes_future_frames_to_inline_kitty() {
+    fn shared_memory_failure_drops_future_frames_for_safe_half_block_fallback() {
         let display = KittySharedDisplay::new((8, 16));
         display.state.lock().unwrap().failed = true;
         display.submit(
@@ -1174,11 +1172,8 @@ mod tests {
             ratatui::layout::Size::new(1, 1),
         );
 
-        let deadline = Instant::now() + Duration::from_secs(1);
-        while display.fallback.protocol.lock().unwrap().is_none() && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(5));
-        }
-        assert!(display.fallback.protocol.lock().unwrap().is_some());
+        let (lock, _) = &*display.queue.state;
+        assert!(lock.lock().unwrap().value.is_none());
     }
 
     #[cfg(unix)]

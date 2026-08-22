@@ -2,7 +2,7 @@ use crate::app::App;
 use crate::render::display::{AsyncRasterizer, RasterGeneration, ViewportDisplay};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 pub mod workbench;
 
 const MINIMUM_KERNEL_PREVIEW_ROWS: usize = 8;
@@ -105,24 +105,22 @@ fn draw_impl(
         render_help(frame, outer);
     }
 
-    let status = Line::from(vec![
-        Span::styled(
-            status_text(app, display),
-            Style::default().fg(Color::Rgb(190, 215, 255)),
-        ),
-        Span::raw("  "),
-        Span::styled(
-            "[Space] pause  [N] step  [1] Conway  [2] Lenia  [R] reset  [A] random  [C] clear  [Q] quit  L-drag paint  R-drag erase  M-drag pan  wheel zoom",
-            Style::default()
-                .fg(Color::Rgb(128, 148, 180))
-                .add_modifier(Modifier::DIM),
-        ),
-    ]);
+    let status = Line::from(Span::styled(
+        truncate_chars(&status_text(app, display), chunks[1].width as usize),
+        Style::default().fg(Color::Rgb(190, 215, 255)),
+    ));
+    let help = truncate_chars(
+        "[W] editor  [Space] pause  [N] step  [1/2] rule  [R] reset  [A] random  [C] clear  [Q] quit  L/R paint/erase  M pan  wheel zoom",
+        chunks[1].width as usize,
+    );
     // Keep the ordinary terminal status row separate from the Kitty image:
     // clear stale cells and clip the help text to the actual terminal width.
     frame.render_widget(Clear, chunks[1]);
     frame.render_widget(
-        Paragraph::new(status).style(Style::default().bg(Color::Rgb(12, 18, 32))),
+        Paragraph::new(vec![status, Line::from(Span::styled(help, Style::default()
+            .fg(Color::Rgb(128, 148, 180))
+            .add_modifier(Modifier::DIM)))])
+            .style(Style::default().bg(Color::Rgb(12, 18, 32))),
         chunks[1],
     );
     fresh_graphics
@@ -146,8 +144,8 @@ fn draw_footer(
     );
     let row2 = "[T] section  [Tab] focus  [Ctrl+Z/Y] undo/redo  [Ctrl+Enter] Apply  [Ctrl+S/E/O] files  [W] simulate  [?] help";
     let lines = vec![
-        Line::from(fit_segments(area.width as usize, &[&row1])),
-        Line::from(fit_segments(area.width as usize, &[row2])),
+        Line::from(truncate_chars(&row1, area.width as usize)),
+        Line::from(truncate_chars(row2, area.width as usize)),
     ];
     frame.render_widget(
         Paragraph::new(lines).style(
@@ -157,18 +155,6 @@ fn draw_footer(
         ),
         area,
     );
-}
-
-fn fit_segments(width: usize, segments: &[&str]) -> String {
-    let mut result = String::new();
-    for segment in segments {
-        let separator = if result.is_empty() { "" } else { "  " };
-        if result.chars().count() + separator.chars().count() + segment.chars().count() <= width {
-            result.push_str(separator);
-            result.push_str(segment);
-        }
-    }
-    result
 }
 
 fn render_kernel_preview(frame: &mut ratatui::Frame, app: &App, area: ratatui::layout::Rect) {
@@ -223,6 +209,7 @@ fn render_help(frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         Line::from("Kernel: K select · Tab parameter · +/- adjust · G regenerate · V preview"),
         Line::from("Panels: T cycle Overview / Rule / Kernel / Topology / Errors"),
         Line::from("Topology: polygon drafts validate edges, seams, coverage, and compile to CSR"),
+        Line::from("W enters the editor/workbench; W again returns to simulation"),
         Line::from("Growth: use let, if/else, booleans, math calls; the plot appears in Rule"),
         Line::from("? or Esc closes this help"),
     ];
@@ -387,7 +374,7 @@ fn editor_panel_lines(app: &App, max_width: usize, max_height: usize) -> Vec<Str
     let (snapshot_rate, graphics_rate) = app.remote_transport_rates();
     let performance = app.performance();
     let world = app.world();
-    let mut lines = vec![
+    let lines = vec![
         format!("{} WORLD", panel_marker(app, crate::app::Panel::Overview)),
         format!("size {}×{} · scalar channel", world.width(), world.height()),
         "boundary periodic · editable viewport".to_string(),
@@ -474,10 +461,24 @@ fn editor_panel_lines(app: &App, max_width: usize, max_height: usize) -> Vec<Str
         app.backend_error().unwrap_or("none").to_string(),
         "[T] next panel · mouse targets viewport".to_string(),
     ];
-    lines.truncate(max_height);
     lines
         .into_iter()
-        .map(|line| truncate_chars(&line, max_width))
+        .flat_map(|line| wrap_chars(&line, max_width))
+        .take(max_height)
+        .collect()
+}
+
+fn wrap_chars(value: &str, width: usize) -> Vec<String> {
+    if width == 0 {
+        return Vec::new();
+    }
+    let chars = value.chars().collect::<Vec<_>>();
+    if chars.is_empty() {
+        return vec![String::new()];
+    }
+    chars
+        .chunks(width)
+        .map(|chunk| chunk.iter().collect())
         .collect()
 }
 
@@ -536,6 +537,7 @@ fn render_editor_panel(frame: &mut ratatui::Frame, app: &App, area: ratatui::lay
     frame.render_widget(
         Paragraph::new(lines)
             .block(block)
+            .wrap(Wrap { trim: false })
             .style(Style::default().bg(Color::Rgb(10, 15, 28))),
         area,
     );

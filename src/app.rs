@@ -1609,12 +1609,25 @@ where
                     });
                     snapshot_tx.store(app.remote_snapshot());
                 }
-                Ok(RemoteMessage::Viewport { width, height }) => {
+                Ok(RemoteMessage::Viewport {
+                    width,
+                    height,
+                    frame_width,
+                    frame_height,
+                }) => {
                     let width = width.max(1);
                     let height = height.max(1);
+                    let frame_width = usize::try_from(frame_width)
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .unwrap_or(width as usize);
+                    let frame_height = usize::try_from(frame_height)
+                        .ok()
+                        .filter(|value| *value > 0)
+                        .unwrap_or(height as usize * 2);
                     app.set_viewport(
                         Rect::new(0, 0, width, height),
-                        [width as usize, height as usize * 2],
+                        [frame_width, frame_height],
                     );
                 }
                 Ok(RemoteMessage::Input { sequence, input }) => {
@@ -2017,14 +2030,24 @@ where
             .saturating_sub(now.duration_since(last_render))
             .min(Duration::from_millis(5));
         if crossterm::event::poll(wait)? {
-            if handle_remote_terminal_event(
-                app,
-                &mut tracker,
-                &writer,
-                &mut next_input_sequence,
-                crossterm::event::read()?,
-            )? {
-                return Ok(());
+            // A drag can enqueue dozens of mouse reports before the next
+            // render. Read a bounded batch so control keys (especially q/Esc)
+            // are not stranded behind one-event-per-frame input handling.
+            // The cap preserves fairness with snapshots and rendering under
+            // an intentionally noisy terminal.
+            for _ in 0..256 {
+                if handle_remote_terminal_event(
+                    app,
+                    &mut tracker,
+                    &writer,
+                    &mut next_input_sequence,
+                    crossterm::event::read()?,
+                )? {
+                    return Ok(());
+                }
+                if !crossterm::event::poll(Duration::from_millis(10))? {
+                    break;
+                }
             }
             last_render = Instant::now() - render_interval;
         }
@@ -2037,7 +2060,7 @@ where
             app.graphics_rate = graphics_meter.rate();
             let viewport = app.viewport_geometry().map(|(_, frame)| frame);
             if viewport != last_viewport {
-                if let Some((area, _frame_size)) = app.viewport_geometry() {
+                if let Some((area, frame_size)) = app.viewport_geometry() {
                     let mut guard = writer
                         .lock()
                         .map_err(|_| std::io::Error::other("SSH writer mutex poisoned"))?;
@@ -2046,6 +2069,8 @@ where
                         &RemoteMessage::Viewport {
                             width: area.width,
                             height: area.height,
+                            frame_width: frame_size[0].try_into().unwrap_or(u32::MAX),
+                            frame_height: frame_size[1].try_into().unwrap_or(u32::MAX),
                         },
                     )
                     .map_err(std::io::Error::other)?;
@@ -2154,6 +2179,11 @@ fn handle_remote_terminal_event<W: std::io::Write>(
                 return Ok(false);
             }
             if let Some(command) = crate::input::translate_key(&key) {
+                if command == Command::ToggleWorkbench
+                    && std::env::var_os("CELLARIUM_E2E_TRACE").is_some()
+                {
+                    eprintln!("E2E_WORKBENCH_TOGGLE");
+                }
                 send_remote_input(writer, next_input_sequence, InputMessage::Command(command))?;
                 if command == Command::Quit {
                     return Ok(true);
@@ -2436,6 +2466,14 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
     let mut simulation_backlog = Duration::ZERO;
     let mut last_iteration = Instant::now();
     let mut last_render = last_iteration;
+    let (event_tx, event_rx) = std::sync::mpsc::sync_channel::<Event>(4096);
+    std::thread::spawn(move || {
+        while let Ok(event) = crossterm::event::read() {
+            if event_tx.send(event).is_err() {
+                break;
+            }
+        }
+    });
 
     loop {
         let now = Instant::now();
@@ -2445,49 +2483,85 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
         let wait = render_interval
             .saturating_sub(now.duration_since(last_render))
             .min(Duration::from_millis(5));
-        if crossterm::event::poll(wait)? {
-            match crossterm::event::read()? {
-                Event::Key(key) => {
-                    if app.handle_workbench_growth_key(key) {
-                        continue;
-                    }
-                    if app.expression_editing() {
-                        app.handle_expression_key(key);
-                        continue;
-                    }
-                    if app.mode() == AppMode::Workbench
-                        && app.workbench().section()
-                            == crate::workbench::WorkbenchSection::Experiment
-                        && matches!(
-                            key.code,
-                            KeyCode::Enter | KeyCode::Char('A') | KeyCode::Char('a')
-                        )
-                    {
-                        let _ = app.handle_workbench_ui(UiCommand::ApplyDraft);
-                        continue;
-                    }
-                    if app.mode() == AppMode::Workbench
-                        && let Some(ui_command) = crate::input::translate_ui_key(&key)
-                    {
-                        let _ = app.handle_workbench_ui(ui_command);
-                        continue;
-                    }
-                    if let Some(command) = crate::input::translate_key(&key) {
-                        if command == Command::Quit {
-                            if let Some(path) = save_path {
-                                app.save_experiment(path).map_err(std::io::Error::other)?;
-                            }
-                            break;
+        let mut quit_requested = false;
+        let mut input_seen = false;
+        let initially_paused = app.paused();
+        let mut deferred_step = false;
+        let mut pause_command_seen = false;
+        let mut events = Vec::with_capacity(256);
+        if let Ok(event) = event_rx.recv_timeout(wait) {
+            events.push(event);
+            events.extend(event_rx.try_iter().take(255));
+        }
+        for event in events {
+            match event {
+                    Event::Key(key) => {
+                        input_seen = true;
+                        if app.handle_workbench_growth_key(key) {
+                            continue;
                         }
-                        app.handle_command(command);
+                        if app.expression_editing() {
+                            app.handle_expression_key(key);
+                            continue;
+                        }
+                        if app.mode() == AppMode::Workbench
+                            && app.workbench().section()
+                                == crate::workbench::WorkbenchSection::Experiment
+                            && matches!(
+                                key.code,
+                                KeyCode::Enter | KeyCode::Char('A') | KeyCode::Char('a')
+                            )
+                        {
+                            let _ = app.handle_workbench_ui(UiCommand::ApplyDraft);
+                            continue;
+                        }
+                        if app.mode() == AppMode::Workbench
+                            && let Some(ui_command) = crate::input::translate_ui_key(&key)
+                        {
+                            let _ = app.handle_workbench_ui(ui_command);
+                            continue;
+                        }
+                        if let Some(command) = crate::input::translate_key(&key) {
+                            if command == Command::Quit {
+                                quit_requested = true;
+                                break;
+                            }
+                            if command == Command::Step {
+                                deferred_step = true;
+                                continue;
+                            }
+                            if command == Command::TogglePause {
+                                pause_command_seen = true;
+                            }
+                            app.handle_command(command);
+                        }
                     }
+                    Event::Mouse(mouse) => {
+                        input_seen = true;
+                        app.handle_mouse(mouse, &mut tracker);
+                    }
+                    Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
+                    Event::Paste(_) => {}
                 }
-                Event::Mouse(mouse) => {
-                    app.handle_mouse(mouse, &mut tracker);
+                if quit_requested {
+                    break;
                 }
-                Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
-                Event::Paste(_) => {}
+        }
+        if deferred_step && (!app.paused() || (initially_paused && !pause_command_seen)) {
+            app.handle_command(Command::Step);
+        }
+        if quit_requested {
+            if let Some(path) = save_path {
+                app.save_experiment(path).map_err(std::io::Error::other)?;
             }
+            break;
+        }
+
+        if input_seen {
+            // Avoid blocking on a large synchronous terminal diff while a
+            // drag/key burst is still arriving. The next iteration drains
+            // more input before the next presentation.
+            continue;
         }
 
         if app.paused() {

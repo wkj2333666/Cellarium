@@ -65,6 +65,7 @@ fn spawn_on_pty(slave: i32) -> std::process::Child {
         .stdout(stdout)
         .stderr(stderr)
         .env("TERM", "xterm-256color")
+        .env("CELLARIUM_E2E_TRACE", "1")
         .env_remove("TERM_PROGRAM")
         .env_remove("WEZTERM_EXECUTABLE")
         .env_remove("KONSOLE_VERSION")
@@ -257,6 +258,7 @@ fn nonresponsive_terminal_startup_accepts_quit_and_restores_terminal() {
 
     // Keep this terminal-startup regression independent of CPU simulation
     // speed on runners without CUDA.
+    thread::sleep(Duration::from_millis(100));
     assert_eq!(unsafe { libc::write(master, b" ".as_ptr().cast(), 1) }, 1);
     let mut output = Vec::new();
     let rendered = pump_until(
@@ -404,6 +406,137 @@ fn local_kitty_connect_keeps_control_responsive_with_shared_memory_frames() {
         panic!("C/S viewer ignored q after shared-memory rendering");
     };
     assert!(status.success(), "C/S viewer exited with {status}");
+}
+
+#[test]
+fn c_s_pty_user_journey_survives_repeated_keyboard_and_mouse_operations() {
+    let fixture = server_connector_fixture();
+    let invocation = fixture.join("unused-invocation");
+    let (master, slave) = open_pty();
+    set_nonblocking(master);
+    let mut child = spawn_connect_on_pty(slave, &fixture, &invocation, None);
+    unsafe { libc::close(slave) };
+
+    let mut output = Vec::new();
+    assert!(pump_until(
+        &mut child,
+        master,
+        &mut output,
+        Instant::now() + Duration::from_secs(8),
+        |output| contains(output, b"Cellarium")
+    ));
+
+    // The editor entry must be discoverable and must not require a mouse
+    // click on the side panel: this is the same key a user sees in the
+    // footer/help text.
+    assert_eq!(unsafe { libc::write(master, b"w".as_ptr().cast(), 1) }, 1);
+    assert!(pump_until(
+        &mut child,
+        master,
+        &mut output,
+        Instant::now() + Duration::from_secs(2),
+        |output| contains(output, b"Workbench") && contains(output, b"World")
+    ));
+
+    // Return to simulation, then exercise the high-frequency paths. SGR
+    // mouse events use terminal coordinates (1-based); the viewport begins
+    // inside a bordered panel, so this also covers the origin subtraction.
+    assert_eq!(unsafe { libc::write(master, b"w".as_ptr().cast(), 1) }, 1);
+    for key in b" tnrac12kgv" {
+        assert_eq!(unsafe { libc::write(master, [*key].as_ptr().cast(), 1) }, 1);
+    }
+    for _ in 0..80 {
+        assert_eq!(unsafe { libc::write(master, b"n".as_ptr().cast(), 1) }, 1);
+    }
+    for index in 0..32_u16 {
+        let column = 3 + (index % 24);
+        let row = 3 + (index % 12);
+        let event = format!("\x1b[<0;{column};{row}M\x1b[<32;{column};{row}M\x1b[<0;{column};{row}m");
+        assert_eq!(unsafe { libc::write(master, event.as_ptr().cast(), event.len()) }, event.len() as isize);
+    }
+    assert_eq!(unsafe { libc::write(master, b" ".as_ptr().cast(), 1) }, 1);
+    let recovered = pump_until(
+        &mut child,
+        master,
+        &mut output,
+        Instant::now() + Duration::from_secs(8),
+        |output| contains(output, b"paused")
+    );
+    assert!(recovered, "PTY stopped responding after repeated user input");
+
+    assert_eq!(unsafe { libc::write(master, b"q".as_ptr().cast(), 1) }, 1);
+    let status = pump_until_exit(
+        &mut child,
+        master,
+        &mut output,
+        Instant::now() + Duration::from_secs(3),
+    );
+    unsafe { libc::close(master) };
+    let _ = std::fs::remove_dir_all(&fixture);
+    let Some(status) = status else {
+        child.kill().expect("kill stalled C/S viewer");
+        child.wait().expect("wait for stalled C/S viewer");
+        panic!("C/S viewer froze after repeated keyboard/mouse operations");
+    };
+    assert!(status.success(), "C/S viewer exited with {status}");
+}
+
+#[test]
+fn local_pty_user_journey_survives_a_burst_of_input() {
+    let (master, slave) = open_pty();
+    set_nonblocking(master);
+    let mut child = spawn_on_pty(slave);
+    unsafe { libc::close(slave) };
+
+    let mut output = Vec::new();
+    assert!(pump_until(
+        &mut child,
+        master,
+        &mut output,
+        Instant::now() + Duration::from_secs(8),
+        |output| contains(output, b"Cellarium")
+    ));
+    for _ in 0..40 {
+        assert_eq!(unsafe { libc::write(master, b"n".as_ptr().cast(), 1) }, 1);
+    }
+    for index in 0..32_u16 {
+        let column = 3 + (index % 24);
+        let row = 3 + (index % 12);
+        let event = format!(
+            "\x1b[<0;{column};{row}M\x1b[<32;{column};{row}M\x1b[<0;{column};{row}m"
+        );
+        assert_eq!(
+            unsafe { libc::write(master, event.as_ptr().cast(), event.len()) },
+            event.len() as isize
+        );
+    }
+    assert_eq!(unsafe { libc::write(master, b" ".as_ptr().cast(), 1) }, 1);
+    let recovered = pump_until(
+        &mut child,
+        master,
+        &mut output,
+        Instant::now() + Duration::from_secs(3),
+        |output| contains(output, b"paused"),
+    );
+    assert!(
+        recovered,
+        "direct-mode PTY stalled behind a burst of keyboard/mouse input; tail={:?}",
+        String::from_utf8_lossy(&output[output.len().saturating_sub(800)..])
+    );
+    assert_eq!(unsafe { libc::write(master, b"q".as_ptr().cast(), 1) }, 1);
+    let status = pump_until_exit(
+        &mut child,
+        master,
+        &mut output,
+        Instant::now() + Duration::from_secs(3),
+    );
+    unsafe { libc::close(master) };
+    let Some(status) = status else {
+        child.kill().expect("kill stalled direct viewer");
+        child.wait().expect("wait for stalled direct viewer");
+        panic!("direct viewer froze after a burst of keyboard/mouse input");
+    };
+    assert!(status.success(), "direct viewer exited with {status}");
 }
 
 #[test]

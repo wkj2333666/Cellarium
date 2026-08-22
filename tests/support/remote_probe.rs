@@ -95,6 +95,11 @@ impl ProtocolConnection {
         connection.send(RemoteMessage::Viewport {
             width: 40,
             height: 14,
+            // Deliberately use a non-half-block framebuffer. The server must
+            // use these dimensions for the same screen->world mapping as the
+            // Kitty client, otherwise a paint lands in a different cell.
+            frame_width: 320,
+            frame_height: 224,
         })?;
         Ok(connection)
     }
@@ -230,7 +235,15 @@ pub fn run_protocol_probe(host: &str) -> io::Result<ProtocolProbeReport> {
     let painted = connection.wait_for("mouse paint", SNAPSHOT_TIMEOUT, |snapshot| {
         snapshot.paused
             && snapshot.applied_input_sequence >= mouse_sequence
-            && snapshot.cells.iter().any(|value| *value >= 0.99)
+            && snapshot
+                .cells
+                .get(72 * 256 + 50)
+                .is_some_and(|value| *value >= 0.99)
+            && snapshot
+                .cells
+                .iter()
+                .enumerate()
+                .all(|(index, value)| index == 72 * 256 + 50 || *value < 0.01)
     })?;
     let mouse_latency_ms = painted.at.duration_since(mouse_started).as_secs_f64() * 1_000.0;
 

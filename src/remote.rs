@@ -5,7 +5,7 @@ use crate::sim::service::{ApplyAccepted, ApplyRejected, ApplyRequest, Diagnostic
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u8 = 7;
+pub const PROTOCOL_VERSION: u8 = 8;
 pub const MAX_FRAME_SIZE: u32 = 64 * 1024 * 1024;
 const MAGIC: [u8; 4] = *b"CLRM";
 
@@ -41,6 +41,8 @@ pub enum RemoteMessage {
     Viewport {
         width: u16,
         height: u16,
+        frame_width: u32,
+        frame_height: u32,
     },
     Quit,
     ExperimentState {
@@ -143,9 +145,16 @@ fn encode_message(message: &RemoteMessage, payload: &mut Vec<u8>) -> Result<u8, 
             encode_snapshot(snapshot, payload)?;
             Ok(3)
         }
-        RemoteMessage::Viewport { width, height } => {
+        RemoteMessage::Viewport {
+            width,
+            height,
+            frame_width,
+            frame_height,
+        } => {
             put_u16(payload, *width);
             put_u16(payload, *height);
+            put_u32(payload, *frame_width);
+            put_u32(payload, *frame_height);
             Ok(4)
         }
         RemoteMessage::Quit => Ok(5),
@@ -203,8 +212,15 @@ fn decode_message(tag: u8, payload: &[u8]) -> Result<RemoteMessage, ProtocolErro
         4 => {
             let width = cursor.u16()?;
             let height = cursor.u16()?;
+            let frame_width = cursor.u32()?;
+            let frame_height = cursor.u32()?;
             cursor.finish()?;
-            Ok(RemoteMessage::Viewport { width, height })
+            Ok(RemoteMessage::Viewport {
+                width,
+                height,
+                frame_width,
+                frame_height,
+            })
         }
         5 if payload.is_empty() => Ok(RemoteMessage::Quit),
         6 => {
@@ -769,6 +785,17 @@ mod tests {
                 Some(message)
             );
         }
+    }
+
+    #[test]
+    fn viewport_round_trip_preserves_pixel_frame_size() {
+        let message = RemoteMessage::Viewport {
+            width: 97,
+            height: 41,
+            frame_width: 1940,
+            frame_height: 1640,
+        };
+        assert_eq!(roundtrip(message.clone()), message);
     }
 
     #[test]
