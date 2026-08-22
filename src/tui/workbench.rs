@@ -155,14 +155,11 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             let editor = state.growth_editor();
             let mut lines = vec![
                 editor.signature().to_string(),
-                format!(
-                    "{} source",
-                    if state.growth_editing() {
-                        "EDITING"
-                    } else {
-                        "[E] edit"
-                    }
-                ),
+                if state.growth_editing() {
+                    "EDITING source · Esc finish".into()
+                } else {
+                    "[E] edit source".into()
+                },
             ];
             lines.extend(
                 editor
