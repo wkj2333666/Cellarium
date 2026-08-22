@@ -5,6 +5,7 @@ mod growth_editor;
 mod history;
 mod state;
 mod text_buffer;
+pub mod tiling_editor;
 
 pub use channel_editor::{ChannelView, add_channel, resolved_color};
 pub use command::DraftCommand;
