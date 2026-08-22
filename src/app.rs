@@ -188,6 +188,9 @@ impl App {
         self.workbench_display_needs_clear = false;
         needs_clear
     }
+    pub fn request_workbench_display_clear(&mut self) {
+        self.workbench_display_needs_clear = true;
+    }
     pub fn set_workbench_area(&mut self, area: Rect) {
         self.workbench_area = area;
     }
@@ -215,7 +218,11 @@ impl App {
             if inner.contains(point) {
                 let index = usize::from(point.y.saturating_sub(inner.y));
                 if let Some(section) = WorkbenchSection::ALL.get(index).copied() {
+                    let changed = self.workbench.section() != section;
                     self.workbench.select_section(section);
+                    if changed {
+                        self.request_workbench_display_clear();
+                    }
                     self.workbench_notice = Some(format!("selected {}", section.label()));
                 }
             }
@@ -977,7 +984,11 @@ impl App {
             }
             Command::NextPanel => {
                 if self.mode == AppMode::Workbench {
+                    let previous = self.workbench.section();
                     self.workbench.section_next();
+                    if self.workbench.section() != previous {
+                        self.request_workbench_display_clear();
+                    }
                     self.workbench_notice =
                         Some(format!("selected {}", self.workbench.section().label()));
                     if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
@@ -1014,7 +1025,11 @@ impl App {
             Command::Clear => self.world.clear(),
             Command::NextPanel => {
                 if self.mode == AppMode::Workbench {
+                    let previous = self.workbench.section();
                     self.workbench.section_next();
+                    if self.workbench.section() != previous {
+                        self.request_workbench_display_clear();
+                    }
                     self.workbench_notice =
                         Some(format!("selected {}", self.workbench.section().label()));
                     if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {

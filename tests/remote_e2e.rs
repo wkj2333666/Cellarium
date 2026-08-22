@@ -172,6 +172,14 @@ fn tinker_terminal_consumes_kitty_frames_and_observes_input() {
 
 #[test]
 #[ignore = "requires a configured SSH alias, PTY, and installed tinker server"]
+fn tinker_workbench_graphics_clears_when_switching_to_experiment() {
+    let host = std::env::var("CELLARIUM_E2E_HOST").unwrap_or_else(|_| "tinker".into());
+    terminal_probe::run_workbench_graphics_clear_probe(&host)
+        .expect("Workbench graphics clear probe");
+}
+
+#[test]
+#[ignore = "requires a configured SSH alias, PTY, and installed tinker server"]
 fn tinker_workbench_user_journey_applies_authoritatively() {
     let host = std::env::var("CELLARIUM_E2E_HOST").unwrap_or_else(|_| "tinker".into());
     let latency = terminal_probe::run_workbench_probe(&host).expect("Workbench PTY E2E probe");

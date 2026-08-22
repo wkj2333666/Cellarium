@@ -165,6 +165,7 @@ fn user_journey_edits_every_workbench_section_before_authoritative_apply() {
 fn mouse_navigation_selects_workbench_sections_and_focuses_panels() {
     let mut app = App::new(SimulationSpec::lenia_orbium(), 8, 8);
     app.handle_command(Command::ToggleWorkbench);
+    assert!(app.take_workbench_display_clear());
     app.set_workbench_area(ratatui::layout::Rect::new(0, 0, 180, 48));
 
     let click = |column, row| MouseEvent {
@@ -182,6 +183,7 @@ fn mouse_navigation_selects_workbench_sections_and_focuses_panels() {
         app.workbench().focus(),
         cellarium::workbench::WorkbenchFocus::Outline
     );
+    assert!(app.take_workbench_display_clear());
 
     assert!(app.handle_workbench_panel_mouse(click(150, 8)));
     assert_eq!(

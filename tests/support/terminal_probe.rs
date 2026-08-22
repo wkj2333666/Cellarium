@@ -1,5 +1,6 @@
 use super::kitty_terminal::{KittyStreamParser, consume_shared_frame};
 use std::io;
+use std::collections::HashSet;
 use std::os::fd::FromRawFd;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -42,6 +43,7 @@ struct PtySession {
     output: Vec<u8>,
     screen: TerminalScreen,
     frames: Vec<FrameObservation>,
+    active_kitty_images: HashSet<u32>,
 }
 
 enum EscapeState {
@@ -290,6 +292,7 @@ impl PtySession {
             output: Vec::new(),
             screen: TerminalScreen::new(columns, rows),
             frames: Vec::new(),
+            active_kitty_images: HashSet::new(),
         })
     }
 
@@ -337,6 +340,7 @@ impl PtySession {
             self.output.extend_from_slice(bytes);
             self.screen.push(bytes);
             for command in self.parser.push(bytes) {
+                observe_kitty_placement(&command.control, &mut self.active_kitty_images);
                 if command.control.split(',').any(|field| field == "t=s") {
                     let frame = consume_shared_frame(&command)?;
                     self.frames.push(FrameObservation {
@@ -700,4 +704,49 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
     })
+}
+
+fn observe_kitty_placement(control: &str, active: &mut HashSet<u32>) {
+    let fields = control
+        .split(',')
+        .filter_map(|field| field.split_once('='))
+        .collect::<std::collections::HashMap<_, _>>();
+    match (fields.get("a"), fields.get("d")) {
+        (Some(&"T"), _) => {
+            if let Some(id) = fields.get("i").and_then(|value| value.parse().ok()) {
+                active.insert(id);
+            }
+        }
+        (Some(&"d"), Some(&"I")) => {
+            if let Some(id) = fields.get("i").and_then(|value| value.parse().ok()) {
+                active.remove(&id);
+            }
+        }
+        (Some(&"d"), Some(&"A")) => active.clear(),
+        _ => {}
+    }
+}
+
+/// Drive Workbench with a real Kitty PTY and verify that leaving the graphics
+/// canvas for the text-only Experiment section removes the terminal image
+/// placement. Checking only the textual screen misses stale Kitty overlays.
+pub fn run_workbench_graphics_clear_probe(host: &str) -> io::Result<()> {
+    let mut session = PtySession::spawn(host, 96, 30)?;
+    session.pump_until("first simulation Kitty frame", STARTUP_TIMEOUT, |session| {
+        !session.frames.is_empty()
+    })?;
+    session.write(b"w")?;
+    session.pump_until("Workbench canvas", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"Canvas") && session.screen.contains(b"World")
+    })?;
+    // Outline rows are World(1), Tiling(2), Channels(3), Kernels(4),
+    // Growth(5), Experiment(6); coordinates are one-based in SGR mouse.
+    session.write(b"\x1b[<0;8;7M\x1b[<0;8;7m")?;
+    session.pump_for(Duration::from_millis(350))?;
+    assert!(
+        session.active_kitty_images.is_empty(),
+        "switching to text-only Experiment must leave no active Kitty image placement"
+    );
+    session.write(b"q")?;
+    session.wait_for_successful_exit(INPUT_TIMEOUT)
 }
