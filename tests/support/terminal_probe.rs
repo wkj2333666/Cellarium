@@ -249,9 +249,11 @@ impl PtySession {
         let stdin = unsafe { Stdio::from_raw_fd(libc::dup(slave)) };
         let stdout = unsafe { Stdio::from_raw_fd(libc::dup(slave)) };
         let stderr = unsafe { Stdio::from_raw_fd(libc::dup(slave)) };
-        let ssh_command = std::env::var_os("CELLARIUM_E2E_SSH_CONFIG")
-            .map(|path| format!("ssh -F {}", path.to_string_lossy()))
-            .unwrap_or_else(|| "ssh".into());
+        let ssh_command = std::env::var("CELLARIUM_E2E_SSH_COMMAND").unwrap_or_else(|_| {
+            std::env::var_os("CELLARIUM_E2E_SSH_CONFIG")
+                .map(|path| format!("ssh -F {}", path.to_string_lossy()))
+                .unwrap_or_else(|| "ssh".into())
+        });
         let client = std::env::var_os("CELLARIUM_E2E_CLIENT")
             .unwrap_or_else(|| env!("CARGO_BIN_EXE_cellarium").into());
         let mut command = Command::new(client);

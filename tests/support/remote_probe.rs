@@ -43,9 +43,19 @@ struct ProtocolConnection {
 
 impl ProtocolConnection {
     fn connect(host: &str) -> io::Result<Self> {
-        let mut command = ssh_command();
+        let direct = std::env::var_os("CELLARIUM_E2E_DIRECT_SERVER").is_some();
+        let mut command = if direct {
+            let client = std::env::var_os("CELLARIUM_E2E_CLIENT")
+                .unwrap_or_else(|| env!("CARGO_BIN_EXE_cellarium").into());
+            let mut command = ProcessCommand::new(client);
+            command.arg("server");
+            command
+        } else {
+            let mut command = ssh_command();
+            command.args([host, "$HOME/.local/bin/cellarium", "server"]);
+            command
+        };
         let mut child = command
-            .args([host, "$HOME/.local/bin/cellarium", "server"])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -361,9 +371,15 @@ fn ssh_command() -> ProcessCommand {
 }
 
 fn remote_binary_sha256(host: &str) -> io::Result<String> {
-    let output = ssh_command()
-        .args([host, "sha256sum", "$HOME/.local/bin/cellarium"])
-        .output()?;
+    let output = if std::env::var_os("CELLARIUM_E2E_DIRECT_SERVER").is_some() {
+        let client = std::env::var_os("CELLARIUM_E2E_CLIENT")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_cellarium").into());
+        ProcessCommand::new("sha256sum").arg(client).output()?
+    } else {
+        ssh_command()
+            .args([host, "sha256sum", "$HOME/.local/bin/cellarium"])
+            .output()?
+    };
     if !output.status.success() {
         return Err(io::Error::other(format!(
             "remote sha256sum exited with {}: {}",

@@ -195,7 +195,9 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, display: &Viewp
     let canvas_inner = canvas_block.inner(layout.canvas);
     frame.render_widget(canvas_block, layout.canvas);
     if matches!(state.section(), WorkbenchSection::World) {
-        frame.render_widget(ChannelCanvas::new(state), canvas_inner);
+        let (width, height) = display.framebuffer_size(canvas_inner);
+        let graphics = initial_field_graphics(state, width as u32, height as u32);
+        display.render_graphics(frame, canvas_inner, &graphics);
     } else if state.section() == WorkbenchSection::Tiling {
         if let Some(tiling) = &state.draft().tiling {
             let scene = crate::workbench::tiling_editor::TilingScene::new(tiling.clone());
@@ -290,6 +292,48 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, display: &Viewp
     app.set_viewport(canvas_inner, logical);
 }
 
+fn initial_field_graphics(
+    state: &crate::workbench::WorkbenchState,
+    width: u32,
+    height: u32,
+) -> crate::render::workbench_graphics::GraphicsFrame {
+    let width = width.max(1);
+    let height = height.max(1);
+    let (grid_width, grid_height) = match &state.draft().geometry {
+        crate::sim::experiment_model::GeometrySpec::RasterGrid(grid) => (grid.width, grid.height),
+    };
+    let colors = state
+        .draft()
+        .channels
+        .iter()
+        .map(|channel| {
+            crate::workbench::resolved_color(state.draft(), channel.id)
+                .unwrap_or(crate::render::channels::Rgb8::new(255, 255, 255))
+        })
+        .collect::<Vec<_>>();
+    let mut rgba = vec![0_u8; width as usize * height as usize * 4];
+    for y in 0..height {
+        for x in 0..width {
+            let wx = (x * grid_width / width).min(grid_width.saturating_sub(1)) as usize;
+            let wy = (y * grid_height / height).min(grid_height.saturating_sub(1)) as usize;
+            let tile = wy * grid_width as usize + wx;
+            let mut values = Vec::new();
+            let mut active_colors = Vec::new();
+            for (index, channel) in state.draft().channels.iter().enumerate() {
+                if channel.display.visible {
+                    values.push(channel.initial.get(tile).copied().unwrap_or(0.0));
+                    active_colors.push(colors[index]);
+                }
+            }
+            let pixel = crate::render::channels::composite_pixel(&values, &active_colors);
+            let offset = (y as usize * width as usize + x as usize) * 4;
+            rgba[offset..offset + 4].copy_from_slice(&[pixel.red, pixel.green, pixel.blue, 255]);
+        }
+    }
+    crate::render::workbench_graphics::GraphicsFrame::new(width, height, rgba, 0)
+        .expect("initial field dimensions are valid")
+}
+
 fn growth_source_preview(editor: &crate::workbench::GrowthEditorState) -> Vec<Line<'static>> {
     let text = editor.buffer().as_str();
     let cursor = editor.buffer().cursor();
@@ -310,6 +354,7 @@ fn growth_source_preview(editor: &crate::workbench::GrowthEditorState) -> Vec<Li
     lines
 }
 
+#[allow(dead_code)]
 struct ChannelCanvas {
     width: usize,
     height: usize,
@@ -321,6 +366,7 @@ struct ChannelCanvas {
 }
 
 impl ChannelCanvas {
+    #[allow(dead_code)]
     fn new(state: &crate::workbench::WorkbenchState) -> Self {
         let (width, height) = match &state.draft().geometry {
             crate::sim::experiment_model::GeometrySpec::RasterGrid(grid) => {
