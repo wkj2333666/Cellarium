@@ -47,6 +47,7 @@ pub fn workbench_layout(area: Rect) -> WorkbenchLayout {
 
 pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     let layout = workbench_layout(area);
+    app.set_workbench_area(area);
     let state = app.workbench();
     let outline_lines = WorkbenchSection::ALL
         .into_iter()
@@ -220,7 +221,9 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             )),
             Line::from(format!("view: {:?}", state.channel_view())),
             Line::from(""),
-            Line::from("T section · Tab focus"),
+            Line::from("Click section · T section · Tab focus"),
+            Line::from("Canvas: left paint · right erase"),
+            Line::from("Wheel zoom · middle pan"),
             Line::from("A add · Del remove · ] select"),
             Line::from("V view · C color · X visible · F freeze"),
             Line::from("P tiling preset · E edit Growth"),

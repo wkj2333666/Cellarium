@@ -160,3 +160,37 @@ fn user_journey_edits_every_workbench_section_before_authoritative_apply() {
         cellarium::workbench::DraftStatus::Clean
     );
 }
+
+#[test]
+fn mouse_navigation_selects_workbench_sections_and_focuses_panels() {
+    let mut app = App::new(SimulationSpec::lenia_orbium(), 8, 8);
+    app.handle_command(Command::ToggleWorkbench);
+    app.set_workbench_area(ratatui::layout::Rect::new(0, 0, 180, 48));
+
+    let click = |column, row| MouseEvent {
+        kind: MouseEventKind::Down(MouseButton::Left),
+        column,
+        row,
+        modifiers: KeyModifiers::NONE,
+    };
+    assert!(app.handle_workbench_panel_mouse(click(8, 6)));
+    assert_eq!(
+        app.workbench().section(),
+        cellarium::workbench::WorkbenchSection::Experiment
+    );
+    assert_eq!(
+        app.workbench().focus(),
+        cellarium::workbench::WorkbenchFocus::Outline
+    );
+
+    assert!(app.handle_workbench_panel_mouse(click(150, 8)));
+    assert_eq!(
+        app.workbench().focus(),
+        cellarium::workbench::WorkbenchFocus::Inspector
+    );
+    assert!(!app.handle_workbench_panel_mouse(click(80, 8)));
+    assert_eq!(
+        app.workbench().focus(),
+        cellarium::workbench::WorkbenchFocus::Canvas
+    );
+}

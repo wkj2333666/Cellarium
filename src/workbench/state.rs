@@ -104,6 +104,9 @@ impl WorkbenchState {
     pub fn focus(&self) -> WorkbenchFocus {
         self.focus
     }
+    pub fn set_focus(&mut self, focus: WorkbenchFocus) {
+        self.focus = focus;
+    }
     pub fn status(&self) -> DraftStatus {
         self.status
     }

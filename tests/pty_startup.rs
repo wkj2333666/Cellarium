@@ -65,7 +65,6 @@ fn spawn_on_pty(slave: i32) -> std::process::Child {
         .stdout(stdout)
         .stderr(stderr)
         .env("TERM", "xterm-256color")
-        .env("CELLARIUM_E2E_TRACE", "1")
         .env_remove("TERM_PROGRAM")
         .env_remove("WEZTERM_EXECUTABLE")
         .env_remove("KONSOLE_VERSION")
@@ -162,6 +161,7 @@ fn spawn_connect_on_pty(
         .env("CELLARIUM_CELL_HEIGHT", "16")
         .env("CELLARIUM_FAKE_INVOCATION", invocation)
         .env("CELLARIUM_TEST_BINARY", env!("CARGO_BIN_EXE_cellarium"))
+        .env("CELLARIUM_E2E_TRACE", "1")
         .env_remove("SSH_CONNECTION")
         .env_remove("SSH_TTY")
         .env_remove("CELLARIUM_SSH_COMMAND");
@@ -441,6 +441,52 @@ fn c_s_pty_user_journey_survives_repeated_keyboard_and_mouse_operations() {
         contains(&output, b"a=d,d=A,q=1"),
         "entering Workbench must delete the previous Kitty image placement"
     );
+
+    // User-level Workbench journey: clicking the left outline must select a
+    // section, clicking the canvas must edit the draft, and keyboard section
+    // navigation must remain available after mouse interaction.
+    let experiment_click = b"\x1b[<0;8;7M";
+    assert_eq!(
+        unsafe {
+            libc::write(
+                master,
+                experiment_click.as_ptr().cast(),
+                experiment_click.len(),
+            )
+        },
+        experiment_click.len() as isize
+    );
+    assert!(
+        pump_until(
+            &mut child,
+            master,
+            &mut output,
+            Instant::now() + Duration::from_secs(2),
+            |output| contains(output, b"selected Experiment")
+        ),
+        "Workbench click did not select Experiment; tail={:?}",
+        String::from_utf8_lossy(&output[output.len().saturating_sub(1200)..])
+    );
+    assert_eq!(unsafe { libc::write(master, b"t".as_ptr().cast(), 1) }, 1);
+    assert!(pump_until(
+        &mut child,
+        master,
+        &mut output,
+        Instant::now() + Duration::from_secs(2),
+        |output| contains(output, b"E2E_WORKBENCH_SECTION=World")
+    ));
+    let canvas_click = b"\x1b[<0;35;10M";
+    assert_eq!(
+        unsafe { libc::write(master, canvas_click.as_ptr().cast(), canvas_click.len()) },
+        canvas_click.len() as isize
+    );
+    assert!(pump_until(
+        &mut child,
+        master,
+        &mut output,
+        Instant::now() + Duration::from_secs(2),
+        |output| contains(output, b"E2E_WORKBENCH_DRAFT=Dirty")
+    ));
 
     // Return to simulation, then exercise the high-frequency paths. SGR
     // mouse events use terminal coordinates (1-based); the viewport begins

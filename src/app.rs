@@ -19,7 +19,7 @@ use crate::sim::service::{
 };
 use crate::sim::tiling::PeriodicTilingDraft;
 use crate::sim::world::World;
-use crate::workbench::{AppMode, WorkbenchState};
+use crate::workbench::{AppMode, WorkbenchFocus, WorkbenchSection, WorkbenchState};
 use crossterm::event::{Event, KeyCode, KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 use std::path::Path;
@@ -92,6 +92,7 @@ pub struct App {
     experiment_service: Option<ExperimentService>,
     workbench_notice: Option<String>,
     workbench_display_needs_clear: bool,
+    workbench_area: Rect,
 }
 
 impl App {
@@ -152,6 +153,7 @@ impl App {
             experiment_service: None,
             workbench_notice: None,
             workbench_display_needs_clear: false,
+            workbench_area: Rect::default(),
         }
     }
 
@@ -185,6 +187,48 @@ impl App {
         let needs_clear = self.workbench_display_needs_clear;
         self.workbench_display_needs_clear = false;
         needs_clear
+    }
+    pub fn set_workbench_area(&mut self, area: Rect) {
+        self.workbench_area = area;
+    }
+    /// Handle clicks on the Workbench navigation and inspector panels.
+    /// Canvas clicks remain available to the normal paint/inspect path.
+    pub fn handle_workbench_panel_mouse(&mut self, mouse: MouseEvent) -> bool {
+        if self.mode != AppMode::Workbench
+            || !matches!(
+                mouse.kind,
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+            )
+        {
+            return false;
+        }
+        let layout = crate::tui::workbench::workbench_layout(self.workbench_area);
+        let point = ratatui::layout::Position::new(mouse.column, mouse.row);
+        if layout.outline.contains(point) {
+            self.workbench.set_focus(WorkbenchFocus::Outline);
+            let inner = Rect::new(
+                layout.outline.x.saturating_add(1),
+                layout.outline.y.saturating_add(1),
+                layout.outline.width.saturating_sub(2),
+                layout.outline.height.saturating_sub(2),
+            );
+            if inner.contains(point) {
+                let index = usize::from(point.y.saturating_sub(inner.y));
+                if let Some(section) = WorkbenchSection::ALL.get(index).copied() {
+                    self.workbench.select_section(section);
+                    self.workbench_notice = Some(format!("selected {}", section.label()));
+                }
+            }
+            return true;
+        }
+        if layout.inspector.is_some_and(|area| area.contains(point)) {
+            self.workbench.set_focus(WorkbenchFocus::Inspector);
+            return true;
+        }
+        if layout.canvas.contains(point) {
+            self.workbench.set_focus(WorkbenchFocus::Canvas);
+        }
+        false
     }
     pub fn workbench_apply_request(&self, request_id: u64) -> ApplyRequest {
         ApplyRequest {
@@ -934,6 +978,11 @@ impl App {
             Command::NextPanel => {
                 if self.mode == AppMode::Workbench {
                     self.workbench.section_next();
+                    self.workbench_notice =
+                        Some(format!("selected {}", self.workbench.section().label()));
+                    if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
+                        eprintln!("E2E_WORKBENCH_SECTION={}", self.workbench.section().label());
+                    }
                 } else {
                     self.active_panel = self.active_panel.next();
                 }
@@ -966,6 +1015,11 @@ impl App {
             Command::NextPanel => {
                 if self.mode == AppMode::Workbench {
                     self.workbench.section_next();
+                    self.workbench_notice =
+                        Some(format!("selected {}", self.workbench.section().label()));
+                    if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
+                        eprintln!("E2E_WORKBENCH_SECTION={}", self.workbench.section().label());
+                    }
                 } else {
                     self.active_panel = self.active_panel.next();
                 }
@@ -1171,7 +1225,7 @@ impl App {
                 crate::input::MouseAction::Inspect | crate::input::MouseAction::Paint => 1.0,
                 _ => return false,
             };
-            return self
+            let applied = self
                 .workbench
                 .execute(crate::workbench::DraftCommand::SetChannelValue {
                     channel: self.workbench.selected_channel(),
@@ -1179,6 +1233,10 @@ impl App {
                     value,
                 })
                 .is_ok();
+            if applied && std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
+                eprintln!("E2E_WORKBENCH_DRAFT=Dirty");
+            }
+            return applied;
         }
         let frame_size = self
             .frame_size
@@ -2200,6 +2258,9 @@ fn handle_remote_terminal_event<W: std::io::Write>(
             }
         }
         Event::Mouse(mouse) => {
+            if app.handle_workbench_panel_mouse(mouse) {
+                return Ok(false);
+            }
             if app.mode() == AppMode::Workbench
                 && app.workbench().section() == crate::workbench::WorkbenchSection::Experiment
                 && matches!(
@@ -2546,6 +2607,9 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
                 }
                 Event::Mouse(mouse) => {
                     input_seen = true;
+                    if app.handle_workbench_panel_mouse(mouse) {
+                        continue;
+                    }
                     app.handle_mouse(mouse, &mut tracker);
                 }
                 Event::Resize(_, _) | Event::FocusGained | Event::FocusLost => {}
