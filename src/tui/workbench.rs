@@ -235,9 +235,9 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
                 .block(panel(
-                " Inspector ",
-                state.focus() == WorkbenchFocus::Inspector,
-            )),
+                    " Inspector ",
+                    state.focus() == WorkbenchFocus::Inspector,
+                )),
             inspector,
         );
     }
