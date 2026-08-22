@@ -1321,6 +1321,31 @@ mod remote_snapshot_tests {
     }
 
     #[test]
+    fn latest_remote_update_does_not_drop_apply_ack_behind_snapshots() {
+        let slot = LatestRemoteUpdate::default();
+        let app = App::new(SimulationSpec::conway(), 1, 1);
+        let accepted = crate::sim::service::ApplyAccepted {
+            request_id: 7,
+            revision: 2,
+            normalized_experiment: app.active_experiment(),
+        };
+        let mut snapshot = app.remote_snapshot();
+        snapshot.tick = 9;
+
+        slot.store(RemoteUpdate::ApplyAccepted(accepted));
+        slot.store(RemoteUpdate::Snapshot {
+            snapshot,
+            receive_rate: 30.0,
+        });
+
+        assert!(matches!(
+            slot.take(),
+            Some(RemoteUpdate::ApplyAccepted(accepted)) if accepted.request_id == 7
+        ));
+        assert!(matches!(slot.take(), Some(RemoteUpdate::Snapshot { .. })));
+    }
+
+    #[test]
     fn remote_server_processes_at_most_one_simulation_step_between_input_checks() {
         assert_eq!(SERVER_MAX_STEPS_PER_ITERATION, 1);
     }
@@ -1797,20 +1822,30 @@ enum RemoteUpdate {
     Closed(Result<(), crate::remote::ProtocolError>),
 }
 
+#[derive(Default)]
+struct LatestRemoteUpdateState {
+    snapshot: Option<RemoteUpdate>,
+    controls: VecDeque<RemoteUpdate>,
+}
+
 #[derive(Clone, Default)]
 struct LatestRemoteUpdate {
-    update: Arc<Mutex<Option<RemoteUpdate>>>,
+    update: Arc<Mutex<LatestRemoteUpdateState>>,
 }
 
 impl LatestRemoteUpdate {
     fn store(&self, update: RemoteUpdate) {
         if let Ok(mut slot) = self.update.lock() {
-            *slot = Some(update);
+            match update {
+                RemoteUpdate::Snapshot { .. } => slot.snapshot = Some(update),
+                update => slot.controls.push_back(update),
+            }
         }
     }
 
     fn take(&self) -> Option<RemoteUpdate> {
-        self.update.lock().ok()?.take()
+        let mut slot = self.update.lock().ok()?;
+        slot.controls.pop_front().or_else(|| slot.snapshot.take())
     }
 }
 
