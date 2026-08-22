@@ -100,9 +100,13 @@ fn should_submit_raster(previous: Option<RasterRequestKey>, next: RasterRequestK
     previous != Some(next)
 }
 
+fn ready_generation_is_current(frame_generation: u64, current_priority: u64) -> bool {
+    frame_generation >= current_priority
+}
+
 pub struct AsyncRasterizer {
     queue: LatestWorkQueue<RasterRequest>,
-    ready: Arc<Mutex<Option<(DynamicImage, ratatui::layout::Size)>>>,
+    ready: Arc<Mutex<Option<(DynamicImage, ratatui::layout::Size, u64)>>>,
     latest_generation: Arc<AtomicU64>,
     last_request: Mutex<Option<RasterRequestKey>>,
     worker: Option<JoinHandle<()>>,
@@ -141,7 +145,7 @@ impl AsyncRasterizer {
                     continue;
                 }
                 if let Ok(mut slot) = worker_ready.lock() {
-                    *slot = Some((image, request.terminal_size));
+                    *slot = Some((image, request.terminal_size, request.generation));
                 }
             }
         });
@@ -192,7 +196,7 @@ impl AsyncRasterizer {
         });
     }
 
-    fn take_ready(&self) -> Option<(DynamicImage, ratatui::layout::Size)> {
+    fn take_ready(&self) -> Option<(DynamicImage, ratatui::layout::Size, u64)> {
         self.ready.lock().ok()?.take()
     }
 }
@@ -836,7 +840,9 @@ impl ViewportDisplay {
             terminal_size,
             generation,
         );
-        if let Some((image, size)) = rasterizer.take_ready() {
+        if let Some((image, size, frame_priority)) = rasterizer.take_ready()
+            && ready_generation_is_current(frame_priority, generation.priority)
+        {
             match self {
                 Self::Pixel(display) => display.submit(image, size),
                 #[cfg(unix)]
@@ -967,6 +973,13 @@ mod tests {
     }
 
     #[test]
+    fn stale_ready_frames_are_rejected_after_input_priority_changes() {
+        assert!(ready_generation_is_current(4, 4));
+        assert!(ready_generation_is_current(5, 4));
+        assert!(!ready_generation_is_current(3, 4));
+    }
+
+    #[test]
     fn async_rasterizer_produces_a_pixel_frame_without_blocking_the_caller() {
         let mut world = World::new(2, 2);
         world.replace_cells(&[0.0, 1.0, 0.0, 1.0]);
@@ -984,7 +997,7 @@ mod tests {
         );
 
         let deadline = Instant::now() + Duration::from_secs(1);
-        let (image, size) = loop {
+        let (image, size, _priority) = loop {
             if let Some(ready) = rasterizer.take_ready() {
                 break ready;
             }
