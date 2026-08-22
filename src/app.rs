@@ -1243,6 +1243,74 @@ impl App {
             }
             return applied;
         }
+        if self.mode == AppMode::Workbench {
+            let frame_size = self
+                .frame_size
+                .unwrap_or([viewport.width as usize, viewport.height as usize * 2]);
+            let px = (u32::from(local.column) * frame_size[0] as u32
+                / u32::from(viewport.width.max(1)))
+                .min(frame_size[0].saturating_sub(1) as u32);
+            let py = (u32::from(local.row) * frame_size[1] as u32
+                / u32::from(viewport.height.max(1)))
+                .min(frame_size[1].saturating_sub(1) as u32);
+            match self.workbench.section() {
+                crate::workbench::WorkbenchSection::Tiling => {
+                    let Some(tiling) = self.workbench.draft().tiling.clone() else {
+                        return false;
+                    };
+                    let mut scene = crate::workbench::tiling_editor::TilingScene::new(tiling);
+                    let applied = match action {
+                        crate::input::MouseAction::Inspect => scene
+                            .hit_test_vertex(px, py, frame_size[0] as u32, frame_size[1] as u32, 8)
+                            .map(|(prototype, vertex)| {
+                                scene.apply_gesture(crate::workbench::tiling_editor::TilingGesture::SelectVertex { prototype, vertex }).is_ok()
+                            })
+                            .unwrap_or(false),
+                        crate::input::MouseAction::Paint => scene
+                            .hit_test_vertex(px, py, frame_size[0] as u32, frame_size[1] as u32, 12)
+                            .map(|(prototype, vertex)| {
+                                let to = scene.pixel_to_world(px, py, frame_size[0] as u32, frame_size[1] as u32);
+                                scene.apply_gesture(crate::workbench::tiling_editor::TilingGesture::MoveVertex { prototype, vertex, to }).is_ok()
+                            })
+                            .unwrap_or(false),
+                        crate::input::MouseAction::Erase => scene
+                            .hit_test_vertex(px, py, frame_size[0] as u32, frame_size[1] as u32, 8)
+                            .map(|(prototype, vertex)| scene.apply_gesture(crate::workbench::tiling_editor::TilingGesture::RemoveVertex { prototype, vertex }).is_ok())
+                            .unwrap_or(false),
+                        crate::input::MouseAction::Pan { .. }
+                        | crate::input::MouseAction::Zoom { .. } => true,
+                    };
+                    if applied && scene.draft != *self.workbench.draft().tiling.as_ref().unwrap() {
+                        let mut draft = self.workbench.draft().clone();
+                        draft.tiling = Some(scene.draft);
+                        let _ = self.workbench.import_draft(draft);
+                    }
+                    return applied;
+                }
+                crate::workbench::WorkbenchSection::Kernels => {
+                    let Some(kernel) = self.workbench.draft().kernels.first().cloned() else {
+                        return false;
+                    };
+                    let mut scene = crate::workbench::kernel_editor::KernelScene::new(kernel.definition);
+                    let Some(point) = scene.cell_at_pixel(px, py) else { return false; };
+                    let result = match action {
+                        crate::input::MouseAction::Inspect | crate::input::MouseAction::Paint => scene.apply_gesture(crate::workbench::kernel_editor::KernelGesture::SetValue { x: point.x, y: point.y, value: 1.0 }),
+                        crate::input::MouseAction::Erase => scene.apply_gesture(crate::workbench::kernel_editor::KernelGesture::ToggleMask { x: point.x, y: point.y }),
+                        crate::input::MouseAction::Pan { .. } | crate::input::MouseAction::Zoom { .. } => Ok(()),
+                    };
+                    if result.is_ok() {
+                        let mut draft = self.workbench.draft().clone();
+                        if let Some(kernel) = draft.kernels.first_mut() { kernel.definition = scene.definition; }
+                        let _ = self.workbench.import_draft(draft);
+                    }
+                    return result.is_ok();
+                }
+                crate::workbench::WorkbenchSection::Growth
+                | crate::workbench::WorkbenchSection::Channels
+                | crate::workbench::WorkbenchSection::Experiment => return true,
+                crate::workbench::WorkbenchSection::World => {}
+            }
+        }
         let frame_size = self
             .frame_size
             .unwrap_or([viewport.width as usize, viewport.height as usize * 2]);

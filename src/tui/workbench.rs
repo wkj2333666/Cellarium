@@ -1,4 +1,6 @@
 use crate::app::App;
+use crate::render::display::ViewportDisplay;
+use crate::render::workbench_graphics::GraphicsScene;
 use crate::workbench::{WorkbenchFocus, WorkbenchSection};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -45,7 +47,7 @@ pub fn workbench_layout(area: Rect) -> WorkbenchLayout {
     }
 }
 
-pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
+pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, display: &ViewportDisplay, area: Rect) {
     let layout = workbench_layout(area);
     app.set_workbench_area(area);
     let state = app.workbench();
@@ -194,6 +196,31 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
     frame.render_widget(canvas_block, layout.canvas);
     if matches!(state.section(), WorkbenchSection::World) {
         frame.render_widget(ChannelCanvas::new(state), canvas_inner);
+    } else if state.section() == WorkbenchSection::Tiling {
+        if let Some(tiling) = &state.draft().tiling {
+            let scene = crate::workbench::tiling_editor::TilingScene::new(tiling.clone());
+            let (width, height) = display.framebuffer_size(canvas_inner);
+            let graphics = scene.render_rgba(width as u32, height as u32);
+            display.render_graphics(frame, canvas_inner, &graphics);
+        } else {
+            frame.render_widget(
+                Paragraph::new(canvas_lines.into_iter().map(Line::from).collect::<Vec<_>>())
+                    .wrap(Wrap { trim: false }),
+                canvas_inner,
+            );
+        }
+    } else if state.section() == WorkbenchSection::Kernels {
+        if let Some(kernel) = state.draft().kernels.first() {
+            let scene = crate::workbench::kernel_editor::KernelScene::new(kernel.definition.clone());
+            let (width, height) = display.framebuffer_size(canvas_inner);
+            let graphics = scene.render_rgba(width as u32, height as u32);
+            display.render_graphics(frame, canvas_inner, &graphics);
+        }
+    } else if state.section() == WorkbenchSection::Growth {
+        let scene = crate::workbench::growth_graph::GrowthScene::from_editor(state.growth_editor());
+        let (width, height) = display.framebuffer_size(canvas_inner);
+        let graphics = scene.render_rgba(width as u32, height as u32);
+        display.render_graphics(frame, canvas_inner, &graphics);
     } else {
         frame.render_widget(
             Paragraph::new(canvas_lines.into_iter().map(Line::from).collect::<Vec<_>>())
@@ -241,14 +268,17 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, area: Rect) {
             inspector,
         );
     }
-    if state.section() == WorkbenchSection::World {
-        let (width, height) = match &state.draft().geometry {
-            crate::sim::experiment_model::GeometrySpec::RasterGrid(grid) => {
-                (grid.width as usize, grid.height as usize)
-            }
-        };
-        app.set_viewport(canvas_inner, [width, height]);
-    }
+    let (width, height) = match &state.draft().geometry {
+        crate::sim::experiment_model::GeometrySpec::RasterGrid(grid) => {
+            (grid.width as usize, grid.height as usize)
+        }
+    };
+    let logical = if state.section() == WorkbenchSection::World {
+        [width, height]
+    } else {
+        [canvas_inner.width as usize, canvas_inner.height as usize * 2]
+    };
+    app.set_viewport(canvas_inner, logical);
 }
 
 struct ChannelCanvas {

@@ -2,6 +2,8 @@ mod channel_editor;
 mod command;
 mod experiment_editor;
 mod growth_editor;
+pub mod growth_graph;
+pub mod kernel_editor;
 mod history;
 mod state;
 mod text_buffer;
