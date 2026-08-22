@@ -234,7 +234,7 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, display: &Viewp
             .channels
             .iter()
             .find(|channel| channel.id == state.selected_channel());
-        let lines = vec![
+        let mut lines = vec![
             Line::from(format!("section: {}", state.section().label())),
             Line::from(format!("draft: {:?}", state.status())),
             Line::from(format!("channels: {}", state.draft().channels.len())),
@@ -258,6 +258,15 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, display: &Viewp
             Line::from(app.workbench_notice().unwrap_or("")),
             Line::from("W leave Workbench · ? help"),
         ];
+        if state.section() == WorkbenchSection::Growth {
+            lines.push(Line::from(""));
+            lines.push(Line::from(if state.growth_editing() {
+                "Growth source (editing; Esc finish)"
+            } else {
+                "Growth source (press E to edit)"
+            }));
+            lines.extend(growth_source_preview(state.growth_editor()));
+        }
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
@@ -279,6 +288,26 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, display: &Viewp
         [canvas_inner.width as usize, canvas_inner.height as usize * 2]
     };
     app.set_viewport(canvas_inner, logical);
+}
+
+fn growth_source_preview(editor: &crate::workbench::GrowthEditorState) -> Vec<Line<'static>> {
+    let text = editor.buffer().as_str();
+    let cursor = editor.buffer().cursor();
+    let mut lines = Vec::new();
+    let mut offset = 0usize;
+    for source_line in text.split('\n').take(12) {
+        let end = offset + source_line.len();
+        let mut rendered = source_line.to_string();
+        if editor.buffer().cursor_is_char_boundary() && cursor >= offset && cursor <= end {
+            rendered.insert_str(cursor.saturating_sub(offset).min(rendered.len()), "▌");
+        }
+        lines.push(Line::from(format!("  {rendered}")));
+        offset = end.saturating_add(1);
+    }
+    if lines.is_empty() {
+        lines.push(Line::from("  ▌"));
+    }
+    lines
 }
 
 struct ChannelCanvas {
