@@ -87,6 +87,7 @@ pub struct App {
     graphics_rate: f64,
     experiment_model: ExperimentSpec,
     experiment_revision: u64,
+    workbench_base_revision: u64,
     mode: AppMode,
     workbench: WorkbenchState,
     experiment_service: Option<ExperimentService>,
@@ -148,6 +149,7 @@ impl App {
             graphics_rate: 0.0,
             experiment_model,
             experiment_revision: 0,
+            workbench_base_revision: 0,
             mode: AppMode::Simulation,
             workbench,
             experiment_service: None,
@@ -240,7 +242,7 @@ impl App {
     pub fn workbench_apply_request(&self, request_id: u64) -> ApplyRequest {
         ApplyRequest {
             request_id,
-            base_revision: self.experiment_revision,
+            base_revision: self.workbench_base_revision,
             draft: self.workbench.draft().clone(),
         }
     }
@@ -321,7 +323,7 @@ impl App {
                 let path = Path::new("cellarium-draft.ron");
                 crate::workbench::export_draft(
                     path,
-                    self.experiment_revision,
+                    self.workbench_base_revision,
                     self.workbench.draft(),
                 )?;
                 self.workbench_notice = Some(format!("exported draft to {}", path.display()));
@@ -330,6 +332,7 @@ impl App {
             UiCommand::LoadDraft => {
                 let path = Path::new("cellarium-draft.ron");
                 let envelope = crate::workbench::load_draft(path)?;
+                self.workbench_base_revision = envelope.base_revision;
                 self.workbench
                     .import_draft(envelope.draft)
                     .map_err(|error| error.to_string())?;
@@ -404,6 +407,13 @@ impl App {
         }
         self.workbench.growth_editor_mut().refresh_now();
         self.workbench.sync_growth_source();
+        if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
+            eprintln!(
+                "E2E_GROWTH_VALID valid={} source={:?}",
+                self.workbench.growth_editor().diagnostics().is_empty(),
+                self.workbench.growth_editor().buffer().as_str()
+            );
+        }
         true
     }
 
@@ -619,6 +629,7 @@ impl App {
                         path: DiagnosticPath::field("revision"),
                     }],
                 })?;
+        self.workbench_base_revision = self.experiment_revision;
         Ok(ApplyAccepted {
             request_id: request.request_id,
             revision: self.experiment_revision,
@@ -772,6 +783,25 @@ impl App {
         self.performance.step_samples = snapshot.step_samples;
         self.backend_error = snapshot.error.clone();
         true
+    }
+
+    fn apply_remote_experiment_state(
+        &mut self,
+        revision: u64,
+        experiment: crate::sim::experiment_model::ExperimentSpec,
+    ) {
+        self.experiment_revision = revision;
+        self.experiment_model = experiment.clone();
+        // The initial authoritative model can arrive after the user has
+        // already entered Workbench over a latent SSH connection. Never let
+        // that late initialization erase a dirty draft or an active editor.
+        if self.mode != AppMode::Workbench
+            || (self.workbench.status() == crate::workbench::DraftStatus::Clean
+                && !self.workbench.growth_editing())
+        {
+            self.workbench.accept(experiment);
+            self.workbench_base_revision = revision;
+        }
     }
 
     fn apply_remote_spec(
@@ -1230,33 +1260,40 @@ impl App {
         {
             let crate::sim::experiment_model::GeometrySpec::RasterGrid(grid) =
                 &self.workbench.draft().geometry;
-            let Some(point) = crate::input::map_viewport_point(
-                &event,
-                viewport,
-                [grid.width, grid.height],
-            ) else {
-                return false;
-            };
-            let x = point.x as usize;
-            let y = point.y as usize;
+            let frame_size = self
+                .frame_size
+                .unwrap_or([viewport.width as usize, viewport.height as usize * 2]);
+            let screen = [
+                (local.column as f32 + 0.5) * frame_size[0] as f32 / viewport.width.max(1) as f32,
+                (local.row as f32 + 0.5) * frame_size[1] as f32 / viewport.height.max(1) as f32,
+            ];
+            let world = self
+                .camera
+                .screen_to_world(screen, frame_size[0], frame_size[1]);
+            let x = (world[0].floor() as isize).rem_euclid(grid.width as isize) as usize;
+            let y = (world[1].floor() as isize).rem_euclid(grid.height as isize) as usize;
             let tile = y.saturating_mul(grid.width as usize).saturating_add(x);
             let value = match action {
-                crate::input::MouseAction::Erase => 0.0,
-                crate::input::MouseAction::Inspect | crate::input::MouseAction::Paint => 1.0,
-                _ => return false,
+                crate::input::MouseAction::Erase => Some(0.0),
+                crate::input::MouseAction::Inspect | crate::input::MouseAction::Paint => Some(1.0),
+                crate::input::MouseAction::Pan { .. } | crate::input::MouseAction::Zoom { .. } => {
+                    None
+                }
             };
-            let applied = self
-                .workbench
-                .execute(crate::workbench::DraftCommand::SetChannelValue {
-                    channel: self.workbench.selected_channel(),
-                    tile,
-                    value,
-                })
-                .is_ok();
-            if applied && std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
-                eprintln!("E2E_WORKBENCH_DRAFT=Dirty");
+            if let Some(value) = value {
+                let applied = self
+                    .workbench
+                    .execute(crate::workbench::DraftCommand::SetChannelValue {
+                        channel: self.workbench.selected_channel(),
+                        tile,
+                        value,
+                    })
+                    .is_ok();
+                if applied && std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
+                    eprintln!("E2E_WORKBENCH_DRAFT=Dirty");
+                }
+                return applied;
             }
-            return applied;
         }
         if self.mode == AppMode::Workbench {
             let frame_size = self
@@ -1264,10 +1301,10 @@ impl App {
                 .unwrap_or([viewport.width as usize, viewport.height as usize * 2]);
             let px = (u32::from(local.column) * frame_size[0] as u32
                 / u32::from(viewport.width.max(1)))
-                .min(frame_size[0].saturating_sub(1) as u32);
+            .min(frame_size[0].saturating_sub(1) as u32);
             let py = (u32::from(local.row) * frame_size[1] as u32
                 / u32::from(viewport.height.max(1)))
-                .min(frame_size[1].saturating_sub(1) as u32);
+            .min(frame_size[1].saturating_sub(1) as u32);
             match self.workbench.section() {
                 crate::workbench::WorkbenchSection::Tiling => {
                     let Some(tiling) = self.workbench.draft().tiling.clone() else {
@@ -1293,7 +1330,7 @@ impl App {
                             .map(|(prototype, vertex)| scene.apply_gesture(crate::workbench::tiling_editor::TilingGesture::RemoveVertex { prototype, vertex }).is_ok())
                             .unwrap_or(false),
                         crate::input::MouseAction::Pan { .. }
-                        | crate::input::MouseAction::Zoom { .. } => true,
+                        | crate::input::MouseAction::Zoom { .. } => false,
                     };
                     if applied && scene.draft != *self.workbench.draft().tiling.as_ref().unwrap() {
                         let mut draft = self.workbench.draft().clone();
@@ -1306,16 +1343,68 @@ impl App {
                     let Some(kernel) = self.workbench.draft().kernels.first().cloned() else {
                         return false;
                     };
-                    let mut scene = crate::workbench::kernel_editor::KernelScene::new(kernel.definition);
-                    let Some(point) = scene.cell_at_pixel(px, py) else { return false; };
+                    let mut scene =
+                        crate::workbench::kernel_editor::KernelScene::new(kernel.definition)
+                            .with_view(self.workbench.kernel_view());
+                    match action {
+                        crate::input::MouseAction::Zoom { direction } => {
+                            let factor = match direction {
+                                crate::input::ZoomDirection::In => 1.4,
+                                crate::input::ZoomDirection::Out => 1.0 / 1.4,
+                            };
+                            scene.zoom_at(
+                                px,
+                                py,
+                                frame_size[0] as u32,
+                                frame_size[1] as u32,
+                                factor,
+                            );
+                            self.workbench.set_kernel_view(scene.view);
+                            return true;
+                        }
+                        crate::input::MouseAction::Pan { dx, dy } => {
+                            scene.pan_pixels(
+                                f64::from(dx) * frame_size[0] as f64
+                                    / f64::from(viewport.width.max(1)),
+                                f64::from(dy) * frame_size[1] as f64
+                                    / f64::from(viewport.height.max(1)),
+                                frame_size[0] as u32,
+                                frame_size[1] as u32,
+                            );
+                            self.workbench.set_kernel_view(scene.view);
+                            return true;
+                        }
+                        _ => {}
+                    }
+                    let Some(point) =
+                        scene.cell_at_pixel_in(px, py, frame_size[0] as u32, frame_size[1] as u32)
+                    else {
+                        return false;
+                    };
                     let result = match action {
-                        crate::input::MouseAction::Inspect | crate::input::MouseAction::Paint => scene.apply_gesture(crate::workbench::kernel_editor::KernelGesture::SetValue { x: point.x, y: point.y, value: 1.0 }),
-                        crate::input::MouseAction::Erase => scene.apply_gesture(crate::workbench::kernel_editor::KernelGesture::ToggleMask { x: point.x, y: point.y }),
-                        crate::input::MouseAction::Pan { .. } | crate::input::MouseAction::Zoom { .. } => Ok(()),
+                        crate::input::MouseAction::Inspect | crate::input::MouseAction::Paint => {
+                            scene.apply_gesture(
+                                crate::workbench::kernel_editor::KernelGesture::SetValue {
+                                    x: point.x,
+                                    y: point.y,
+                                    value: 1.0,
+                                },
+                            )
+                        }
+                        crate::input::MouseAction::Erase => scene.apply_gesture(
+                            crate::workbench::kernel_editor::KernelGesture::ToggleMask {
+                                x: point.x,
+                                y: point.y,
+                            },
+                        ),
+                        crate::input::MouseAction::Pan { .. }
+                        | crate::input::MouseAction::Zoom { .. } => unreachable!(),
                     };
                     if result.is_ok() {
                         let mut draft = self.workbench.draft().clone();
-                        if let Some(kernel) = draft.kernels.first_mut() { kernel.definition = scene.definition; }
+                        if let Some(kernel) = draft.kernels.first_mut() {
+                            kernel.definition = scene.definition;
+                        }
                         let _ = self.workbench.import_draft(draft);
                     }
                     return result.is_ok();
@@ -1389,6 +1478,32 @@ mod remote_snapshot_tests {
         assert_eq!(mirror.applied_input_sequence(), 19);
         assert_eq!(mirror.performance().last_step_ms, 2.0);
         assert_eq!(mirror.rates(), (12.0, 7.0));
+    }
+
+    #[test]
+    fn late_remote_experiment_state_does_not_erase_a_dirty_workbench_draft() {
+        let mut app = App::new(SimulationSpec::conway(), 8, 8);
+        app.enter_workbench();
+        app.workbench_mut().add_channel().unwrap();
+        assert_eq!(app.workbench().draft().channels.len(), 2);
+        let mut remote = crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(8, 8);
+        remote.name = "late authoritative state".into();
+
+        app.apply_remote_experiment_state(7, remote.clone());
+
+        assert_eq!(app.active_revision(), 7);
+        assert_eq!(app.active_experiment().name, remote.name);
+        assert_eq!(app.workbench().draft().channels.len(), 2);
+        assert_eq!(
+            app.workbench().status(),
+            crate::workbench::DraftStatus::Dirty
+        );
+        let stale = app.workbench_apply_request(99);
+        assert_eq!(stale.base_revision, 0);
+        let rejected = app
+            .submit_draft(stale)
+            .expect_err("a dirty draft must retain its original base revision");
+        assert_eq!(rejected.diagnostics[0].code, "revision_conflict");
     }
 
     #[test]
@@ -2139,12 +2254,11 @@ where
                     revision,
                     experiment,
                 } => {
-                    app.experiment_revision = revision;
-                    app.experiment_model = experiment.clone();
-                    app.workbench.accept(experiment);
+                    app.apply_remote_experiment_state(revision, experiment);
                 }
                 RemoteUpdate::ApplyAccepted(accepted) => {
                     app.experiment_revision = accepted.revision;
+                    app.workbench_base_revision = accepted.revision;
                     app.experiment_model = accepted.normalized_experiment.clone();
                     app.workbench.accept(accepted.normalized_experiment);
                     app.workbench_notice = Some(format!("applied revision {}", accepted.revision));
@@ -2349,30 +2463,14 @@ fn handle_remote_terminal_event<W: std::io::Write>(
             if app.handle_workbench_panel_mouse(mouse) {
                 return Ok(false);
             }
-            if app.mode() == AppMode::Workbench
-                && app.workbench().section() == crate::workbench::WorkbenchSection::Experiment
-                && matches!(
-                    mouse.kind,
-                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
-                )
-            {
-                app.workbench_notice = Some("apply sent".into());
-                let request = app.workbench_apply_request(*next_input_sequence);
-                let mut guard = writer
-                    .lock()
-                    .map_err(|_| std::io::Error::other("SSH writer mutex poisoned"))?;
-                crate::remote::write_message(
-                    &mut *guard,
-                    &crate::remote::RemoteMessage::ApplyDraft(request),
-                )
-                .map_err(std::io::Error::other)?;
+            let in_workbench = app.mode() == AppMode::Workbench;
+            let applied = app.handle_mouse(mouse, tracker);
+            if in_workbench {
                 if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
-                    eprintln!("E2E_APPLY_SENT");
+                    eprintln!("E2E_WORKBENCH_MOUSE applied={applied}");
                 }
-                *next_input_sequence = (*next_input_sequence).wrapping_add(1).max(1);
                 return Ok(false);
             }
-            let applied = app.handle_mouse(mouse, tracker);
             if crate::input::should_forward_mouse_event(&mouse, applied) {
                 if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
                     eprintln!("E2E_MOUSE_FORWARDED applied={applied}");
@@ -3410,6 +3508,97 @@ mod tests {
         app.handle_mouse(down, &mut tracker);
         assert!(app.handle_mouse(drag, &mut tracker));
         assert_eq!(app.camera().center(), [10.0, 5.0]);
+    }
+
+    #[test]
+    fn workbench_world_canvas_supports_middle_button_pan() {
+        let mut app = App::new(SimulationSpec::conway(), 32, 16);
+        app.enter_workbench();
+        app.set_viewport(ratatui::layout::Rect::new(24, 1, 60, 32), [480, 512]);
+        let before = app.camera().center();
+        let mut tracker = crate::input::MouseTracker::new();
+        let down = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Middle),
+            column: 50,
+            row: 12,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let drag = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Middle),
+            column: 54,
+            row: 14,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        app.handle_mouse(down, &mut tracker);
+        assert!(app.handle_mouse(drag, &mut tracker));
+        assert_ne!(app.camera().center(), before);
+    }
+
+    #[test]
+    fn unsupported_tiling_pan_does_not_dirty_the_draft() {
+        for section in [crate::workbench::WorkbenchSection::Tiling] {
+            let mut app = App::new(SimulationSpec::conway(), 32, 16);
+            app.enter_workbench();
+            app.workbench_mut().select_section(section);
+            app.set_viewport(ratatui::layout::Rect::new(24, 1, 60, 32), [480, 512]);
+            let mut tracker = crate::input::MouseTracker::new();
+            let down = crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Middle),
+                column: 50,
+                row: 12,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            };
+            let drag = crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Middle),
+                column: 54,
+                row: 14,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            };
+
+            app.handle_mouse(down, &mut tracker);
+            assert!(!app.handle_mouse(drag, &mut tracker));
+            assert_eq!(
+                app.workbench().status(),
+                crate::workbench::DraftStatus::Clean,
+                "{section:?} pan must not create a fake edit"
+            );
+        }
+    }
+
+    #[test]
+    fn kernel_pan_changes_the_view_without_dirtying_the_draft() {
+        let mut app = App::new(SimulationSpec::conway(), 32, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Kernels);
+        app.workbench_mut()
+            .set_kernel_view(crate::workbench::kernel_editor::KernelView {
+                center: [0.4, 0.4],
+                zoom: 4.0,
+            });
+        app.set_viewport(ratatui::layout::Rect::new(24, 1, 60, 32), [480, 512]);
+        let before = app.workbench().kernel_view();
+        let mut tracker = crate::input::MouseTracker::new();
+        let down = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Middle),
+            column: 50,
+            row: 12,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let drag = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Middle),
+            column: 54,
+            row: 14,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        app.handle_mouse(down, &mut tracker);
+        assert!(app.handle_mouse(drag, &mut tracker));
+        assert_ne!(app.workbench().kernel_view(), before);
+        assert_eq!(
+            app.workbench().status(),
+            crate::workbench::DraftStatus::Clean
+        );
     }
 
     #[test]

@@ -247,13 +247,13 @@ pub fn run_protocol_probe(host: &str) -> io::Result<ProtocolProbeReport> {
             && snapshot.applied_input_sequence >= mouse_sequence
             && snapshot
                 .cells
-                .get(72 * 256 + 50)
+                .get(136 * 256 + 132)
                 .is_some_and(|value| *value >= 0.99)
             && snapshot
                 .cells
                 .iter()
                 .enumerate()
-                .all(|(index, value)| index == 72 * 256 + 50 || *value < 0.01)
+                .all(|(index, value)| index == 136 * 256 + 132 || *value < 0.01)
     })?;
     let mouse_latency_ms = painted.at.duration_since(mouse_started).as_secs_f64() * 1_000.0;
 

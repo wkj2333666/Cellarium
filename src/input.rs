@@ -123,13 +123,13 @@ pub fn map_viewport_point(
     }
     Some(LogicalPoint {
         x: (x * logical_size[0] / u32::from(viewport.width)).min(logical_size[0].saturating_sub(1)),
-        y: (y * logical_size[1] / u32::from(viewport.height)).min(logical_size[1].saturating_sub(1)),
+        y: (y * logical_size[1] / u32::from(viewport.height))
+            .min(logical_size[1].saturating_sub(1)),
     })
 }
 
 pub fn should_forward_mouse_event(event: &MouseEvent, applied: bool) -> bool {
-    applied
-        || matches!(event.kind, MouseEventKind::Down(_) | MouseEventKind::Up(_))
+    applied || matches!(event.kind, MouseEventKind::Down(_) | MouseEventKind::Up(_))
 }
 
 pub fn translate_key(event: &KeyEvent) -> Option<Command> {

@@ -139,7 +139,9 @@ impl Parser {
         };
         if let Some(op) = op {
             self.advance();
-            let operand = self.parse_unary();
+            // Exponentiation binds more tightly than prefix operators, while
+            // still allowing a prefix expression on the right of `^`.
+            let operand = self.parse_expression(7);
             return Expr {
                 span: Span::new(token.span.start, operand.span.end),
                 kind: ExprKind::Unary {
@@ -313,6 +315,24 @@ mod tests {
             program.result.kind,
             ExprKind::Binary {
                 op: BinaryOp::Add,
+                ..
+            }
+        ));
+    }
+    #[test]
+    fn exponentiation_binds_tighter_than_unary_minus() {
+        let program = parse_program("-2.0 ^ 2.0").unwrap();
+        let ExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } = program.result.kind
+        else {
+            panic!("expected unary negation at the root");
+        };
+        assert!(matches!(
+            operand.kind,
+            ExprKind::Binary {
+                op: BinaryOp::Power,
                 ..
             }
         ));

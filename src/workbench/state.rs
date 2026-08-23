@@ -69,6 +69,7 @@ pub struct WorkbenchState {
     growth_editor: GrowthEditorState,
     growth_editing: bool,
     selected_prototype: Option<PrototypeId>,
+    kernel_view: super::kernel_editor::KernelView,
 }
 impl WorkbenchState {
     pub fn new(spec: ExperimentSpec) -> Self {
@@ -90,6 +91,7 @@ impl WorkbenchState {
             growth_editor,
             growth_editing: false,
             selected_prototype,
+            kernel_view: super::kernel_editor::KernelView::default(),
         }
     }
     pub fn draft(&self) -> &ExperimentSpec {
@@ -115,6 +117,12 @@ impl WorkbenchState {
     }
     pub fn channel_view(&self) -> ChannelView {
         self.channel_view
+    }
+    pub fn kernel_view(&self) -> super::kernel_editor::KernelView {
+        self.kernel_view
+    }
+    pub fn set_kernel_view(&mut self, view: super::kernel_editor::KernelView) {
+        self.kernel_view = view;
     }
     pub fn growth_editor(&self) -> &GrowthEditorState {
         &self.growth_editor

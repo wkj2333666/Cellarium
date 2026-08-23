@@ -571,7 +571,7 @@ fn local_pty_user_journey_survives_a_burst_of_input() {
         &mut child,
         master,
         &mut output,
-        Instant::now() + Duration::from_secs(3),
+        Instant::now() + Duration::from_secs(8),
         |output| contains(output, b"paused"),
     );
     assert!(

@@ -151,7 +151,7 @@ fn draw_footer(
         app.tick(),
         display.protocol().label(),
     );
-    let row2 = "[Click] section  [T] section  [Tab] focus  [Ctrl+Z/Y] undo/redo  [Ctrl+Enter] Apply  [Ctrl+S/E/O] files  [W] simulate  [?] help";
+    let row2 = "[Click/T] section  [Tab] focus  [Ctrl+Z/Y] undo/redo  [Ctrl+Enter] Apply  [Ctrl+S/E/O] files  [W] simulate  [?] help";
     let lines = vec![
         Line::from(truncate_chars(&row1, area.width as usize)),
         Line::from(truncate_chars(row2, area.width as usize)),

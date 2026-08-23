@@ -1,12 +1,15 @@
 use super::kitty_terminal::{KittyStreamParser, consume_shared_frame};
-use std::io;
 use std::collections::HashSet;
+use std::io::{self, Read};
 use std::os::fd::FromRawFd;
 use std::process::{Child, Command, Stdio};
+use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const INPUT_TIMEOUT: Duration = Duration::from_secs(5);
+const FRAME_WARMUP: Duration = Duration::from_secs(1);
 const FRAME_WINDOW: Duration = Duration::from_secs(3);
 
 #[derive(Debug)]
@@ -36,14 +39,23 @@ struct FrameObservation {
     size: usize,
 }
 
+struct CapturedGraphics {
+    width: u32,
+    height: u32,
+    rgba: Vec<u8>,
+}
+
 struct PtySession {
     master: i32,
     child: Child,
     parser: KittyStreamParser,
     output: Vec<u8>,
+    trace_output: Arc<Mutex<Vec<u8>>>,
+    trace_thread: Option<JoinHandle<()>>,
     screen: TerminalScreen,
     frames: Vec<FrameObservation>,
     active_kitty_images: HashSet<u32>,
+    latest_graphics: Option<CapturedGraphics>,
 }
 
 enum EscapeState {
@@ -59,6 +71,8 @@ pub struct TerminalScreen {
     column: usize,
     row: usize,
     cells: Vec<u8>,
+    styles: Vec<u64>,
+    current_style: u64,
     state: EscapeState,
     utf8_remaining: u8,
 }
@@ -73,6 +87,8 @@ impl TerminalScreen {
             column: 0,
             row: 0,
             cells: vec![b' '; width * height],
+            styles: vec![0; width * height],
+            current_style: 0,
             state: EscapeState::Ground,
             utf8_remaining: 0,
         }
@@ -143,9 +159,25 @@ impl TerminalScreen {
             .join("\\n")
     }
 
+    pub fn visual_hash(&self, x: usize, y: usize, width: usize, height: usize) -> u64 {
+        let mut hash = 0xcbf29ce484222325_u64;
+        for row in y..(y + height).min(self.height) {
+            for column in x..(x + width).min(self.width) {
+                let index = row * self.width + column;
+                hash ^= u64::from(self.cells[index]);
+                hash = hash.wrapping_mul(0x100000001b3);
+                hash ^= self.styles[index];
+                hash = hash.wrapping_mul(0x100000001b3);
+            }
+        }
+        hash
+    }
+
     fn put(&mut self, byte: u8) {
         if self.column < self.width && self.row < self.height {
-            self.cells[self.row * self.width + self.column] = byte;
+            let index = self.row * self.width + self.column;
+            self.cells[index] = byte;
+            self.styles[index] = self.current_style;
         }
         self.column = (self.column + 1).min(self.width.saturating_sub(1));
     }
@@ -180,7 +212,10 @@ impl TerminalScreen {
             b'B' => self.row = (self.row + value(0, 1)).min(self.height - 1),
             b'C' => self.column = (self.column + value(0, 1)).min(self.width - 1),
             b'D' => self.column = self.column.saturating_sub(value(0, 1)),
-            b'J' if values.first().copied() == Some(2) => self.cells.fill(b' '),
+            b'J' if values.first().copied() == Some(2) => {
+                self.cells.fill(b' ');
+                self.styles.fill(0);
+            }
             b'K' => {
                 let mode = values.first().copied().unwrap_or(0);
                 let start = self.row * self.width;
@@ -189,7 +224,15 @@ impl TerminalScreen {
                     2 => start..start + self.width,
                     _ => start + self.column..start + self.width,
                 };
-                self.cells[range].fill(b' ');
+                self.cells[range.clone()].fill(b' ');
+                self.styles[range].fill(0);
+            }
+            b'm' => {
+                if bytes.is_empty() || values.iter().all(|value| *value == 0) {
+                    self.current_style = 0;
+                } else {
+                    self.current_style = hash_bytes(bytes);
+                }
             }
             _ => {}
         }
@@ -250,7 +293,6 @@ impl PtySession {
 
         let stdin = unsafe { Stdio::from_raw_fd(libc::dup(slave)) };
         let stdout = unsafe { Stdio::from_raw_fd(libc::dup(slave)) };
-        let stderr = unsafe { Stdio::from_raw_fd(libc::dup(slave)) };
         let ssh_command = std::env::var("CELLARIUM_E2E_SSH_COMMAND").unwrap_or_else(|_| {
             std::env::var_os("CELLARIUM_E2E_SSH_CONFIG")
                 .map(|path| format!("ssh -F {}", path.to_string_lossy()))
@@ -263,7 +305,7 @@ impl PtySession {
             .args(["connect", host])
             .stdin(stdin)
             .stdout(stdout)
-            .stderr(stderr)
+            .stderr(Stdio::piped())
             .env(
                 "TERM",
                 if graphics {
@@ -283,16 +325,37 @@ impl PtySession {
         } else {
             command.env_remove("KITTY_WINDOW_ID");
         }
-        let child = command.spawn()?;
+        let mut child = command.spawn()?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| io::Error::other("failed to capture E2E trace stream"))?;
+        let trace_output = Arc::new(Mutex::new(Vec::new()));
+        let trace_sink = Arc::clone(&trace_output);
+        let trace_thread = std::thread::spawn(move || {
+            let mut buffer = [0_u8; 4096];
+            while let Ok(count) = stderr.read(&mut buffer) {
+                if count == 0 {
+                    break;
+                }
+                trace_sink
+                    .lock()
+                    .expect("trace buffer mutex poisoned")
+                    .extend_from_slice(&buffer[..count]);
+            }
+        });
         unsafe { libc::close(slave) };
         Ok(Self {
             master,
             child,
             parser: KittyStreamParser::default(),
             output: Vec::new(),
+            trace_output,
+            trace_thread: Some(trace_thread),
             screen: TerminalScreen::new(columns, rows),
             frames: Vec::new(),
             active_kitty_images: HashSet::new(),
+            latest_graphics: None,
         })
     }
 
@@ -305,6 +368,110 @@ impl PtySession {
             return Err(io::Error::new(io::ErrorKind::WriteZero, "short PTY write"));
         }
         Ok(())
+    }
+
+    fn trace_len(&self) -> usize {
+        self.trace_output
+            .lock()
+            .expect("trace buffer mutex poisoned")
+            .len()
+    }
+
+    fn trace_contains_since(&self, start: usize, needle: &[u8]) -> bool {
+        let trace = self
+            .trace_output
+            .lock()
+            .expect("trace buffer mutex poisoned");
+        start <= trace.len() && contains(&trace[start..], needle)
+    }
+
+    fn last_trace_line_since(&self, start: usize, prefix: &[u8]) -> Option<Vec<u8>> {
+        let trace = self
+            .trace_output
+            .lock()
+            .expect("trace buffer mutex poisoned");
+        if start > trace.len() {
+            return None;
+        }
+        trace[start..]
+            .split(|byte| *byte == b'\n')
+            .rev()
+            .find(|line| contains(line, prefix))
+            .map(|line| line.to_vec())
+    }
+
+    fn trace_tail(&self) -> String {
+        let trace = self
+            .trace_output
+            .lock()
+            .expect("trace buffer mutex poisoned");
+        String::from_utf8_lossy(&trace[trace.len().saturating_sub(1000)..]).into_owned()
+    }
+
+    fn wait_for_stable_new_kitty_frame(
+        &mut self,
+        description: &str,
+        checkpoint: usize,
+        old_hash: Option<u64>,
+    ) -> io::Result<u64> {
+        let result = self.pump_until(description, INPUT_TIMEOUT, |session| {
+            let fresh = &session.frames[checkpoint.min(session.frames.len())..];
+            if fresh.len() < 2 {
+                return false;
+            }
+            let last = fresh[fresh.len() - 1].hash;
+            let previous = fresh[fresh.len() - 2].hash;
+            last == previous && Some(last) != old_hash
+        });
+        if let Err(error) = result {
+            return Err(io::Error::new(
+                error.kind(),
+                format!("{error}; trace={}", self.trace_tail()),
+            ));
+        }
+        Ok(self.frames.last().expect("stable Kitty frame").hash)
+    }
+
+    fn wait_for_stable_new_terminal_visual(
+        &mut self,
+        description: &str,
+        region: (usize, usize, usize, usize),
+        old_hash: Option<u64>,
+    ) -> io::Result<u64> {
+        let deadline = Instant::now() + INPUT_TIMEOUT;
+        let mut candidate = None::<(u64, Instant)>;
+        loop {
+            self.pump_once()?;
+            let hash = self
+                .screen
+                .visual_hash(region.0, region.1, region.2, region.3);
+            if Some(hash) != old_hash {
+                match candidate {
+                    Some((previous, since)) if previous == hash => {
+                        if since.elapsed() >= Duration::from_millis(120) {
+                            return Ok(hash);
+                        }
+                    }
+                    _ => candidate = Some((hash, Instant::now())),
+                }
+            }
+            if let Some(status) = self.child.try_wait()? {
+                return Err(io::Error::other(format!(
+                    "cellarium exited with {status} while waiting for {description}; trace: {}",
+                    self.trace_tail()
+                )));
+            }
+            if Instant::now() >= deadline {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "timed out waiting for stable visual change: {description}; trace={}; screen=\\n{}",
+                        self.trace_tail(),
+                        self.screen.dump()
+                    ),
+                ));
+            }
+        }
     }
 
     fn pump_once(&mut self) -> io::Result<()> {
@@ -342,12 +509,22 @@ impl PtySession {
             for command in self.parser.push(bytes) {
                 observe_kitty_placement(&command.control, &mut self.active_kitty_images);
                 if command.control.split(',').any(|field| field == "t=s") {
+                    let dimensions = kitty_dimensions(&command.control);
                     let frame = consume_shared_frame(&command)?;
                     self.frames.push(FrameObservation {
                         at: Instant::now(),
                         hash: hash_bytes(&frame.bytes),
                         size: frame.bytes.len(),
                     });
+                    if let Some((width, height)) = dimensions
+                        && frame.bytes.len() == width as usize * height as usize * 4
+                    {
+                        self.latest_graphics = Some(CapturedGraphics {
+                            width,
+                            height,
+                            rgba: frame.bytes,
+                        });
+                    }
                 }
             }
         }
@@ -367,8 +544,9 @@ impl PtySession {
             }
             if let Some(status) = self.child.try_wait()? {
                 return Err(io::Error::other(format!(
-                    "cellarium exited with {status} while waiting for {description}: {}",
-                    String::from_utf8_lossy(&self.output)
+                    "cellarium exited with {status} while waiting for {description}: {}; trace: {}",
+                    String::from_utf8_lossy(&self.output),
+                    self.trace_tail()
                 )));
             }
             if Instant::now() >= deadline {
@@ -420,12 +598,38 @@ impl PtySession {
             }
         }
     }
+
+    fn capture_state(&self, label: &str) -> io::Result<()> {
+        let Some(directory) = std::env::var_os("CELLARIUM_E2E_CAPTURE_DIR") else {
+            return Ok(());
+        };
+        let directory = std::path::PathBuf::from(directory);
+        std::fs::create_dir_all(&directory)?;
+        std::fs::write(directory.join(format!("{label}.txt")), self.screen.dump())?;
+        if !self.active_kitty_images.is_empty()
+            && let Some(graphics) = &self.latest_graphics
+        {
+            image::save_buffer_with_format(
+                directory.join(format!("{label}.png")),
+                &graphics.rgba,
+                graphics.width,
+                graphics.height,
+                image::ColorType::Rgba8,
+                image::ImageFormat::Png,
+            )
+            .map_err(io::Error::other)?;
+        }
+        Ok(())
+    }
 }
 
 impl Drop for PtySession {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        if let Some(thread) = self.trace_thread.take() {
+            let _ = thread.join();
+        }
         unsafe { libc::close(self.master) };
     }
 }
@@ -438,19 +642,28 @@ pub fn run_terminal_probe(host: &str) -> io::Result<TerminalProbeReport> {
         !session.frames.is_empty()
     })?;
 
+    // The first graphics frame only proves that the Kitty path is alive. It
+    // may precede server startup/snapshot synchronisation by hundreds of
+    // milliseconds, so including the next interval reports startup latency as
+    // steady-state render cadence. Warm the complete C/S pipeline first, then
+    // measure every interval in a separate uninterrupted window.
+    session.pump_for(FRAME_WARMUP)?;
     let cadence_start = session.frames.len() - 1;
+    let cadence_started_at = Instant::now();
     session.pump_for(FRAME_WINDOW)?;
+    let cadence_elapsed = cadence_started_at.elapsed().as_secs_f64();
     let cadence_frames = &session.frames[cadence_start..];
     if cadence_frames.len() < 2 {
         return Err(io::Error::other("fewer than two Kitty frames consumed"));
     }
-    let cadence_elapsed = cadence_frames
-        .last()
-        .unwrap()
-        .at
-        .duration_since(cadence_frames[0].at)
-        .as_secs_f64();
+    // Count frames against the complete wall-clock window. This deliberately
+    // includes any empty tail after the final frame, so a renderer that runs
+    // briefly and then stalls cannot report an inflated cadence.
     let kitty_frame_hz = (cadence_frames.len() - 1) as f64 / cadence_elapsed;
+    let cadence_intervals_ms = cadence_frames
+        .windows(2)
+        .map(|pair| pair[1].at.duration_since(pair[0].at).as_secs_f64() * 1_000.0)
+        .collect::<Vec<_>>();
 
     let pause_started = Instant::now();
     session.write(b" ")?;
@@ -532,11 +745,7 @@ pub fn run_terminal_probe(host: &str) -> io::Result<TerminalProbeReport> {
     let mouse_ack_latency_ms = mouse_ack_at.duration_since(mouse_started).as_secs_f64() * 1_000.0;
 
     let observed_frames = session.frames.len();
-    let frame_intervals_ms = session
-        .frames
-        .windows(2)
-        .map(|pair| pair[1].at.duration_since(pair[0].at).as_secs_f64() * 1_000.0)
-        .collect();
+    let frame_intervals_ms = cadence_intervals_ms;
     let frame_sizes = session.frames.iter().map(|frame| frame.size).collect();
     session.write(b"q")?;
     session.wait_for_successful_exit(INPUT_TIMEOUT)?;
@@ -561,76 +770,398 @@ pub fn run_terminal_probe(host: &str) -> io::Result<TerminalProbeReport> {
     })
 }
 
-/// A separate half-block PTY session keeps this user-flow test independent of
-/// the graphics encoder backlog.  Graphics cadence is measured by
-/// `run_terminal_probe`; input semantics are measured here against the same
-/// SSH connector and the same server.
+/// Drive the actual Kitty Workbench end to end: click/drag the canvas, operate
+/// every editor section, type Growth source, and Apply the draft.
 pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
-    let mut session = PtySession::spawn_with_graphics(host, 64, 20, false)?;
+    // Use a wide, realistic Workbench terminal so the Inspector/editor pane
+    // is present and user-visible while typing Growth source.
+    let mut session = PtySession::spawn_with_graphics(host, 120, 36, true)?;
     session.pump_until("Workbench startup", STARTUP_TIMEOUT, |session| {
         session.screen.contains(b"Cellarium")
     })?;
+    let workbench_trace_start = session.trace_len();
+    let workbench_frame_start = session.frames.len();
+    let simulation_hash = session.frames.last().map(|frame| frame.hash);
     session.write(b"w")?;
     session.pump_until("Workbench shell", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"Workbench") && session.screen.contains(b"World")
+        session.screen.contains(b"Workbench")
+            && session.screen.contains(b"World")
+            && !session.active_kitty_images.is_empty()
     })?;
-    session.write(b"\x1b[<0;30;8M")?;
+    let world_hash = Some(session.wait_for_stable_new_kitty_frame(
+        "stable Workbench World graphics",
+        workbench_frame_start,
+        simulation_hash,
+    )?);
+    // Paint a real stroke (press, drag, release). Leaving the button held
+    // would make subsequent keyboard input look like a drag to a real terminal.
+    let paint_trace_start = session.trace_len();
+    let paint_frame_start = session.frames.len();
+    let mut stroke = b"\x1b[<0;35;18M".to_vec();
+    for column in (37..=71).step_by(2) {
+        stroke.extend_from_slice(format!("\x1b[<32;{column};18M").as_bytes());
+    }
+    stroke.extend_from_slice(b"\x1b[<0;71;18m");
+    session.write(&stroke)?;
     session.pump_until("Workbench mouse paint", INPUT_TIMEOUT, |session| {
-        contains(&session.output, b"E2E_MOUSE_APPLIED")
+        session.trace_contains_since(paint_trace_start, b"E2E_WORKBENCH_MOUSE applied=true")
     })?;
-    session.write(b"tt")?;
+    let painted_hash = Some(session.wait_for_stable_new_kitty_frame(
+        "painted World graphics",
+        paint_frame_start,
+        world_hash,
+    )?);
+    // Pan like a Kitty user: middle-button press, drag, release.
+    let pan_frame_start = session.frames.len();
+    session.write(b"\x1b[<1;60;12M\x1b[<33;64;14M\x1b[<1;64;14m")?;
+    session.wait_for_stable_new_kitty_frame(
+        "middle-button canvas pan",
+        pan_frame_start,
+        painted_hash,
+    )?;
+    session.capture_state("01-world-painted-and-panned")?;
+    // Click Channels in the left Experiment outline (SGR coordinates are
+    // one-based; the section is the fourth terminal row).
+    session.write(b"\x1b[<0;5;4M\x1b[<0;5;4m")?;
     session.pump_until("Channels section", INPUT_TIMEOUT, |session| {
         session.screen.contains(b"Channel compositor")
     })?;
-    session.write(b"a]cvxff\x1a\x19")?;
+    if !session.active_kitty_images.is_empty() {
+        return Err(io::Error::other(
+            "text-only Channels must clear the previous Kitty placement",
+        ));
+    }
+    session.capture_state("02-channels")?;
+    // Freeze removes kernels targeting the channel. Verify undo/redo, then
+    // leave the draft restored so the following kernel editor is meaningful.
+    session.write(b"a]cvxf\x1a\x19\x1a")?;
     session.pump_until("channel controls", INPUT_TIMEOUT, |session| {
         session.screen.contains(b"channel_2")
     })?;
-    session.write(b"t")?;
+    let frames_before_kernels = session.frames.len();
+    let graphics_before_kernels = session.frames.last().map(|frame| frame.hash);
+    session.write(b"\x1b[<0;5;5M\x1b[<0;5;5m")?;
     session.pump_until("Kernels section", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"Kernel routing editor")
+        session.screen.contains(b"selected Kernels") && !session.active_kitty_images.is_empty()
     })?;
-    session.write(b"at")?;
+    let kernel_hash = Some(session.wait_for_stable_new_kitty_frame(
+        "stable Kernels graphics",
+        frames_before_kernels,
+        graphics_before_kernels,
+    )?);
+    let kernel_zoom_start = session.frames.len();
+    session.write(b"\x1b[<64;50;18M\x1b[<64;50;18M")?;
+    let zoomed_kernel_hash = Some(session.wait_for_stable_new_kitty_frame(
+        "mouse-wheel-zoomed kernel graphics",
+        kernel_zoom_start,
+        kernel_hash,
+    )?);
+    let kernel_pan_start = session.frames.len();
+    session.write(b"\x1b[<1;50;18M\x1b[<33;54;20M\x1b[<1;54;20m")?;
+    let panned_kernel_hash = Some(session.wait_for_stable_new_kitty_frame(
+        "middle-panned kernel graphics",
+        kernel_pan_start,
+        zoomed_kernel_hash,
+    )?);
+    // Paint an expression-defined kernel cell. The editor materializes the
+    // evaluated kernel so the result becomes directly editable.
+    let kernel_trace_start = session.trace_len();
+    let kernel_frame_start = session.frames.len();
+    session.write(b"\x1b[<0;30;8M\x1b[<0;30;8m")?;
+    session.pump_until("kernel mouse mutation", INPUT_TIMEOUT, |session| {
+        session.trace_contains_since(kernel_trace_start, b"E2E_WORKBENCH_MOUSE applied=true")
+    })?;
+    session.wait_for_stable_new_kitty_frame(
+        "mouse-edited kernel graphics",
+        kernel_frame_start,
+        panned_kernel_hash,
+    )?;
+    session.capture_state("03-kernel-mouse-edit")?;
+    session.write(b"a")?;
+    let frames_before_growth = session.frames.len();
+    let graphics_before_growth = session.frames.last().map(|frame| frame.hash);
+    session.write(b"\x1b[<0;5;6M\x1b[<0;5;6m")?;
     session.pump_until("Growth section", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"growth_")
+        session.screen.contains(b"selected Growth") && !session.active_kitty_images.is_empty()
     })?;
+    session.wait_for_stable_new_kitty_frame(
+        "stable Growth graphics",
+        frames_before_growth,
+        graphics_before_growth,
+    )?;
     session.write(b"e")?;
     session.pump_until("Growth editor", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"EDITING")
+        session.screen.contains(b"Growth source (editing")
     })?;
-    session.write(b"\r")?;
-    session.pump_for(Duration::from_millis(100))?;
+    // Type a valid expression suffix through the real PTY editor and require
+    // the high-resolution plot itself to change, not merely the text panel.
+    let growth_hash = session.frames.last().map(|frame| frame.hash);
+    let growth_frame_start = session.frames.len();
+    let growth_trace_start = session.trace_len();
+    session.write(b"+0.2*sin(potential*20)")?;
+    session.pump_until("typed Growth source", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"sin(potential*20)")
+            && session
+                .last_trace_line_since(growth_trace_start, b"E2E_GROWTH_VALID")
+                .is_some_and(|line| {
+                    contains(&line, b"E2E_GROWTH_VALID valid=true")
+                        && contains(&line, b"+0.2*sin(potential*20)")
+                })
+    })?;
+    session.wait_for_stable_new_kitty_frame(
+        "live Growth plot update",
+        growth_frame_start,
+        growth_hash,
+    )?;
+    session.capture_state("04-growth-expression-edit")?;
     session.write(b"\x1b")?;
     session.pump_for(Duration::from_millis(200))?;
-    session.write(b"t")?;
+    session.write(b"\x1b[<0;5;7M\x1b[<0;5;7m")?;
     session.pump_until("Experiment section", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"Experiment review")
+        session.screen.contains(b"Experiment review") && session.active_kitty_images.is_empty()
     })?;
-    session.write(b"ttpp+")?;
-    session.pump_until("octagon tiling editor", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"octagon")
+    if !session.active_kitty_images.is_empty() {
+        return Err(io::Error::other(
+            "text-only Experiment must clear the previous Kitty placement",
+        ));
+    }
+    session.capture_state("05-experiment-cleared")?;
+    let frames_before_tiling = session.frames.len();
+    let graphics_before_tiling = session.frames.last().map(|frame| frame.hash);
+    session.write(b"\x1b[<0;5;3M\x1b[<0;5;3mp")?;
+    session.pump_until("square tiling editor", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"selected Tiling") && !session.active_kitty_images.is_empty()
     })?;
-    session.write(b"tttt")?;
+    let tiling_hash = Some(session.wait_for_stable_new_kitty_frame(
+        "stable square tiling graphics",
+        frames_before_tiling,
+        graphics_before_tiling,
+    )?);
+    // Grab the square vertex at world (0, 0), drag it eight graphics pixels,
+    // and release. Undo afterwards so the final Apply remains a valid tiling.
+    let tiling_trace_start = session.trace_len();
+    let tiling_frame_start = session.frames.len();
+    session.write(b"\x1b[<0;55;18M\x1b[<32;56;18M\x1b[<0;56;18m")?;
+    session.pump_until("tiling vertex mutation", INPUT_TIMEOUT, |session| {
+        session.trace_contains_since(tiling_trace_start, b"E2E_WORKBENCH_MOUSE applied=true")
+    })?;
+    session.wait_for_stable_new_kitty_frame(
+        "mouse-dragged tiling vertex",
+        tiling_frame_start,
+        tiling_hash,
+    )?;
+    session.capture_state("06-tiling-vertex-drag")?;
+    session.write(b"\x1a")?;
+    session.pump_for(Duration::from_millis(200))?;
+    session.write(b"\x1b[<0;5;7M\x1b[<0;5;7m")?;
     session.pump_until("Experiment review", INPUT_TIMEOUT, |session| {
         session.screen.contains(b"Experiment review")
             && !session.screen.contains(b"Periodic tiling editor")
+            && session.active_kitty_images.is_empty()
     })?;
+    if !session.active_kitty_images.is_empty() {
+        return Err(io::Error::other(
+            "returning to Experiment must clear the Tiling Kitty placement",
+        ));
+    }
+    if session.trace_contains_since(workbench_trace_start, b"E2E_MOUSE_FORWARDED") {
+        return Err(io::Error::other(
+            "Workbench mouse input mutated the authoritative server before Apply",
+        ));
+    }
+    let experiment_click_trace = session.trace_len();
+    session.write(b"\x1b[<0;60;18M")?;
+    session.pump_until(
+        "Experiment canvas click handled without Apply",
+        INPUT_TIMEOUT,
+        |session| {
+            session.trace_contains_since(experiment_click_trace, b"E2E_WORKBENCH_MOUSE applied=")
+        },
+    )?;
+    if session.trace_contains_since(experiment_click_trace, b"E2E_APPLY_SENT") {
+        return Err(io::Error::other(
+            "clicking the Experiment canvas must not submit the draft",
+        ));
+    }
     let started = Instant::now();
     // Lowercase `a` is an unambiguous Apply fallback in Experiment review for
     // PTYs that cannot carry Ctrl+Enter modifiers through SSH.
     session.write(b"a")?;
     session.pump_until("Apply dispatch", INPUT_TIMEOUT, |session| {
-        contains(&session.output, b"E2E_APPLY_SENT")
+        session.trace_contains_since(workbench_trace_start, b"E2E_APPLY_SENT")
     })?;
     session.pump_until(
         "authoritative ApplyAccepted",
         Duration::from_secs(20),
-        |session| contains(&session.output, b"E2E_APPLY_ACCEPTED"),
+        |session| session.trace_contains_since(workbench_trace_start, b"E2E_APPLY_ACCEPTED"),
     )?;
     let latency = started.elapsed().as_secs_f64() * 1_000.0;
     session.write(b"q")?;
     session.wait_for_successful_exit(INPUT_TIMEOUT)?;
     Ok(latency)
+}
+
+/// Exercise the same editor entry, mouse, keyboard, source editing, and Apply
+/// path without any terminal graphics protocol.
+pub fn run_workbench_fallback_probe(host: &str) -> io::Result<()> {
+    let mut session = PtySession::spawn_with_graphics(host, 120, 36, false)?;
+    session.pump_until("fallback startup", STARTUP_TIMEOUT, |session| {
+        session.screen.contains(b"Cellarium")
+    })?;
+    session.write(b" ")?;
+    session.pump_until("fallback pause", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"paused")
+    })?;
+    let workbench_trace_start = session.trace_len();
+    let canvas_region = (25, 1, 58, 32);
+    let simulation_hash = session.screen.visual_hash(
+        canvas_region.0,
+        canvas_region.1,
+        canvas_region.2,
+        canvas_region.3,
+    );
+    session.write(b"w")?;
+    session.pump_until("fallback Workbench", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"Workbench") && session.screen.contains(b"World")
+    })?;
+    let mut canvas_hash = session.wait_for_stable_new_terminal_visual(
+        "stable fallback World canvas",
+        canvas_region,
+        Some(simulation_hash),
+    )?;
+    let paint_trace_start = session.trace_len();
+    let mut stroke = b"\x1b[<0;35;18M".to_vec();
+    for column in (37..=71).step_by(2) {
+        stroke.extend_from_slice(format!("\x1b[<32;{column};18M").as_bytes());
+    }
+    stroke.extend_from_slice(b"\x1b[<0;71;18m");
+    session.write(&stroke)?;
+    session.pump_until("fallback mouse paint", INPUT_TIMEOUT, |session| {
+        session.trace_contains_since(paint_trace_start, b"E2E_WORKBENCH_MOUSE applied=true")
+            && session.screen.contains(b"Dirty")
+    })?;
+    let painted_hash = session.wait_for_stable_new_terminal_visual(
+        "fallback World paint",
+        canvas_region,
+        Some(canvas_hash),
+    )?;
+    canvas_hash = painted_hash;
+    session.write(b"\x1b[<1;60;12M\x1b[<33;64;14M\x1b[<1;64;14m")?;
+    let _panned_hash = session.wait_for_stable_new_terminal_visual(
+        "fallback middle-button World pan",
+        canvas_region,
+        Some(canvas_hash),
+    )?;
+    session.write(b"\x1b[<0;5;5M\x1b[<0;5;5m")?;
+    session.pump_until("fallback Kernels", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"selected Kernels")
+    })?;
+    canvas_hash = session.wait_for_stable_new_terminal_visual(
+        "stable fallback Kernel canvas",
+        canvas_region,
+        Some(canvas_hash),
+    )?;
+    session.write(b"\x1b[<64;50;18M\x1b[<64;50;18M")?;
+    let zoomed_kernel_hash = session.wait_for_stable_new_terminal_visual(
+        "fallback mouse-wheel kernel zoom",
+        canvas_region,
+        Some(canvas_hash),
+    )?;
+    session.write(b"\x1b[<1;50;18M\x1b[<33;54;20M\x1b[<1;54;20m")?;
+    canvas_hash = session.wait_for_stable_new_terminal_visual(
+        "fallback middle-button kernel pan",
+        canvas_region,
+        Some(zoomed_kernel_hash),
+    )?;
+    let kernel_trace_start = session.trace_len();
+    session.write(b"\x1b[<0;30;8M\x1b[<0;30;8m")?;
+    session.pump_until("fallback kernel mutation", INPUT_TIMEOUT, |session| {
+        session.trace_contains_since(kernel_trace_start, b"E2E_WORKBENCH_MOUSE applied=true")
+    })?;
+    let kernel_hash = session.wait_for_stable_new_terminal_visual(
+        "fallback kernel mouse edit",
+        canvas_region,
+        Some(canvas_hash),
+    )?;
+    session.write(b"\x1b[<0;5;6M\x1b[<0;5;6m")?;
+    session.pump_until("fallback Growth", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"selected Growth")
+    })?;
+    canvas_hash = session.wait_for_stable_new_terminal_visual(
+        "stable fallback Growth canvas",
+        canvas_region,
+        Some(kernel_hash),
+    )?;
+    let growth_trace_start = session.trace_len();
+    session.write(b"e+0.1*sin(potential*10)")?;
+    session.pump_until("fallback Growth source typing", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"Growth source (editing")
+            && session.screen.contains(b"sin(potential*10)")
+            && session
+                .last_trace_line_since(growth_trace_start, b"E2E_GROWTH_VALID")
+                .is_some_and(|line| {
+                    contains(&line, b"E2E_GROWTH_VALID valid=true")
+                        && contains(&line, b"+0.1*sin(potential*10)")
+                })
+    })?;
+    let growth_hash = session.wait_for_stable_new_terminal_visual(
+        "valid fallback Growth curve",
+        canvas_region,
+        Some(canvas_hash),
+    )?;
+    session.write(b"\x1b")?;
+    session.pump_for(Duration::from_millis(200))?;
+    session.write(b"\x1b[<0;5;3M\x1b[<0;5;3mp")?;
+    session.pump_until("fallback square Tiling", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"selected Tiling")
+    })?;
+    canvas_hash = session.wait_for_stable_new_terminal_visual(
+        "stable fallback Tiling canvas",
+        canvas_region,
+        Some(growth_hash),
+    )?;
+    let tiling_trace_start = session.trace_len();
+    session.write(b"\x1b[<0;55;18M\x1b[<32;56;18M\x1b[<0;56;18m")?;
+    session.pump_until("fallback tiling mutation", INPUT_TIMEOUT, |session| {
+        session.trace_contains_since(tiling_trace_start, b"E2E_WORKBENCH_MOUSE applied=true")
+    })?;
+    session.wait_for_stable_new_terminal_visual(
+        "fallback tiling vertex drag",
+        canvas_region,
+        Some(canvas_hash),
+    )?;
+    session.write(b"\x1a")?;
+    session.write(b"\x1b[<0;5;7M\x1b[<0;5;7m")?;
+    session.pump_until("fallback Experiment", INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"Experiment review")
+    })?;
+    if session.trace_contains_since(workbench_trace_start, b"E2E_MOUSE_FORWARDED") {
+        return Err(io::Error::other(
+            "fallback Workbench input mutated the server before Apply",
+        ));
+    }
+    let experiment_click_trace = session.trace_len();
+    session.write(b"\x1b[<0;60;18M")?;
+    session.pump_until(
+        "fallback Experiment canvas click handled without Apply",
+        INPUT_TIMEOUT,
+        |session| {
+            session.trace_contains_since(experiment_click_trace, b"E2E_WORKBENCH_MOUSE applied=")
+        },
+    )?;
+    if session.trace_contains_since(experiment_click_trace, b"E2E_APPLY_SENT") {
+        return Err(io::Error::other(
+            "fallback Experiment canvas click must not submit the draft",
+        ));
+    }
+    session.write(b"a")?;
+    session.pump_until(
+        "fallback authoritative ApplyAccepted",
+        Duration::from_secs(20),
+        |session| session.trace_contains_since(workbench_trace_start, b"E2E_APPLY_ACCEPTED"),
+    )?;
+    session.write(b"q")?;
+    session.wait_for_successful_exit(INPUT_TIMEOUT)
 }
 
 pub fn write_report(report: &TerminalProbeReport) -> io::Result<()> {
@@ -704,6 +1235,17 @@ fn hash_bytes(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325, |hash, byte| {
         (hash ^ u64::from(*byte)).wrapping_mul(0x100000001b3)
     })
+}
+
+fn kitty_dimensions(control: &str) -> Option<(u32, u32)> {
+    let fields = control
+        .split(',')
+        .filter_map(|field| field.split_once('='))
+        .collect::<std::collections::HashMap<_, _>>();
+    Some((
+        fields.get("s")?.parse().ok()?,
+        fields.get("v")?.parse().ok()?,
+    ))
 }
 
 fn observe_kitty_placement(control: &str, active: &mut HashSet<u32>) {

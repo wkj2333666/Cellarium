@@ -1,4 +1,6 @@
 use super::{GeometryIssue, PeriodicTilingDraft, PrototypeShape, RigidTransform, Vec2};
+
+pub const MAX_POLYGON_VERTICES: usize = 64;
 /// Minimal owned polygon adapter.  The public model deliberately does not
 /// expose a third-party geometry type; this boundary can be swapped for geo
 /// when the dependency is available in an offline build cache.
@@ -40,7 +42,16 @@ pub fn prototype_vertices(shape: &PrototypeShape) -> Result<Vec<Vec2>, Vec<Geome
                 })
                 .collect())
         }
-        PrototypeShape::SimplePolygon { vertices } => Ok(vertices.clone()),
+        PrototypeShape::SimplePolygon { vertices } => {
+            if vertices.len() > MAX_POLYGON_VERTICES {
+                return Err(vec![issue(
+                    "too_many_vertices",
+                    "polygon may contain at most 64 vertices",
+                    None,
+                )]);
+            }
+            Ok(vertices.clone())
+        }
     }
 }
 
@@ -82,6 +93,14 @@ pub fn transform_vertices(vertices: &[Vec2], transform: RigidTransform) -> Vec<V
 
 pub fn validate_polygon(vertices: &[Vec2]) -> Vec<GeometryIssue> {
     let mut issues = Vec::new();
+    if vertices.len() > MAX_POLYGON_VERTICES {
+        issues.push(issue(
+            "too_many_vertices",
+            "polygon may contain at most 64 vertices",
+            None,
+        ));
+        return issues;
+    }
     if vertices.len() < 3 {
         issues.push(issue(
             "too_few_vertices",
@@ -223,6 +242,25 @@ mod tests {
             validate_polygon(&vertices)
                 .iter()
                 .any(|i| i.code == "self_intersection")
+        );
+    }
+
+    #[test]
+    fn oversized_custom_polygon_is_rejected_before_quadratic_validation() {
+        let vertices = (0..=MAX_POLYGON_VERTICES)
+            .map(|index| {
+                let angle =
+                    2.0 * std::f64::consts::PI * index as f64 / (MAX_POLYGON_VERTICES + 1) as f64;
+                Vec2::new(angle.cos(), angle.sin())
+            })
+            .collect::<Vec<_>>();
+        let issues = validate_polygon(&vertices);
+        assert_eq!(issues.len(), 1);
+        assert_eq!(issues[0].code, "too_many_vertices");
+        let shape = PrototypeShape::SimplePolygon { vertices };
+        assert_eq!(
+            prototype_vertices(&shape).unwrap_err()[0].code,
+            "too_many_vertices"
         );
     }
 }

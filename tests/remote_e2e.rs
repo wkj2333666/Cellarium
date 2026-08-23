@@ -93,6 +93,16 @@ fn terminal_screen_reconstructs_differential_ack_updates() {
 }
 
 #[test]
+fn terminal_screen_visual_hash_includes_ansi_colors() {
+    let mut screen = terminal_probe::TerminalScreen::new(2, 1);
+    screen.push(b"\x1b[1;1H\x1b[38;2;255;0;0mX");
+    let red = screen.visual_hash(0, 0, 1, 1);
+    screen.push(b"\x1b[1;1H\x1b[38;2;0;255;0mX");
+    let green = screen.visual_hash(0, 0, 1, 1);
+    assert_ne!(red, green);
+}
+
+#[test]
 #[ignore = "requires a configured SSH alias and the installed tinker server"]
 fn tinker_protocol_observes_gpu_rates_and_input_latency() {
     let host = std::env::var("CELLARIUM_E2E_HOST").unwrap_or_else(|_| "tinker".into());
@@ -139,8 +149,8 @@ fn tinker_terminal_consumes_kitty_frames_and_observes_input() {
         "too few consumed frames: {report:?}"
     );
     assert!(
-        report.kitty_frame_hz > 0.0,
-        "no Kitty frame cadence: {report:?}"
+        report.kitty_frame_hz >= 20.0,
+        "optimized Kitty terminal should sustain an interactive frame rate: {report:?}"
     );
     assert!(
         report.pause_ack_latency_ms.is_finite(),
@@ -188,4 +198,11 @@ fn tinker_workbench_user_journey_applies_authoritatively() {
         "Apply latency: {latency}ms"
     );
     println!("Workbench ApplyAccepted latency: {latency:.1}ms");
+}
+
+#[test]
+#[ignore = "requires a configured SSH alias, PTY, and installed tinker server"]
+fn tinker_workbench_fallback_remains_fully_interactive() {
+    let host = std::env::var("CELLARIUM_E2E_HOST").unwrap_or_else(|_| "tinker".into());
+    terminal_probe::run_workbench_fallback_probe(&host).expect("Workbench fallback PTY E2E probe");
 }

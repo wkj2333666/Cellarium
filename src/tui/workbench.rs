@@ -47,7 +47,12 @@ pub fn workbench_layout(area: Rect) -> WorkbenchLayout {
     }
 }
 
-pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, display: &ViewportDisplay, area: Rect) {
+pub fn draw_workbench(
+    frame: &mut ratatui::Frame,
+    app: &mut App,
+    display: &ViewportDisplay,
+    area: Rect,
+) {
     let layout = workbench_layout(area);
     app.set_workbench_area(area);
     let state = app.workbench();
@@ -196,7 +201,7 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, display: &Viewp
     frame.render_widget(canvas_block, layout.canvas);
     if matches!(state.section(), WorkbenchSection::World) {
         let (width, height) = display.framebuffer_size(canvas_inner);
-        let graphics = initial_field_graphics(state, width as u32, height as u32);
+        let graphics = initial_field_graphics(state, *app.camera(), width as u32, height as u32);
         display.render_graphics(frame, canvas_inner, &graphics);
     } else if state.section() == WorkbenchSection::Tiling {
         if let Some(tiling) = &state.draft().tiling {
@@ -213,7 +218,9 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, display: &Viewp
         }
     } else if state.section() == WorkbenchSection::Kernels {
         if let Some(kernel) = state.draft().kernels.first() {
-            let scene = crate::workbench::kernel_editor::KernelScene::new(kernel.definition.clone());
+            let scene =
+                crate::workbench::kernel_editor::KernelScene::new(kernel.definition.clone())
+                    .with_view(state.kernel_view());
             let (width, height) = display.framebuffer_size(canvas_inner);
             let graphics = scene.render_rgba(width as u32, height as u32);
             display.render_graphics(frame, canvas_inner, &graphics);
@@ -248,18 +255,34 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, display: &Viewp
             Line::from(format!("view: {:?}", state.channel_view())),
             Line::from(""),
             Line::from("Click section · T section · Tab focus"),
-            Line::from("Canvas: left paint · right erase"),
-            Line::from("Wheel zoom · middle pan"),
-            Line::from("A add · Del remove · ] select"),
-            Line::from("V view · C color · X visible · F freeze"),
-            Line::from("P tiling preset · E edit Growth"),
-            Line::from("Tiling: N prototype · +/- sides"),
-            Line::from("Ctrl+Z/Y undo/redo"),
-            Line::from("Ctrl+Enter Apply"),
+        ];
+        match state.section() {
+            WorkbenchSection::World => {
+                lines.push(Line::from("Canvas: left paint · right erase"));
+                lines.push(Line::from("Wheel zoom · middle pan"));
+            }
+            WorkbenchSection::Tiling => {
+                lines.push(Line::from("Canvas: drag vertex · right remove"));
+                lines.push(Line::from("P preset · N prototype · +/- sides"));
+            }
+            WorkbenchSection::Channels => {
+                lines.push(Line::from("A add · Del remove · ] select"));
+                lines.push(Line::from("V view · C color · X visible · F freeze"));
+            }
+            WorkbenchSection::Kernels => {
+                lines.push(Line::from("Canvas: left set value · right mask"));
+                lines.push(Line::from("Wheel zoom · middle pan"));
+                lines.push(Line::from("A add · Del remove"));
+            }
+            WorkbenchSection::Growth => lines.push(Line::from("E edit Growth source")),
+            WorkbenchSection::Experiment => lines.push(Line::from("Review, then Apply")),
+        }
+        lines.extend([
+            Line::from("Ctrl+Z/Y undo/redo · Ctrl+Enter Apply"),
             Line::from("Ctrl+S active · Ctrl+E/O draft"),
             Line::from(app.workbench_notice().unwrap_or("")),
             Line::from("W leave Workbench · ? help"),
-        ];
+        ]);
         if state.section() == WorkbenchSection::Growth {
             lines.push(Line::from(""));
             lines.push(Line::from(if state.growth_editing() {
@@ -279,21 +302,13 @@ pub fn draw_workbench(frame: &mut ratatui::Frame, app: &mut App, display: &Viewp
             inspector,
         );
     }
-    let (width, height) = match &state.draft().geometry {
-        crate::sim::experiment_model::GeometrySpec::RasterGrid(grid) => {
-            (grid.width as usize, grid.height as usize)
-        }
-    };
-    let logical = if state.section() == WorkbenchSection::World {
-        [width, height]
-    } else {
-        [canvas_inner.width as usize, canvas_inner.height as usize * 2]
-    };
-    app.set_viewport(canvas_inner, logical);
+    let (frame_width, frame_height) = display.framebuffer_size(canvas_inner);
+    app.set_viewport(canvas_inner, [frame_width, frame_height]);
 }
 
 fn initial_field_graphics(
     state: &crate::workbench::WorkbenchState,
+    camera: crate::render::camera::Camera,
     width: u32,
     height: u32,
 ) -> crate::render::workbench_graphics::GraphicsFrame {
@@ -314,8 +329,13 @@ fn initial_field_graphics(
     let mut rgba = vec![0_u8; width as usize * height as usize * 4];
     for y in 0..height {
         for x in 0..width {
-            let wx = (x * grid_width / width).min(grid_width.saturating_sub(1)) as usize;
-            let wy = (y * grid_height / height).min(grid_height.saturating_sub(1)) as usize;
+            let world = camera.screen_to_world(
+                [x as f32 + 0.5, y as f32 + 0.5],
+                width as usize,
+                height as usize,
+            );
+            let wx = (world[0].floor() as isize).rem_euclid(grid_width as isize) as usize;
+            let wy = (world[1].floor() as isize).rem_euclid(grid_height as isize) as usize;
             let tile = wy * grid_width as usize + wx;
             let mut values = Vec::new();
             let mut active_colors = Vec::new();
