@@ -1,7 +1,7 @@
 use crate::sim::kernel::{
     Kernel, KernelDefinition, KernelValues, Normalization, render_definition, ring_definition,
 };
-use std::collections::VecDeque;
+use std::collections::{BTreeMap, VecDeque};
 use std::io::{ErrorKind, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -2841,6 +2841,7 @@ where
             inner: ratatui::backend::CrosstermBackend::new(AsyncTerminalWriter::new(Arc::clone(
                 &redraw_required,
             ))),
+            shadow: BTreeMap::new(),
         };
         let mut terminal = ratatui::Terminal::new(backend)?;
         run_remote_loop(
@@ -3180,6 +3181,7 @@ fn run_app_with_save(app: App, save_path: Option<&Path>) -> std::io::Result<()> 
             inner: ratatui::backend::CrosstermBackend::new(AsyncTerminalWriter::new(Arc::clone(
                 &redraw_required,
             ))),
+            shadow: BTreeMap::new(),
         };
         let mut terminal = ratatui::Terminal::new(backend)?;
         run_loop(
@@ -3227,6 +3229,7 @@ struct AsyncTerminalWriter {
 
 struct AsyncTerminalBackend {
     inner: ratatui::backend::CrosstermBackend<AsyncTerminalWriter>,
+    shadow: BTreeMap<(u16, u16), ratatui::buffer::Cell>,
 }
 
 impl ratatui::backend::Backend for AsyncTerminalBackend {
@@ -3236,7 +3239,11 @@ impl ratatui::backend::Backend for AsyncTerminalBackend {
     where
         I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
     {
-        self.inner.draw(content)
+        for (x, y, cell) in content {
+            self.shadow.insert((y, x), cell.clone());
+        }
+        self.inner
+            .draw(self.shadow.iter().map(|(&(y, x), cell)| (x, y, cell)))
     }
 
     fn append_lines(&mut self, n: u16) -> Result<(), Self::Error> {
@@ -3263,10 +3270,12 @@ impl ratatui::backend::Backend for AsyncTerminalBackend {
     }
 
     fn clear(&mut self) -> Result<(), Self::Error> {
+        self.shadow.clear();
         self.inner.clear()
     }
 
     fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> Result<(), Self::Error> {
+        self.shadow.clear();
         self.inner.clear_region(clear_type)
     }
 
@@ -3673,6 +3682,7 @@ mod tests {
         };
         let mut backend = AsyncTerminalBackend {
             inner: ratatui::backend::CrosstermBackend::new(writer),
+            shadow: BTreeMap::new(),
         };
 
         ratatui::backend::Backend::clear(&mut backend).unwrap();
@@ -3685,6 +3695,77 @@ mod tests {
         let emitted = state.0.lock().unwrap().take_output().unwrap_or_default();
         assert!(emitted.windows(4).any(|bytes| bytes == b"\x1b[2J"));
         assert!(emitted.windows(6).any(|bytes| bytes == b"\x1b[5;4H"));
+    }
+
+    #[test]
+    fn async_terminal_backend_replays_static_cells_in_later_frames() {
+        let redraw_required = Arc::new(AtomicBool::new(false));
+        let state = Arc::new((
+            Mutex::new(LatestFrameState {
+                clear_prefix: Vec::new(),
+                frame: None,
+                closed: true,
+            }),
+            Condvar::new(),
+        ));
+        let writer = AsyncTerminalWriter {
+            state: Arc::clone(&state),
+            pending: Vec::new(),
+            redraw_required,
+            worker: None,
+        };
+        let mut backend = AsyncTerminalBackend {
+            inner: ratatui::backend::CrosstermBackend::new(writer),
+            shadow: BTreeMap::new(),
+        };
+        let static_cell = ratatui::buffer::Cell::new("A");
+        ratatui::backend::Backend::draw(&mut backend, [(0, 0, &static_cell)].into_iter()).unwrap();
+        ratatui::backend::Backend::flush(&mut backend).unwrap();
+        let _ = state.0.lock().unwrap().take_output();
+
+        let changed_cell = ratatui::buffer::Cell::new("B");
+        ratatui::backend::Backend::draw(&mut backend, [(1, 0, &changed_cell)].into_iter()).unwrap();
+        ratatui::backend::Backend::flush(&mut backend).unwrap();
+        let emitted = state.0.lock().unwrap().take_output().unwrap_or_default();
+
+        assert!(emitted.contains(&b'A'));
+        assert!(emitted.contains(&b'B'));
+    }
+
+    #[test]
+    fn async_terminal_backend_forgets_static_cells_after_clear() {
+        let redraw_required = Arc::new(AtomicBool::new(false));
+        let state = Arc::new((
+            Mutex::new(LatestFrameState {
+                clear_prefix: Vec::new(),
+                frame: None,
+                closed: true,
+            }),
+            Condvar::new(),
+        ));
+        let writer = AsyncTerminalWriter {
+            state: Arc::clone(&state),
+            pending: Vec::new(),
+            redraw_required,
+            worker: None,
+        };
+        let mut backend = AsyncTerminalBackend {
+            inner: ratatui::backend::CrosstermBackend::new(writer),
+            shadow: BTreeMap::new(),
+        };
+        let stale_cell = ratatui::buffer::Cell::new("A");
+        ratatui::backend::Backend::draw(&mut backend, [(0, 0, &stale_cell)].into_iter()).unwrap();
+        ratatui::backend::Backend::flush(&mut backend).unwrap();
+        let _ = state.0.lock().unwrap().take_output();
+
+        ratatui::backend::Backend::clear(&mut backend).unwrap();
+        let new_cell = ratatui::buffer::Cell::new("B");
+        ratatui::backend::Backend::draw(&mut backend, [(1, 0, &new_cell)].into_iter()).unwrap();
+        ratatui::backend::Backend::flush(&mut backend).unwrap();
+        let emitted = state.0.lock().unwrap().take_output().unwrap_or_default();
+
+        assert!(!emitted.contains(&b'A'));
+        assert!(emitted.contains(&b'B'));
     }
 
     #[test]
