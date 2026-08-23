@@ -131,11 +131,70 @@ test_lifecycle_smoke() (
   test ! -S "/tmp/.X11-unix/X${display#:}" || fail 'X socket leaked after stop'
 )
 
+test_actions() (
+  local case_dir run_id manifest window_id geometry x y width height center_x center_y
+  local before after screen_width screen_height captured_width captured_height
+  case_dir=$(mktemp -d)
+  AGENTIC_TARGET_DIR="$case_dir/state"
+  export AGENTIC_TARGET_DIR
+  run_id="actions-$$-$RANDOM"
+  cleanup_actions_case() {
+    "$repo_root/scripts/agentic/session.sh" stop "$run_id" >/dev/null 2>&1 || true
+    rm -rf -- "$case_dir"
+  }
+  trap cleanup_actions_case EXIT
+
+  "$repo_root/scripts/agentic/session.sh" start "$run_id" 100 40 -- \
+    /usr/bin/bash --noprofile --norc
+  manifest="$AGENTIC_TARGET_DIR/$run_id/manifest.env"
+  # shellcheck source=../scripts/agentic/lib.sh
+  source "$repo_root/scripts/agentic/lib.sh"
+  window_id=$(agentic_manifest_get "$manifest" KITTY_WINDOW_ID)
+  geometry=$(DISPLAY="$(agentic_manifest_get "$manifest" DISPLAY)" \
+    xdotool getwindowgeometry --shell "$window_id")
+  x=$(awk -F= '$1 == "X" { print $2 }' <<<"$geometry")
+  y=$(awk -F= '$1 == "Y" { print $2 }' <<<"$geometry")
+  width=$(awk -F= '$1 == "WIDTH" { print $2 }' <<<"$geometry")
+  height=$(awk -F= '$1 == "HEIGHT" { print $2 }' <<<"$geometry")
+  center_x=$((x + width / 2))
+  center_y=$((y + height / 2))
+
+  if "$repo_root/scripts/agentic/action.sh" "$run_id" click -1 10 1; then
+    fail 'negative pointer coordinate was accepted'
+  fi
+  if "$repo_root/scripts/agentic/action.sh" "$run_id" click \
+      "$((x + width + 1))" "$center_y" 1; then
+    fail 'out-of-window click was accepted'
+  fi
+  if "$repo_root/scripts/agentic/action.sh" "$run_id" click \
+      "$center_x" "$center_y" 9; then
+    fail 'invalid mouse button was accepted'
+  fi
+
+  before=$("$repo_root/scripts/agentic/capture.sh" "$run_id" before-tab)
+  "$repo_root/scripts/agentic/action.sh" "$run_id" click "$center_x" "$center_y" 1
+  "$repo_root/scripts/agentic/action.sh" "$run_id" key ctrl+shift+t
+  after=$("$repo_root/scripts/agentic/capture.sh" "$run_id" after-tab)
+  test -s "$before" && test -s "$after" || fail 'capture produced an empty file'
+  test "$(file --brief --mime-type "$after")" = image/png || fail 'capture is not PNG'
+  screen_width=$(agentic_manifest_get "$manifest" SCREEN_WIDTH)
+  screen_height=$(agentic_manifest_get "$manifest" SCREEN_HEIGHT)
+  captured_width=$(ffprobe -v error -select_streams v:0 -show_entries stream=width \
+    -of default=noprint_wrappers=1:nokey=1 "$after")
+  captured_height=$(ffprobe -v error -select_streams v:0 -show_entries stream=height \
+    -of default=noprint_wrappers=1:nokey=1 "$after")
+  test "$captured_width" = "$screen_width" || fail 'capture width differs from X screen'
+  test "$captured_height" = "$screen_height" || fail 'capture height differs from X screen'
+
+  "$repo_root/scripts/agentic/session.sh" stop "$run_id"
+)
+
 case "${1:-contract}" in
   release) test_release ;;
   lib) test_lib ;;
   lifecycle-contract) test_lifecycle_contract ;;
   lifecycle-smoke) test_lifecycle_smoke ;;
+  actions) test_actions ;;
   contract) test_lib; test_release; test_lifecycle_contract ;;
   *) fail "unknown suite: ${1-}" ;;
 esac
