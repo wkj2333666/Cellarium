@@ -92,7 +92,8 @@ supervise() {
   openbox_pid=$!
   printf '%s\n' "$openbox_pid" >"$run_dir/openbox.pid"
 
-  kitty --config "$run_dir/kitty.conf" --title "$title" --class "$title" \
+  kitty --config "$run_dir/kitty.conf" --start-as fullscreen \
+    --title "$title" --class "$title" \
     /usr/bin/sh -c 'printf "%s\n" "$$" >"$1"; shift; exec "$@"' \
     sh "$run_dir/client.pid" "$@" >"$logs_dir/kitty.log" 2>&1 &
   kitty_pid=$!
