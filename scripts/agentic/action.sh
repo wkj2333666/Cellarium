@@ -71,7 +71,9 @@ case "$action" in
   text)
     [[ $# == 1 ]] || usage
     activate_window
-    xdotool type --clearmodifiers --delay 1 -- "$1"
+    # Keep text entry close to a fast human typist. One-millisecond bursts can
+    # outrun Kitty's first expose and are not representative user input.
+    xdotool type --clearmodifiers --delay 20 -- "$1"
     ;;
   click|double-click)
     [[ $# == 3 ]] || usage
