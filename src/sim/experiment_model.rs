@@ -3,8 +3,11 @@ use std::collections::{BTreeMap, BTreeSet};
 use serde::{Deserialize, Serialize};
 
 use crate::sim::kernel::{KernelDefinition, KernelValues, Normalization, ring_definition};
+use crate::sim::ruleset::{
+    KernelSpatialDefinition, RuleBinding, RuleKernel, RuleLibrary, RuleSet, RuleSetId,
+};
 use crate::sim::tiling::{
-    PeriodicTilingDraft,
+    BasisId, PeriodicTilingDraft,
     polygon::{prototype_vertices, validate_polygon},
 };
 use crate::sim::topology::BoundarySpec;
@@ -136,6 +139,10 @@ pub struct ExperimentSpec {
     pub channels: Vec<ChannelSpec>,
     pub kernels: Vec<KernelSlot>,
     pub growth: Vec<GrowthSource>,
+    /// Normalized basis-aware rules. Empty means a legacy global rule model
+    /// that has not yet crossed the one-way normalization boundary.
+    #[serde(default)]
+    pub rules: RuleLibrary,
     pub simulation_dt: f32,
     pub seed: u64,
     /// Optional polygonal tiling metadata. Raster execution remains the
@@ -183,6 +190,7 @@ impl ExperimentSpec {
                 source: "2 * exp(-((potential - mu) / sigma) ^ 2) - 1".to_string(),
                 mode: UpdateMode::GrowthRate,
             }],
+            rules: RuleLibrary::default(),
             simulation_dt: 0.1,
             seed: 0,
             tiling: None,
@@ -215,6 +223,88 @@ impl ExperimentSpec {
             });
         }
         id
+    }
+
+    pub fn basis_ids(&self) -> Vec<BasisId> {
+        let mut ids = self.tiling.as_ref().map_or_else(
+            || vec![BasisId(0)],
+            |tiling| {
+                tiling
+                    .instances
+                    .iter()
+                    .map(|instance| instance.id)
+                    .collect()
+            },
+        );
+        ids.sort_unstable();
+        ids.dedup();
+        if ids.is_empty() {
+            ids.push(BasisId(0));
+        }
+        ids
+    }
+
+    pub fn normalize_rules(mut self) -> Result<Self, Vec<ExperimentModelError>> {
+        if self.rules.is_empty() {
+            if let Err(errors) = validate_structure(&self) {
+                return Err(errors);
+            }
+            let basis_ids = self.basis_ids();
+            let active_channels = self
+                .channels
+                .iter()
+                .filter(|channel| !channel.frozen)
+                .map(|channel| channel.id)
+                .collect::<Vec<_>>();
+            for (index, output) in active_channels.iter().copied().enumerate() {
+                let Some(growth) = self
+                    .growth
+                    .iter()
+                    .find(|growth| growth.target == output)
+                    .cloned()
+                else {
+                    return Err(vec![ExperimentModelError::MissingGrowthProgram(output)]);
+                };
+                let id = RuleSetId(u32::try_from(index).map_err(|_| {
+                    vec![ExperimentModelError::InvalidRules(
+                        "too many active channels".to_string(),
+                    )]
+                })?);
+                let kernels = self
+                    .kernels
+                    .iter()
+                    .filter(|kernel| kernel.target == output)
+                    .map(|kernel| RuleKernel {
+                        id: kernel.id,
+                        symbol: kernel.symbol.clone(),
+                        name: kernel.name.clone(),
+                        source_channel: kernel.source,
+                        spatial: KernelSpatialDefinition::Raster(kernel.definition.clone()),
+                    })
+                    .collect();
+                self.rules.defaults.insert(output, id);
+                self.rules.sets.push(RuleSet {
+                    id,
+                    shared_name: None,
+                    kernels,
+                    growth,
+                });
+                self.rules
+                    .bindings
+                    .extend(basis_ids.iter().map(|basis| RuleBinding {
+                        basis: *basis,
+                        output,
+                        rule_set: id,
+                    }));
+            }
+        }
+        if let Err(errors) = self.rules.validate(&self.basis_ids(), &self.channels) {
+            return Err(errors
+                .into_iter()
+                .map(|error| ExperimentModelError::InvalidRules(error.to_string()))
+                .collect());
+        }
+        Ok(self)
     }
 }
 
@@ -279,6 +369,8 @@ pub enum ExperimentModelError {
     EmptyGrowthSource(ChannelId),
     #[error("tiling is invalid: {0}")]
     InvalidTiling(String),
+    #[error("basis rules are invalid: {0}")]
+    InvalidRules(String),
 }
 
 pub fn validate_structure(spec: &ExperimentSpec) -> Result<(), Vec<ExperimentModelError>> {
@@ -498,6 +590,16 @@ pub fn validate_structure(spec: &ExperimentSpec) -> Result<(), Vec<ExperimentMod
         }
     }
 
+    if !spec.rules.is_empty()
+        && let Err(rule_errors) = spec.rules.validate(&spec.basis_ids(), &spec.channels)
+    {
+        errors.extend(
+            rule_errors
+                .into_iter()
+                .map(|error| ExperimentModelError::InvalidRules(error.to_string())),
+        );
+    }
+
     if errors.is_empty() {
         Ok(())
     } else {
@@ -515,6 +617,17 @@ mod tests {
         assert_eq!(model.channels.len(), 1);
         assert_eq!(model.channels[0].initial.len(), 32 * 24);
         assert!(validate_structure(&model).is_ok());
+    }
+
+    #[test]
+    fn default_has_one_channel_one_basis_one_kernel() {
+        let spec = ExperimentSpec::single_channel_lenia(8, 8)
+            .normalize_rules()
+            .unwrap();
+        let basis = spec.basis_ids();
+        assert_eq!(basis.len(), 1);
+        let binding = spec.rules.binding(basis[0], spec.channels[0].id).unwrap();
+        assert_eq!(spec.rules.get(binding.rule_set).unwrap().kernels.len(), 1);
     }
 
     #[test]

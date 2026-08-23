@@ -451,6 +451,7 @@ fn migrate_legacy(wire: ExperimentWire) -> Result<ExperimentFileV2, ExperimentEr
         }],
         kernels: Vec::new(),
         growth: Vec::new(),
+        rules: Default::default(),
         simulation_dt: 1.0,
         seed: wire.seed,
         tiling: None,

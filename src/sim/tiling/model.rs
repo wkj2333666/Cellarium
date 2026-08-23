@@ -5,6 +5,11 @@ use serde::{Deserialize, Serialize};
 )]
 pub struct TileId(pub u32);
 
+/// Stable semantic identifier for one independent polygonal site inside a
+/// periodic unit cell.  This is an item alias rather than a newtype so legacy
+/// `TileId` RON and protocol payloads remain byte-for-byte compatible.
+pub use TileId as BasisId;
+
 #[derive(
     Clone, Copy, Debug, Default, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize,
 )]

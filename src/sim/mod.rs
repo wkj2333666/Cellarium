@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod backend_error;
+pub mod basis_kernel;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
@@ -15,6 +16,7 @@ pub mod parser;
 pub mod program;
 pub mod program_file;
 pub mod rule;
+pub mod ruleset;
 pub mod runtime;
 pub mod service;
 pub mod strategy;
