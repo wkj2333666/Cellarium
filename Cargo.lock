@@ -183,6 +183,7 @@ dependencies = [
  "ron",
  "serde",
  "thiserror 2.0.20",
+ "unicode-width",
 ]
 
 [[package]]

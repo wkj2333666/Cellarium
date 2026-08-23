@@ -1,8 +1,19 @@
 use crate::render::workbench_graphics::{GraphicsFrame, GraphicsScene};
 use crate::sim::tiling::{
     PeriodicTilingDraft, PrototypeId, PrototypeShape, Vec2,
-    polygon::{MAX_POLYGON_VERTICES, prototype_vertices, transform_vertices, validate_polygon},
+    polygon::{prototype_vertices, transform_vertices, validate_polygon},
 };
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum TilingTool {
+    #[default]
+    Select,
+    DrawPolygon,
+    AddNeighbor,
+    ConfirmSeam,
+    SplitEdge,
+    Pan,
+}
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TilingCamera {
@@ -46,6 +57,7 @@ pub struct TilingScene {
     pub selected_prototype: Option<PrototypeId>,
     pub selected_vertex: Option<usize>,
     pub camera: TilingCamera,
+    pub construction: Vec<Vec2>,
 }
 
 impl TilingScene {
@@ -55,7 +67,18 @@ impl TilingScene {
             draft,
             selected_vertex: None,
             camera: TilingCamera::default(),
+            construction: Vec::new(),
         }
+    }
+
+    pub fn with_selection(mut self, selected: Option<PrototypeId>) -> Self {
+        self.selected_prototype = selected;
+        self
+    }
+
+    pub fn with_construction(mut self, construction: Vec<Vec2>) -> Self {
+        self.construction = construction;
+        self
     }
 
     pub fn world_to_pixel(&self, point: Vec2, width: u32, height: u32) -> (i32, i32) {
@@ -201,72 +224,6 @@ impl TilingScene {
             transform_vertices(&base, instance.transform)
         }))
     }
-    fn visible_lattice_bounds(
-        &self,
-        polygon: &[Vec2],
-        width: u32,
-        height: u32,
-    ) -> Option<([i32; 2], [i32; 2])> {
-        let a = self.draft.translation_a;
-        let b = self.draft.translation_b;
-        let det = a.cross(b);
-        if !det.is_finite() || det.abs() <= 1e-12 {
-            return None;
-        }
-        let viewport = [
-            self.pixel_to_world(0, 0, width, height),
-            self.pixel_to_world(width, 0, width, height),
-            self.pixel_to_world(0, height, width, height),
-            self.pixel_to_world(width, height, width, height),
-        ];
-        let mut min = [f64::INFINITY; 2];
-        let mut max = [f64::NEG_INFINITY; 2];
-        for corner in viewport {
-            for vertex in polygon {
-                let delta = corner - *vertex;
-                let coordinates = [delta.cross(b) / det, a.cross(delta) / det];
-                for axis in 0..2 {
-                    min[axis] = min[axis].min(coordinates[axis]);
-                    max[axis] = max[axis].max(coordinates[axis]);
-                }
-            }
-        }
-        let integer = |value: f64| value.clamp(-1_000_000.0, 1_000_000.0) as i32;
-        Some((
-            [integer(min[0].floor()) - 1, integer(min[1].floor()) - 1],
-            [integer(max[0].ceil()) + 1, integer(max[1].ceil()) + 1],
-        ))
-    }
-}
-
-const MAX_TILING_EDGE_SEGMENTS: usize = 16_384;
-
-fn sampled_lattice_points(lower: [i32; 2], upper: [i32; 2], max_points: usize) -> Vec<[i32; 2]> {
-    if max_points == 0 {
-        return Vec::new();
-    }
-    let count_a = i64::from(upper[0]) - i64::from(lower[0]) + 1;
-    let count_b = i64::from(upper[1]) - i64::from(lower[1]) + 1;
-    let mut stride = 1_i64;
-    while ((count_a + stride - 1) / stride) * ((count_b + stride - 1) / stride) > max_points as i64
-    {
-        stride *= 2;
-    }
-    let mut points = Vec::with_capacity(max_points.min(4096));
-    for lattice_a in (lower[0]..=upper[0]).step_by(stride as usize) {
-        for lattice_b in (lower[1]..=upper[1]).step_by(stride as usize) {
-            // The canonical copy is handled separately so it can never be
-            // skipped by the adaptive stride.
-            if lattice_a == 0 && lattice_b == 0 {
-                continue;
-            }
-            points.push([lattice_a, lattice_b]);
-            if points.len() == max_points {
-                return points;
-            }
-        }
-    }
-    points
 }
 
 impl GraphicsScene for TilingScene {
@@ -274,74 +231,73 @@ impl GraphicsScene for TilingScene {
         let width = width.max(1);
         let height = height.max(1);
         let mut rgba = vec![0_u8; width as usize * height as usize * 4];
-        // Budget edge work across the entire scene, not per instance. This
-        // keeps tiny legal lattice periods and many-sided prototypes from
-        // monopolising the UI thread.
-        let mut remaining_edges = MAX_TILING_EDGE_SEGMENTS - MAX_POLYGON_VERTICES;
-        let mut selected_edge_reserve = MAX_POLYGON_VERTICES;
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[5, 10, 24, 255]);
+        }
         let mut selected_handles = None;
-        for prototype in &self.draft.prototypes {
-            let Ok(base) = prototype_vertices(&prototype.shape) else {
-                continue;
-            };
-            let selected = self.selected_prototype == Some(prototype.id);
-            let mut selected_canonical_drawn = false;
-            for instance in self
+        let mut canonical = Vec::new();
+        for instance in &self.draft.instances {
+            let Some(prototype) = self
                 .draft
-                .instances
+                .prototypes
                 .iter()
-                .filter(|instance| instance.prototype == prototype.id)
-            {
-                let transformed = transform_vertices(&base, instance.transform);
-                let Some((lower, upper)) = self.visible_lattice_bounds(&transformed, width, height)
-                else {
-                    continue;
-                };
-                let edge_count = transformed.len().max(1);
-                let origin_visible =
-                    lower[0] <= 0 && upper[0] >= 0 && lower[1] <= 0 && upper[1] >= 0;
-                if origin_visible
-                    && ((selected
-                        && !selected_canonical_drawn
-                        && selected_edge_reserve >= edge_count)
-                        || (!selected && remaining_edges >= edge_count))
-                {
-                    let valid = validate_polygon(&transformed).is_empty();
-                    let edge = if !valid {
-                        [255, 70, 80, 255]
-                    } else if selected {
-                        [255, 238, 170, 255]
-                    } else {
-                        [80, 160, 230, 220]
-                    };
-                    draw_polygon(&mut rgba, width, height, self, &transformed, edge);
-                    if selected && !selected_canonical_drawn {
-                        selected_edge_reserve -= edge_count;
-                        selected_handles = Some(transformed.clone());
-                        selected_canonical_drawn = true;
-                    } else {
-                        remaining_edges = remaining_edges.saturating_sub(edge_count);
-                    }
+                .find(|prototype| prototype.id == instance.prototype)
+            else { continue };
+            let Ok(base) = prototype_vertices(&prototype.shape) else { continue };
+            canonical.push((
+                prototype.id,
+                transform_vertices(&base, instance.transform),
+            ));
+        }
+
+        // The editor intentionally shows one strong canonical cell and only
+        // its immediate translated neighbours. Translation vectors may be
+        // oblique, so hexagonal and mixed octagon/square tilings retain their
+        // true geometry instead of being forced into an axis-aligned grid.
+        for lattice_a in -1..=1 {
+            for lattice_b in -1..=1 {
+                if lattice_a == 0 && lattice_b == 0 { continue; }
+                let translation = self.draft.translation_a * f64::from(lattice_a)
+                    + self.draft.translation_b * f64::from(lattice_b);
+                for (_, polygon) in &canonical {
+                    let ghost = polygon.iter().map(|vertex| *vertex + translation).collect::<Vec<_>>();
+                    draw_filled_polygon(&mut rgba, width, height, self, &ghost, [28, 66, 108, 72]);
+                    draw_polygon(&mut rgba, width, height, self, &ghost, [90, 145, 205, 130]);
                 }
-                let max_polygons = remaining_edges / edge_count;
-                for [lattice_a, lattice_b] in sampled_lattice_points(lower, upper, max_polygons) {
-                    let translation = self.draft.translation_a * f64::from(lattice_a)
-                        + self.draft.translation_b * f64::from(lattice_b);
-                    let polygon = transformed
-                        .iter()
-                        .map(|vertex| *vertex + translation)
-                        .collect::<Vec<_>>();
-                    let valid = validate_polygon(&polygon).is_empty();
-                    let edge = if !valid {
-                        [255, 70, 80, 255]
-                    } else if selected {
-                        [255, 238, 170, 255]
-                    } else {
-                        [80, 160, 230, 220]
-                    };
-                    draw_polygon(&mut rgba, width, height, self, &polygon, edge);
-                    remaining_edges = remaining_edges.saturating_sub(edge_count);
-                }
+            }
+        }
+        for (prototype_id, polygon) in canonical {
+            let selected = self.selected_prototype == Some(prototype_id);
+            let valid = validate_polygon(&polygon).is_empty();
+            let (fill, edge) = if !valid {
+                ([120, 20, 35, 120], [255, 70, 80, 255])
+            } else if selected {
+                ([150, 116, 28, 150], [255, 238, 170, 255])
+            } else {
+                ([24, 92, 156, 130], [100, 190, 255, 245])
+            };
+            draw_filled_polygon(&mut rgba, width, height, self, &polygon, fill);
+            draw_polygon(&mut rgba, width, height, self, &polygon, edge);
+            if selected && selected_handles.is_none() {
+                selected_handles = Some(polygon);
+            }
+        }
+        let origin = self.world_to_pixel(Vec2::ZERO, width, height);
+        draw_line(&mut rgba, width, height, origin, self.world_to_pixel(self.draft.translation_a, width, height), [255, 110, 90, 230]);
+        draw_line(&mut rgba, width, height, origin, self.world_to_pixel(self.draft.translation_b, width, height), [90, 220, 150, 230]);
+        if !self.construction.is_empty() {
+            for segment in self.construction.windows(2) {
+                draw_line(
+                    &mut rgba,
+                    width,
+                    height,
+                    self.world_to_pixel(segment[0], width, height),
+                    self.world_to_pixel(segment[1], width, height),
+                    [255, 190, 70, 255],
+                );
+            }
+            for point in &self.construction {
+                draw_disc(&mut rgba, width, height, self.world_to_pixel(*point, width, height), 4, [255, 245, 190, 255]);
             }
         }
         if let Some(vertices) = selected_handles {
@@ -365,6 +321,41 @@ impl GraphicsScene for TilingScene {
             }
         }
         GraphicsFrame::new(width, height, rgba, 0).expect("raster dimensions are valid")
+    }
+}
+
+fn draw_filled_polygon(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    scene: &TilingScene,
+    polygon: &[Vec2],
+    color: [u8; 4],
+) {
+    if polygon.len() < 3 { return; }
+    let points = polygon.iter().map(|point| scene.world_to_pixel(*point, width, height)).collect::<Vec<_>>();
+    let min_y = points.iter().map(|point| point.1).min().unwrap_or(0).max(0);
+    let max_y = points.iter().map(|point| point.1).max().unwrap_or(-1).min(height as i32 - 1);
+    for y in min_y..=max_y {
+        let scan_y = f64::from(y) + 0.5;
+        let mut intersections = Vec::with_capacity(points.len());
+        for index in 0..points.len() {
+            let (x0, y0) = points[index];
+            let (x1, y1) = points[(index + 1) % points.len()];
+            let (y0, y1) = (f64::from(y0), f64::from(y1));
+            if (y0 <= scan_y && scan_y < y1) || (y1 <= scan_y && scan_y < y0) {
+                let t = (scan_y - y0) / (y1 - y0);
+                intersections.push(f64::from(x0) + t * f64::from(x1 - x0));
+            }
+        }
+        intersections.sort_by(|a, b| a.total_cmp(b));
+        for pair in intersections.chunks_exact(2) {
+            let start = pair[0].ceil().max(0.0) as i32;
+            let end = pair[1].floor().min(f64::from(width.saturating_sub(1))) as i32;
+            for x in start..=end {
+                blend_pixel(rgba, width, height, x, y, color);
+            }
+        }
     }
 }
 
@@ -601,27 +592,6 @@ mod tests {
                 .count();
             assert!(lit > 500, "{name} preview is empty at minimum scale");
         }
-    }
-
-    #[test]
-    fn lattice_sampling_obeys_budget_and_keeps_canonical_handle() {
-        let points = sampled_lattice_points([-1_000_000, -1_000_000], [1_000_000, 1_000_000], 256);
-        assert!(points.len() <= 256);
-        assert!(!points.contains(&[0, 0]));
-
-        let mut scene = TilingScene::new(crate::sim::tiling::build_preset(
-            crate::sim::tiling::TilingPreset::Square,
-            0.05,
-        ));
-        scene.selected_vertex = Some(0);
-        let frame = scene.render_rgba(160, 120);
-        assert!(
-            frame
-                .rgba
-                .chunks_exact(4)
-                .any(|pixel| pixel[..3] == [255, 255, 255]),
-            "the canonical selected handle must survive adaptive sampling"
-        );
     }
 
     #[test]

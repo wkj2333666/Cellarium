@@ -1,5 +1,7 @@
 use super::growth_editor::editor_for;
 use super::{ChannelView, DraftCommand, GrowthEditorState, History, HistoryError};
+use super::kernel_editor::KernelPoint;
+use super::numeric_editor::NumericEditor;
 use crate::sim::experiment_model::{
     ChannelId, DisplayColor, ExperimentSpec, KernelId, KernelSlot, RgbColor,
 };
@@ -74,6 +76,11 @@ pub struct WorkbenchState {
     growth_editing: bool,
     selected_prototype: Option<PrototypeId>,
     kernel_view: super::kernel_editor::KernelView,
+    kernel_selection: Option<KernelPoint>,
+    kernel_paint_value: f32,
+    numeric_editor: Option<NumericEditor>,
+    tiling_tool: super::tiling_editor::TilingTool,
+    tiling_construction: Vec<crate::sim::tiling::Vec2>,
 }
 impl WorkbenchState {
     pub fn new(spec: ExperimentSpec) -> Self {
@@ -108,6 +115,11 @@ impl WorkbenchState {
             growth_editing: false,
             selected_prototype,
             kernel_view: super::kernel_editor::KernelView::default(),
+            kernel_selection: None,
+            kernel_paint_value: 0.05,
+            numeric_editor: None,
+            tiling_tool: super::tiling_editor::TilingTool::Select,
+            tiling_construction: Vec::new(),
         }
     }
     pub fn draft(&self) -> &ExperimentSpec {
@@ -160,6 +172,76 @@ impl WorkbenchState {
     }
     pub fn set_kernel_view(&mut self, view: super::kernel_editor::KernelView) {
         self.kernel_view = view;
+    }
+    pub fn kernel_selection(&self) -> Option<KernelPoint> {
+        self.kernel_selection
+    }
+    pub fn select_kernel_point(&mut self, point: KernelPoint) {
+        self.kernel_selection = Some(point);
+    }
+    pub fn kernel_paint_value(&self) -> f32 {
+        self.kernel_paint_value
+    }
+    pub fn set_kernel_paint_value(&mut self, value: f32) -> Result<(), String> {
+        if !value.is_finite() {
+            return Err("kernel paint value must be finite".into());
+        }
+        self.kernel_paint_value = value.clamp(-1.0, 1.0);
+        Ok(())
+    }
+    pub fn numeric_editor(&self) -> Option<&NumericEditor> {
+        self.numeric_editor.as_ref()
+    }
+    pub fn numeric_editor_mut(&mut self) -> Option<&mut NumericEditor> {
+        self.numeric_editor.as_mut()
+    }
+    pub fn begin_numeric_editor(&mut self, editor: NumericEditor) {
+        self.numeric_editor = Some(editor);
+    }
+    pub fn take_numeric_editor(&mut self) -> Option<NumericEditor> {
+        self.numeric_editor.take()
+    }
+    pub fn tiling_tool(&self) -> super::tiling_editor::TilingTool {
+        self.tiling_tool
+    }
+    pub fn set_tiling_tool(&mut self, tool: super::tiling_editor::TilingTool) {
+        self.tiling_tool = tool;
+        if tool != super::tiling_editor::TilingTool::DrawPolygon {
+            self.tiling_construction.clear();
+        }
+    }
+    pub fn tiling_construction(&self) -> &[crate::sim::tiling::Vec2] {
+        &self.tiling_construction
+    }
+    pub fn push_tiling_vertex(&mut self, point: crate::sim::tiling::Vec2) {
+        self.tiling_construction.push(point);
+    }
+    pub fn cancel_tiling_construction(&mut self) {
+        self.tiling_construction.clear();
+        self.tiling_tool = super::tiling_editor::TilingTool::Select;
+    }
+    pub fn finish_tiling_construction(&mut self) -> Result<(), String> {
+        if self.tiling_construction.len() < 3 {
+            return Err("place at least three vertices before closing the polygon".into());
+        }
+        let issues = crate::sim::tiling::polygon::validate_polygon(&self.tiling_construction);
+        if let Some(issue) = issues.first() {
+            return Err(issue.message.clone());
+        }
+        let selected = self.selected_prototype.ok_or("select a basis polygon first")?;
+        let mut next = self.draft.clone();
+        let prototype = next
+            .tiling
+            .as_mut()
+            .and_then(|tiling| tiling.prototypes.iter_mut().find(|entry| entry.id == selected))
+            .ok_or("selected basis polygon is missing")?;
+        prototype.shape = PrototypeShape::SimplePolygon {
+            vertices: self.tiling_construction.clone(),
+        };
+        self.replace_draft(next).map_err(|error| error.to_string())?;
+        self.tiling_construction.clear();
+        self.tiling_tool = super::tiling_editor::TilingTool::Select;
+        Ok(())
     }
     pub fn growth_editor(&self) -> &GrowthEditorState {
         &self.growth_editor

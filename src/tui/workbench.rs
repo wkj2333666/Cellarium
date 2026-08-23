@@ -56,10 +56,29 @@ pub fn draw_workbench(
     let layout = workbench_layout(area);
     app.set_workbench_area(area);
     let canvas_block = panel(" Canvas ", app.workbench().focus() == WorkbenchFocus::Canvas);
-    let canvas_inner = canvas_block.inner(layout.canvas);
-    let (pixel_width, pixel_height) = display.framebuffer_size(canvas_inner);
+    let canvas_content = canvas_block.inner(layout.canvas);
+    let header_height = canvas_content.height.min(2);
+    let canvas_header = Rect::new(canvas_content.x, canvas_content.y, canvas_content.width, header_height);
+    let canvas_inner = Rect::new(
+        canvas_content.x,
+        canvas_content.y.saturating_add(header_height),
+        canvas_content.width,
+        canvas_content.height.saturating_sub(header_height),
+    );
+    let graphics_area = if app.workbench().section() == WorkbenchSection::Growth {
+        let source_height = canvas_inner.height.saturating_mul(48) / 100;
+        Rect::new(
+            canvas_inner.x,
+            canvas_inner.y.saturating_add(source_height),
+            canvas_inner.width,
+            canvas_inner.height.saturating_sub(source_height),
+        )
+    } else {
+        canvas_inner
+    };
+    let (pixel_width, pixel_height) = display.framebuffer_size(graphics_area);
     let (placement_action, scene_generation) = app.prepare_workbench_scene(
-        canvas_inner,
+        graphics_area,
         [pixel_width as u32, pixel_height as u32],
         display.protocol(),
     );
@@ -205,18 +224,35 @@ pub fn draw_workbench(
         ],
     };
     frame.render_widget(canvas_block, layout.canvas);
+    let header = match state.section() {
+        WorkbenchSection::Tiling => format!(
+            "[S] Select  [D] Draw polygon  [P] Preset  [N] Next basis   tool: {:?}",
+            state.tiling_tool()
+        ),
+        WorkbenchSection::Kernels =>
+            "Click select · drag paint · wheel value · E exact · middle pan · empty wheel zoom".into(),
+        WorkbenchSection::Growth =>
+            "Source editor and pixel plot · E edit · Esc finish · diagnostics update live".into(),
+        WorkbenchSection::World => "Left paint · right erase · middle pan · wheel zoom".into(),
+        WorkbenchSection::Channels => "Add/remove channels · visibility · color · composite view".into(),
+        WorkbenchSection::Experiment => "Review changes; Ctrl+Enter applies explicitly".into(),
+    };
+    frame.render_widget(Paragraph::new(header).style(Style::default().fg(Color::Rgb(150, 190, 240))), canvas_header);
     if matches!(state.section(), WorkbenchSection::World) {
-        let (width, height) = display.framebuffer_size(canvas_inner);
+        let (width, height) = display.framebuffer_size(graphics_area);
         let mut graphics = initial_field_graphics(state, *app.camera(), width as u32, height as u32);
         graphics.generation = scene_generation;
-        display.render_graphics(frame, canvas_inner, &graphics);
+        display.render_graphics(frame, graphics_area, &graphics);
     } else if state.section() == WorkbenchSection::Tiling {
         if let Some(tiling) = &state.draft().tiling {
             let scene = crate::workbench::tiling_editor::TilingScene::new(tiling.clone());
-            let (width, height) = display.framebuffer_size(canvas_inner);
+            let scene = scene
+                .with_selection(state.tiling_prototype())
+                .with_construction(state.tiling_construction().to_vec());
+            let (width, height) = display.framebuffer_size(graphics_area);
             let mut graphics = scene.render_rgba(width as u32, height as u32);
             graphics.generation = scene_generation;
-            display.render_graphics(frame, canvas_inner, &graphics);
+            display.render_graphics(frame, graphics_area, &graphics);
         } else {
             frame.render_widget(
                 Paragraph::new(canvas_lines.into_iter().map(Line::from).collect::<Vec<_>>())
@@ -228,18 +264,42 @@ pub fn draw_workbench(
         if let Some(kernel) = state.draft().kernels.first() {
             let scene =
                 crate::workbench::kernel_editor::KernelScene::new(kernel.definition.clone())
-                    .with_view(state.kernel_view());
-            let (width, height) = display.framebuffer_size(canvas_inner);
+                    .with_view(state.kernel_view())
+                    .with_selected(state.kernel_selection());
+            let (width, height) = display.framebuffer_size(graphics_area);
             let mut graphics = scene.render_rgba(width as u32, height as u32);
             graphics.generation = scene_generation;
-            display.render_graphics(frame, canvas_inner, &graphics);
+            display.render_graphics(frame, graphics_area, &graphics);
         }
     } else if state.section() == WorkbenchSection::Growth {
+        let source_height = canvas_inner.height.saturating_sub(graphics_area.height);
+        let source_area = Rect::new(canvas_inner.x, canvas_inner.y, canvas_inner.width, source_height);
+        let editor = state.growth_editor();
+        let mut source_lines = vec![
+            Line::styled(
+                format!("target: basis {} / channel {}", state.selected_basis().0, state.selected_channel().0),
+                Style::default().fg(Color::Rgb(120, 170, 230)),
+            ),
+            Line::styled(editor.signature().to_string(), Style::default().fg(Color::Rgb(255, 220, 130)).add_modifier(Modifier::BOLD)),
+        ];
+        source_lines.extend(growth_source_preview(editor));
+        if !editor.diagnostics().is_empty() {
+            source_lines.push(Line::styled(
+                editor.diagnostics().join(" · "),
+                Style::default().fg(Color::Rgb(255, 95, 105)),
+            ));
+        }
+        frame.render_widget(
+            Paragraph::new(source_lines)
+                .wrap(Wrap { trim: false })
+                .block(Block::default().title(if state.growth_editing() { " Source — EDITING " } else { " Source — press E " }).borders(Borders::BOTTOM)),
+            source_area,
+        );
         let scene = crate::workbench::growth_graph::GrowthScene::from_editor(state.growth_editor());
-        let (width, height) = display.framebuffer_size(canvas_inner);
+        let (width, height) = display.framebuffer_size(graphics_area);
         let mut graphics = scene.render_rgba(width as u32, height as u32);
         graphics.generation = scene_generation;
-        display.render_graphics(frame, canvas_inner, &graphics);
+        display.render_graphics(frame, graphics_area, &graphics);
     } else {
         frame.render_widget(
             Paragraph::new(canvas_lines.into_iter().map(Line::from).collect::<Vec<_>>())
@@ -247,7 +307,7 @@ pub fn draw_workbench(
             canvas_inner,
         );
     }
-    display.apply_placement_action(frame, canvas_inner, placement_action);
+    display.apply_placement_action(frame, graphics_area, placement_action);
     if let Some(inspector) = layout.inspector {
         let selected = state
             .draft()
@@ -273,17 +333,35 @@ pub fn draw_workbench(
                 lines.push(Line::from("Wheel zoom · middle pan"));
             }
             WorkbenchSection::Tiling => {
-                lines.push(Line::from("Canvas: drag vertex · right remove"));
-                lines.push(Line::from("P preset · N prototype · +/- sides"));
+                lines.push(Line::from(format!("tool: {:?}", state.tiling_tool())));
+                lines.push(Line::from(format!(
+                    "construction vertices: {}",
+                    state.tiling_construction().len()
+                )));
+                lines.push(Line::from("D draw freely · click vertices · Enter close"));
+                lines.push(Line::from("Select: drag vertex · right remove"));
+                lines.push(Line::from("P preset · N basis · +/- regular sides"));
             }
             WorkbenchSection::Channels => {
                 lines.push(Line::from("A add · Del remove · ] select"));
                 lines.push(Line::from("V view · C color · X visible · F freeze"));
             }
             WorkbenchSection::Kernels => {
-                lines.push(Line::from("Canvas: left set value · right mask"));
-                lines.push(Line::from("Wheel zoom · middle pan"));
+                lines.push(Line::from("Canvas: click select · drag paint · right mask"));
+                lines.push(Line::from("Cell wheel ±0.05 · Shift ±0.005 · Ctrl ±0.5"));
+                lines.push(Line::from("Empty wheel zoom · middle pan · E exact value"));
                 lines.push(Line::from("A add · Del remove"));
+                lines.push(Line::from(format!(
+                    "paint value: {:.4}",
+                    state.kernel_paint_value()
+                )));
+                if let Some(point) = state.kernel_selection() {
+                    lines.push(Line::from(format!("selected cell: {}, {}", point.x, point.y)));
+                }
+                if let Some(editor) = state.numeric_editor() {
+                    lines.push(Line::from(format!("{} = {}▌", editor.label(), editor.buffer())));
+                    lines.push(Line::from("Enter commit · Esc cancel"));
+                }
             }
             WorkbenchSection::Growth => lines.push(Line::from("E edit Growth source")),
             WorkbenchSection::Experiment => lines.push(Line::from("Review, then Apply")),
@@ -294,15 +372,6 @@ pub fn draw_workbench(
             Line::from(app.workbench_notice().unwrap_or("")),
             Line::from("W leave Workbench · ? help"),
         ]);
-        if state.section() == WorkbenchSection::Growth {
-            lines.push(Line::from(""));
-            lines.push(Line::from(if state.growth_editing() {
-                "Growth source (editing; Esc finish)"
-            } else {
-                "Growth source (press E to edit)"
-            }));
-            lines.extend(growth_source_preview(state.growth_editor()));
-        }
         frame.render_widget(
             Paragraph::new(lines)
                 .wrap(Wrap { trim: false })
@@ -313,8 +382,8 @@ pub fn draw_workbench(
             inspector,
         );
     }
-    let (frame_width, frame_height) = display.framebuffer_size(canvas_inner);
-    app.set_viewport(canvas_inner, [frame_width, frame_height]);
+    let (frame_width, frame_height) = display.framebuffer_size(graphics_area);
+    app.set_viewport(graphics_area, [frame_width, frame_height]);
 }
 
 fn initial_field_graphics(

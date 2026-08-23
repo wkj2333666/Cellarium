@@ -121,13 +121,10 @@ pub fn editor_for(
         })
         .unwrap_or_default();
     let parameters = growth.map(|g| g.parameters.clone()).unwrap_or_default();
-    let target_name = spec
-        .channels
-        .iter()
-        .find(|c| c.id == target)
-        .map_or("channel", |c| c.name.as_str());
     let source = growth.map_or("self", |g| g.source.as_str());
-    let signature = format!("growth_{target_name}({}; self) -> rate", inputs.join(", "));
+    let mut arguments = vec!["self: Scalar".to_string()];
+    arguments.extend(inputs.iter().map(|symbol| format!("{symbol}: Scalar")));
+    let signature = format!("fn growth({}) -> Rate", arguments.join(", "));
     GrowthEditorState::new(
         source,
         ExternalSymbols {

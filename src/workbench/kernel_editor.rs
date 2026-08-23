@@ -54,6 +54,11 @@ impl KernelScene {
         self
     }
 
+    pub fn with_selected(mut self, selected: Option<KernelPoint>) -> Self {
+        self.selected = selected;
+        self
+    }
+
     pub fn cell_at_pixel(&self, px: u32, py: u32) -> Option<KernelPoint> {
         let x = (px / self.cell_size) as usize;
         let y = (py / self.cell_size) as usize;

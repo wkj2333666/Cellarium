@@ -148,10 +148,21 @@ fn draw_footer(
         app.tick(),
         display.protocol().label(),
     );
-    let row2 = "[Click/T] section  [Tab] focus  [Ctrl+Z/Y] undo/redo  [Ctrl+Enter] Apply  [Ctrl+S/E/O] files  [W] simulate  [?] help";
+    let row2 = fit_footer_segments(
+        area.width as usize,
+        &[
+            "[Click/T] section",
+            "[Tab] focus",
+            "[Ctrl+Z/Y] undo/redo",
+            "[Ctrl+Enter] Apply",
+            "[Ctrl+S/E/O] files",
+            "[W] simulate",
+            "[?] help",
+        ],
+    );
     let lines = vec![
-        Line::from(truncate_chars(&row1, area.width as usize)),
-        Line::from(truncate_chars(row2, area.width as usize)),
+        Line::from(truncate_display_width(&row1, area.width as usize)),
+        Line::from(row2),
     ];
     frame.render_widget(
         Paragraph::new(lines).style(
@@ -557,6 +568,40 @@ fn truncate_chars(value: &str, maximum: usize) -> String {
     }
 }
 
+fn truncate_display_width(value: &str, maximum: usize) -> String {
+    use unicode_width::UnicodeWidthChar;
+    let mut width = 0;
+    value
+        .chars()
+        .take_while(|character| {
+            let next = character.width().unwrap_or(0);
+            if width + next > maximum {
+                false
+            } else {
+                width += next;
+                true
+            }
+        })
+        .collect()
+}
+
+fn fit_footer_segments(maximum: usize, segments: &[&str]) -> String {
+    use unicode_width::UnicodeWidthStr;
+    let mut output = String::new();
+    for segment in segments {
+        let candidate = if output.is_empty() {
+            (*segment).to_string()
+        } else {
+            format!("{output}  {segment}")
+        };
+        if UnicodeWidthStr::width(candidate.as_str()) > maximum {
+            break;
+        }
+        output = candidate;
+    }
+    output
+}
+
 pub fn status_text(app: &App, display: &ViewportDisplay) -> String {
     status_text_with_error(app, display, app.backend_error())
 }
@@ -609,6 +654,19 @@ fn status_text_with_error(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use unicode_width::UnicodeWidthStr;
+
+    #[test]
+    fn footer_never_emits_partial_or_overwide_segments() {
+        let segments = ["[界面/T] section", "[Tab] focus", "[Ctrl+Enter] Apply", "[?] help"];
+        for width in 20..=240 {
+            let row = fit_footer_segments(width, &segments);
+            assert!(UnicodeWidthStr::width(row.as_str()) <= width);
+            assert!(segments.iter().any(|prefix| row.ends_with(prefix)) || row.is_empty());
+            let status = truncate_display_width("Workbench · 生长函数 · Dirty · Kitty graphics", width);
+            assert!(UnicodeWidthStr::width(status.as_str()) <= width);
+        }
+    }
     use crate::sim::rule::SimulationSpec;
 
     #[test]

@@ -22,6 +22,18 @@ impl TextBuffer {
     pub fn cursor_is_char_boundary(&self) -> bool {
         self.text.is_char_boundary(self.cursor)
     }
+    pub fn set_cursor_line_column(&mut self, line: usize, column: usize) {
+        let start = self
+            .text
+            .match_indices('\n')
+            .nth(line.saturating_sub(1))
+            .map_or_else(|| if line == 0 { 0 } else { self.text.len() }, |(index, _)| index + 1);
+        let end = self.text[start..]
+            .find('\n')
+            .map_or(self.text.len(), |offset| start + offset);
+        self.cursor = byte_at_column(&self.text, start, end, column);
+        self.preferred_column = None;
+    }
     pub fn replace(&mut self, text: impl Into<String>) {
         self.text = text.into();
         self.cursor = self.text.len();
@@ -133,5 +145,14 @@ mod tests {
         assert!(buffer.cursor_is_char_boundary());
         buffer.backspace();
         assert_eq!(buffer.as_str(), "// 生长\ninner + sel");
+    }
+
+    #[test]
+    fn mouse_style_line_column_placement_respects_utf8_boundaries() {
+        let mut buffer = TextBuffer::new("alpha\n生长 + self");
+        buffer.set_cursor_line_column(1, 2);
+        buffer.insert_char('X');
+        assert_eq!(buffer.as_str(), "alpha\n生长X + self");
+        assert!(buffer.cursor_is_char_boundary());
     }
 }

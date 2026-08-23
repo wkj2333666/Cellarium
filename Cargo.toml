@@ -19,6 +19,7 @@ ron = "0.10"
 robust = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
+unicode-width = "0.2"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
