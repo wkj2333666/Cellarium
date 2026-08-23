@@ -4172,33 +4172,32 @@ mod tests {
 
     #[test]
     fn unsupported_tiling_pan_does_not_dirty_the_draft() {
-        for section in [crate::workbench::WorkbenchSection::Tiling] {
-            let mut app = App::new(SimulationSpec::conway(), 32, 16);
-            app.enter_workbench();
-            app.workbench_mut().select_section(section);
-            app.set_viewport(ratatui::layout::Rect::new(24, 1, 60, 32), [480, 512]);
-            let mut tracker = crate::input::MouseTracker::new();
-            let down = crossterm::event::MouseEvent {
-                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Middle),
-                column: 50,
-                row: 12,
-                modifiers: crossterm::event::KeyModifiers::NONE,
-            };
-            let drag = crossterm::event::MouseEvent {
-                kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Middle),
-                column: 54,
-                row: 14,
-                modifiers: crossterm::event::KeyModifiers::NONE,
-            };
+        let section = crate::workbench::WorkbenchSection::Tiling;
+        let mut app = App::new(SimulationSpec::conway(), 32, 16);
+        app.enter_workbench();
+        app.workbench_mut().select_section(section);
+        app.set_viewport(ratatui::layout::Rect::new(24, 1, 60, 32), [480, 512]);
+        let mut tracker = crate::input::MouseTracker::new();
+        let down = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Middle),
+            column: 50,
+            row: 12,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let drag = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Middle),
+            column: 54,
+            row: 14,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
 
-            app.handle_mouse(down, &mut tracker);
-            assert!(!app.handle_mouse(drag, &mut tracker));
-            assert_eq!(
-                app.workbench().status(),
-                crate::workbench::DraftStatus::Clean,
-                "{section:?} pan must not create a fake edit"
-            );
-        }
+        app.handle_mouse(down, &mut tracker);
+        assert!(!app.handle_mouse(drag, &mut tracker));
+        assert_eq!(
+            app.workbench().status(),
+            crate::workbench::DraftStatus::Clean,
+            "{section:?} pan must not create a fake edit"
+        );
     }
 
     #[test]

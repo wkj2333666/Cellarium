@@ -138,12 +138,15 @@ fn user_journey_edits_every_workbench_section_before_authoritative_apply() {
     assert!(!app.workbench().growth_editor().plot().data.is_empty());
     app.handle_workbench_growth_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
 
-    // Tiling: both presets validate, and a regular polygon can be adjusted
-    // through the same key path as a terminal user.
+    // Tiling: cycle to the regular-hexagon preset, then exercise the same
+    // +/- side controls a terminal user sees. Restore six sides before Apply:
+    // a seven-sided polygon is intentionally an invalid periodic tiling.
     app.handle_command(Command::NextPanel);
     app.handle_workbench_ui(UiCommand::CyclePreset).unwrap();
     app.handle_workbench_ui(UiCommand::CyclePreset).unwrap();
+    app.handle_workbench_ui(UiCommand::CyclePreset).unwrap();
     app.handle_workbench_ui(UiCommand::ShapeIncrease).unwrap();
+    app.handle_workbench_ui(UiCommand::ShapeDecrease).unwrap();
     assert!(app.workbench().draft().tiling.is_some());
     cellarium::sim::experiment_model::validate_structure(app.workbench().draft()).unwrap();
 

@@ -736,7 +736,7 @@ mod tests {
         scene
             .apply_gesture(KernelGesture::ToggleMask { x: 0, y: 0 })
             .unwrap();
-        assert_eq!(scene.definition.mask.as_ref().unwrap()[0], true);
+        assert!(scene.definition.mask.as_ref().unwrap()[0]);
         assert!(
             scene
                 .apply_gesture(KernelGesture::Resize {

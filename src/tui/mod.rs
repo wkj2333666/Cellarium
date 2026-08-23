@@ -50,10 +50,19 @@ fn draw_impl(
     ])
     .split(chunks[0]);
     if app.mode() == crate::workbench::AppMode::Workbench {
+        let clear_previous_graphics = app.take_workbench_display_clear();
         workbench::draw_workbench(frame, app, display, chunks[0]);
         draw_footer(frame, app, display, chunks[1]);
         if app.help_visible() {
             render_help(frame, outer);
+        }
+        if clear_previous_graphics {
+            // This command is stored in the frame's first cell, before any
+            // graphics command in the canvas in terminal traversal order.
+            // Kitty therefore deletes the previous placement before a fresh
+            // Workbench frame can be presented, without racing the async
+            // graphics worker or overwriting the UI glyph under the command.
+            display.clear_graphics(frame, chunks[0]);
         }
         return false;
     }

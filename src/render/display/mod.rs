@@ -765,9 +765,8 @@ impl ViewportDisplay {
     pub fn clear_graphics(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) {
         if self.protocol() == DisplayProtocol::Kitty {
             frame.render_widget(
-                GraphicsCommandWidget {
-                    command: Some(kitty_delete_all_images_command()),
-                    skip_area: false,
+                GraphicsPlacementWidget {
+                    action: PlacementAction::DeleteOnly,
                 },
                 area,
             );
@@ -1426,12 +1425,20 @@ mod tests {
 
         terminal
             .draw(|frame| {
+                frame.render_widget(
+                    ratatui::widgets::Paragraph::new("W"),
+                    ratatui::layout::Rect::new(0, 0, 2, 1),
+                );
                 display.clear_graphics(frame, ratatui::layout::Rect::new(0, 0, 2, 1));
             })
             .unwrap();
 
         let symbol = terminal.backend().buffer().cell((0, 0)).unwrap().symbol();
         assert!(symbol.contains("a=d,d=A,q=1"));
+        assert!(
+            symbol.ends_with('W'),
+            "clearing a placement must preserve the text cell beneath it"
+        );
     }
 
     #[cfg(unix)]
