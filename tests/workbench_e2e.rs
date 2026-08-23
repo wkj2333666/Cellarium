@@ -155,6 +155,9 @@ fn user_journey_edits_every_workbench_section_before_authoritative_apply() {
         .expect("valid Workbench draft applies");
     assert_eq!(accepted.revision, before + 1);
     assert_eq!(app.active_experiment(), accepted.normalized_experiment);
+    assert!(accepted.normalized_experiment.kernels.is_empty());
+    assert!(accepted.normalized_experiment.growth.is_empty());
+    assert!(!accepted.normalized_experiment.rules.is_empty());
     assert_eq!(
         app.workbench().status(),
         cellarium::workbench::DraftStatus::Clean

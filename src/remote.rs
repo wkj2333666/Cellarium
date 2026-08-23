@@ -5,8 +5,14 @@ use crate::sim::service::{ApplyAccepted, ApplyRejected, ApplyRequest, Diagnostic
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u8 = 8;
+pub const PROTOCOL_VERSION: u8 = 9;
 pub const MAX_FRAME_SIZE: u32 = 64 * 1024 * 1024;
+const MAX_EXPERIMENT_SIZE: usize = 8 * 1024 * 1024;
+const MAX_CHANNELS: usize = 64;
+const MAX_BASIS_SITES: usize = 4096;
+const MAX_RULE_SETS: usize = 4096;
+const MAX_BINDINGS: usize = MAX_CHANNELS * MAX_BASIS_SITES;
+const MAX_KERNELS_PER_RULE_SET: usize = 256;
 const MAGIC: [u8; 4] = *b"CLRM";
 
 #[derive(Clone, Debug, PartialEq)]
@@ -122,7 +128,10 @@ pub fn read_message<R: Read>(reader: &mut R) -> Result<Option<RemoteMessage>, Pr
         return Err(ProtocolError::Invalid("bad magic"));
     }
     if header[4] != PROTOCOL_VERSION {
-        return Err(ProtocolError::Invalid("unsupported protocol version"));
+        return Err(ProtocolError::Message(format!(
+            "unsupported protocol version {}; expected version {}",
+            header[4], PROTOCOL_VERSION
+        )));
     }
     let length = u32::from_le_bytes(header[6..10].try_into().expect("header length"));
     if length > MAX_FRAME_SIZE {
@@ -495,9 +504,57 @@ fn put_experiment(
     payload: &mut Vec<u8>,
     experiment: &crate::sim::experiment_model::ExperimentSpec,
 ) -> Result<(), ProtocolError> {
+    validate_protocol_experiment(experiment)?;
     let encoded = ron::to_string(experiment)
         .map_err(|error| ProtocolError::Message(format!("cannot encode experiment: {error}")))?;
+    if encoded.len() > MAX_EXPERIMENT_SIZE {
+        return Err(ProtocolError::Invalid(
+            "experiment exceeds protocol size limit",
+        ));
+    }
     put_long_string(payload, &encoded)
+}
+
+fn validate_protocol_experiment(
+    experiment: &crate::sim::experiment_model::ExperimentSpec,
+) -> Result<(), ProtocolError> {
+    if experiment.channels.len() > MAX_CHANNELS {
+        return Err(ProtocolError::Invalid("too many experiment channels"));
+    }
+    if experiment.kernels.len() > MAX_RULE_SETS * MAX_KERNELS_PER_RULE_SET {
+        return Err(ProtocolError::Invalid("too many legacy kernels"));
+    }
+    if experiment.growth.len() > MAX_CHANNELS {
+        return Err(ProtocolError::Invalid("too many legacy growth programs"));
+    }
+    if let Some(tiling) = &experiment.tiling {
+        if tiling.instances.len() > MAX_BASIS_SITES {
+            return Err(ProtocolError::Invalid("too many basis sites"));
+        }
+        if tiling.prototypes.len() > MAX_BASIS_SITES {
+            return Err(ProtocolError::Invalid("too many tile prototypes"));
+        }
+    }
+    if experiment.rules.sets.len() > MAX_RULE_SETS {
+        return Err(ProtocolError::Invalid("too many rule sets"));
+    }
+    if experiment.rules.bindings.len() > MAX_BINDINGS {
+        return Err(ProtocolError::Invalid("too many rule bindings"));
+    }
+    for rule in &experiment.rules.sets {
+        if rule.kernels.len() > MAX_KERNELS_PER_RULE_SET {
+            return Err(ProtocolError::Invalid("too many kernels in rule set"));
+        }
+        for kernel in &rule.kernels {
+            if let crate::sim::ruleset::KernelSpatialDefinition::Periodic(periodic) =
+                &kernel.spatial
+                && periodic.planes.len() > MAX_BASIS_SITES
+            {
+                return Err(ProtocolError::Invalid("too many periodic kernel planes"));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn command_code(command: Command) -> u8 {
@@ -693,8 +750,19 @@ impl<'a> Cursor<'a> {
     fn experiment(
         &mut self,
     ) -> Result<crate::sim::experiment_model::ExperimentSpec, ProtocolError> {
-        ron::from_str(&self.long_string()?)
-            .map_err(|error| ProtocolError::Message(format!("cannot decode experiment: {error}")))
+        let length = self.u32()? as usize;
+        if length > MAX_EXPERIMENT_SIZE {
+            return Err(ProtocolError::Invalid(
+                "experiment exceeds protocol size limit",
+            ));
+        }
+        let source = std::str::from_utf8(self.take(length)?)
+            .map_err(|_| ProtocolError::Invalid("invalid utf-8 experiment"))?;
+        let experiment = ron::from_str(source).map_err(|error| {
+            ProtocolError::Message(format!("cannot decode experiment: {error}"))
+        })?;
+        validate_protocol_experiment(&experiment)?;
+        Ok(experiment)
     }
     fn finish(&self) -> Result<(), ProtocolError> {
         if self.offset == self.bytes.len() {
@@ -708,10 +776,13 @@ impl<'a> Cursor<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::experiment_model::ExperimentSpec;
+    use crate::sim::basis_kernel::PeriodicKernelDefinition;
+    use crate::sim::experiment_model::{ChannelId, ExperimentSpec, KernelId, KernelSlot};
+    use crate::sim::ruleset::{BindingKey, KernelSpatialDefinition};
     use crate::sim::service::{
         ApplyAccepted, ApplyRejected, ApplyRequest, Diagnostic, DiagnosticPath,
     };
+    use crate::sim::tiling::{BasisId, PeriodicTilingDraft};
     use std::io::Cursor as IoCursor;
 
     fn sample_snapshot() -> Snapshot {
@@ -852,6 +923,91 @@ mod tests {
         read_message(&mut IoCursor::new(bytes)).unwrap().unwrap()
     }
 
+    fn basis_ruleset_fixture() -> ExperimentSpec {
+        let mut spec = ExperimentSpec::single_channel_lenia(2, 2);
+        let green = spec.add_channel("green", false);
+        let blue = spec.add_channel("blue", false);
+        assert_eq!((green, blue), (ChannelId(1), ChannelId(2)));
+        spec.kernels.push(KernelSlot::identity(
+            KernelId(1),
+            "detail",
+            ChannelId(0),
+            ChannelId(0),
+        ));
+        let growth = spec
+            .growth
+            .iter_mut()
+            .find(|growth| growth.target == ChannelId(0))
+            .unwrap();
+        growth.kernel_inputs.push(KernelId(1));
+        growth.source = "potential + detail".into();
+        spec.tiling = Some(
+            ron::from_str::<PeriodicTilingDraft>(include_str!(
+                "../tests/fixtures/tiling/t_junction.ron"
+            ))
+            .unwrap(),
+        );
+        let mut spec = spec.normalize_rules().unwrap();
+        let default = spec.rules.defaults[&ChannelId(0)];
+        spec.rules.get_mut(default).unwrap().shared_name = Some("shared-red".into());
+        let local = spec
+            .rules
+            .detach(BindingKey {
+                basis: BasisId(1),
+                output: ChannelId(0),
+            })
+            .unwrap();
+        spec.rules.get_mut(local).unwrap().kernels[0].spatial =
+            KernelSpatialDefinition::Periodic(PeriodicKernelDefinition::identity(BasisId(0)));
+        spec
+    }
+
+    #[test]
+    fn basis_ruleset_apply_round_trip() {
+        let experiment = basis_ruleset_fixture();
+        assert_eq!(experiment.channels.len(), 3);
+        assert_eq!(experiment.rules.sets.len(), 4);
+        assert_eq!(
+            experiment
+                .rules
+                .get(experiment.rules.defaults[&ChannelId(0)])
+                .unwrap()
+                .kernels
+                .len(),
+            2
+        );
+
+        for message in [
+            RemoteMessage::ApplyDraft(ApplyRequest {
+                request_id: 100,
+                base_revision: 12,
+                draft: experiment.clone(),
+            }),
+            RemoteMessage::ApplyAccepted(ApplyAccepted {
+                request_id: 100,
+                revision: 13,
+                normalized_experiment: experiment.clone(),
+            }),
+            RemoteMessage::ExperimentState {
+                revision: 13,
+                normalized_experiment: experiment.clone(),
+            },
+        ] {
+            assert_eq!(roundtrip(message.clone()), message);
+        }
+    }
+
+    #[test]
+    fn protocol_v8_peer_is_rejected_clearly() {
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&MAGIC);
+        frame.extend_from_slice(&[8, 1]);
+        frame.extend_from_slice(&0_u32.to_le_bytes());
+        let error = read_message(&mut IoCursor::new(frame)).unwrap_err();
+        assert!(error.to_string().contains("version 8"));
+        assert!(error.to_string().contains("version 9"));
+    }
+
     #[test]
     fn apply_messages_roundtrip_complete_drafts_and_paths() {
         let message = RemoteMessage::ApplyDraft(ApplyRequest {
@@ -897,6 +1053,22 @@ mod tests {
         assert!(matches!(
             read_message(&mut IoCursor::new(header)),
             Err(ProtocolError::Invalid(_))
+        ));
+    }
+
+    #[test]
+    fn experiment_collection_limits_are_enforced_before_encoding() {
+        let mut experiment = ExperimentSpec::single_channel_lenia(1, 1);
+        for index in 1..=MAX_CHANNELS {
+            experiment.add_channel(format!("channel-{index}"), false);
+        }
+        let message = RemoteMessage::ExperimentState {
+            revision: 0,
+            normalized_experiment: experiment,
+        };
+        assert!(matches!(
+            write_message(&mut Vec::new(), &message),
+            Err(ProtocolError::Invalid("too many experiment channels"))
         ));
     }
 }

@@ -57,8 +57,53 @@ mod tests {
             service.world().channel_cells(0)
         );
     }
+
+    #[test]
+    fn apply_normalizes_once_and_returns_the_authoritative_model() {
+        let mut service = service_fixture();
+        let accepted = service
+            .apply(ApplyRequest {
+                request_id: 12,
+                base_revision: service.revision(),
+                draft: service.active_spec().clone(),
+            })
+            .unwrap();
+        assert!(accepted.normalized_experiment.kernels.is_empty());
+        assert!(accepted.normalized_experiment.growth.is_empty());
+        assert!(!accepted.normalized_experiment.rules.is_empty());
+        assert_eq!(service.active_spec(), &accepted.normalized_experiment);
+    }
+
+    #[test]
+    fn basis_diagnostics_have_stable_paths() {
+        use crate::sim::basis_kernel::PeriodicKernelDefinition;
+        use crate::sim::ruleset::KernelSpatialDefinition;
+
+        let mut service = service_fixture();
+        let mut draft = service.active_spec().clone().normalize_rules().unwrap();
+        let rule_set = draft.rules.defaults[&crate::sim::experiment_model::ChannelId(0)];
+        let rule = draft.rules.get_mut(rule_set).unwrap();
+        rule.kernels[0].spatial = KernelSpatialDefinition::Periodic(PeriodicKernelDefinition {
+            width: 0,
+            height: 1,
+            anchor_x: 0,
+            anchor_y: 0,
+            planes: Default::default(),
+        });
+        let rejected = service
+            .apply(ApplyRequest {
+                request_id: 13,
+                base_revision: service.revision(),
+                draft,
+            })
+            .unwrap_err();
+        assert!(rejected.diagnostics.iter().any(|diagnostic| {
+            diagnostic.path.0 == ["basis", "0", "channel", "0", "ruleset", "0", "kernel", "0"]
+        }));
+    }
 }
-use crate::sim::experiment_model::{ExperimentSpec, validate_structure};
+use crate::sim::experiment_model::{ExperimentSpec, KernelId, KernelSlot, validate_structure};
+use crate::sim::ruleset::{KernelSpatialDefinition, RuleSetError};
 use crate::sim::runtime::{
     CompiledExperiment, CpuExperimentBackend, RuntimeError, compile_experiment,
 };
@@ -132,6 +177,7 @@ pub struct AuditSnapshot {
 
 impl ExperimentService {
     pub fn new(spec: ExperimentSpec) -> Result<Self, ApplyRejected> {
+        let spec = normalize_or_reject(0, spec)?;
         let compiled = compile_or_reject(0, &spec)?;
         let world = world_from_spec(&spec).map_err(|error| reject(0, error.to_string()))?;
         Ok(Self {
@@ -239,16 +285,112 @@ impl ExperimentService {
 
 impl PrepareJob {
     pub fn build(self) -> Result<PreparedExperiment, ApplyRejected> {
-        let compiled = compile_or_reject(self.request.request_id, &self.request.draft)?;
-        let world = world_from_spec(&self.request.draft)
+        let spec = normalize_or_reject(self.request.request_id, self.request.draft)?;
+        let compiled = compile_or_reject(self.request.request_id, &spec)?;
+        let world = world_from_spec(&spec)
             .map_err(|error| reject(self.request.request_id, error.to_string()))?;
         Ok(PreparedExperiment {
             request_id: self.request.request_id,
             base_revision: self.request.base_revision,
-            spec: self.request.draft,
+            spec,
             world,
             compiled,
         })
+    }
+}
+
+fn normalize_or_reject(
+    request_id: u64,
+    spec: ExperimentSpec,
+) -> Result<ExperimentSpec, ApplyRejected> {
+    if !spec.rules.is_empty()
+        && let Err(errors) = spec.rules.validate(&spec.basis_ids(), &spec.channels)
+    {
+        return Err(ApplyRejected {
+            request_id,
+            diagnostics: errors
+                .iter()
+                .map(|error| Diagnostic {
+                    code: "invalid_basis_rule".into(),
+                    message: error.to_string(),
+                    path: rule_error_path(&spec, error),
+                })
+                .collect(),
+        });
+    }
+    spec.normalize_rules().map_err(|errors| ApplyRejected {
+        request_id,
+        diagnostics: errors
+            .into_iter()
+            .map(|error| Diagnostic {
+                code: "invalid_experiment".into(),
+                message: error.to_string(),
+                path: DiagnosticPath::field("experiment"),
+            })
+            .collect(),
+    })
+}
+
+fn rule_error_path(spec: &ExperimentSpec, error: &RuleSetError) -> DiagnosticPath {
+    use RuleSetError::*;
+    let rule_set = match error {
+        DuplicateRuleSetId(id) | MissingRuleSet(id) => Some(*id),
+        DuplicateKernelId { rule_set, .. }
+        | InvalidKernelSymbol { rule_set, .. }
+        | InvalidKernel { rule_set, .. }
+        | GrowthKernelMismatch { rule_set, .. }
+        | EmptyGrowthSource { rule_set }
+        | InvalidSharedName { rule_set }
+        | InvalidGrowthParameter { rule_set, .. }
+        | MissingOutputChannel { rule_set, .. }
+        | MissingSourceChannel { rule_set, .. } => Some(*rule_set),
+        DefaultTargetMismatch { rule_set, .. } => Some(*rule_set),
+        _ => None,
+    };
+    let kernel = match error {
+        DuplicateKernelId { kernel, .. }
+        | InvalidKernel { kernel, .. }
+        | MissingSourceChannel { kernel, .. } => Some(*kernel),
+        _ => None,
+    };
+    if let Some(rule_set) = rule_set {
+        let binding = spec
+            .rules
+            .bindings
+            .iter()
+            .filter(|binding| binding.rule_set == rule_set)
+            .min_by_key(|binding| (binding.basis, binding.output));
+        let mut path = if let Some(binding) = binding {
+            vec![
+                "basis".into(),
+                binding.basis.0.to_string(),
+                "channel".into(),
+                binding.output.0.to_string(),
+            ]
+        } else {
+            vec!["rules".into()]
+        };
+        path.extend(["ruleset".into(), rule_set.0.to_string()]);
+        if let Some(kernel) = kernel {
+            path.extend(["kernel".into(), kernel.0.to_string()]);
+        }
+        return DiagnosticPath(path);
+    }
+    match error {
+        DuplicateBinding(key)
+        | MissingBinding(key)
+        | BindingTargetMismatch { binding: key, .. } => DiagnosticPath(vec![
+            "basis".into(),
+            key.basis.0.to_string(),
+            "channel".into(),
+            key.output.0.to_string(),
+        ]),
+        MissingBasis(basis) => DiagnosticPath(vec!["basis".into(), basis.0.to_string()]),
+        InvalidBindingOutput(channel) | MissingDefault(channel) | FrozenChannelDefault(channel) => {
+            DiagnosticPath(vec!["channel".into(), channel.0.to_string()])
+        }
+        RuleSetIdExhausted => DiagnosticPath::field("rules"),
+        _ => DiagnosticPath::field("rules"),
     }
 }
 
@@ -267,7 +409,58 @@ fn compile_or_reject(
             })
             .collect(),
     })?;
-    compile_experiment(spec).map_err(|error| reject(request_id, error.to_string()))
+    let runtime_spec = legacy_runtime_view(spec).map_err(|message| reject(request_id, message))?;
+    compile_experiment(&runtime_spec).map_err(|error| reject(request_id, error.to_string()))
+}
+
+fn legacy_runtime_view(spec: &ExperimentSpec) -> Result<ExperimentSpec, String> {
+    if spec.rules.is_empty() {
+        return Ok(spec.clone());
+    }
+    let mut legacy = spec.clone();
+    legacy.rules = Default::default();
+    legacy.kernels.clear();
+    legacy.growth.clear();
+    let mut next_kernel = 0_u32;
+    for channel in spec.channels.iter().filter(|channel| !channel.frozen) {
+        let rule_set_id = spec
+            .rules
+            .defaults
+            .get(&channel.id)
+            .ok_or_else(|| format!("channel {:?} has no default rule set", channel.id))?;
+        let rule = spec
+            .rules
+            .get(*rule_set_id)
+            .ok_or_else(|| format!("missing default rule set {rule_set_id:?}"))?;
+        let mut growth = rule.growth.clone();
+        growth.kernel_inputs.clear();
+        for kernel in &rule.kernels {
+            let id = KernelId(next_kernel);
+            next_kernel = next_kernel
+                .checked_add(1)
+                .ok_or_else(|| "too many kernels for legacy raster runtime".to_string())?;
+            let definition = match &kernel.spatial {
+                KernelSpatialDefinition::Raster(definition) => definition.clone(),
+                KernelSpatialDefinition::Periodic(_) => {
+                    return Err(format!(
+                        "periodic kernel {:?} in rule set {:?} requires the basis runtime",
+                        kernel.id, rule.id
+                    ));
+                }
+            };
+            legacy.kernels.push(KernelSlot {
+                id,
+                symbol: kernel.symbol.clone(),
+                name: kernel.name.clone(),
+                source: kernel.source_channel,
+                target: channel.id,
+                definition,
+            });
+            growth.kernel_inputs.push(id);
+        }
+        legacy.growth.push(growth);
+    }
+    Ok(legacy)
 }
 
 fn world_from_spec(spec: &ExperimentSpec) -> Result<ChannelWorld, ChannelWorldError> {

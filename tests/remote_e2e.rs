@@ -12,6 +12,27 @@ use kitty_terminal::{KittyCommand, KittyStreamParser, consume_shared_frame};
 use std::ffi::CString;
 
 #[test]
+fn public_protocol_roundtrips_normalized_basis_authority() {
+    use cellarium::remote::{RemoteMessage, read_message, write_message};
+    use cellarium::sim::experiment_model::ExperimentSpec;
+    use cellarium::sim::tiling::{TilingPreset, build_preset};
+
+    let mut experiment = ExperimentSpec::single_channel_lenia(2, 2);
+    experiment.tiling = Some(build_preset(TilingPreset::EquilateralTriangles, 1.0));
+    let experiment = experiment.normalize_rules().unwrap();
+    let message = RemoteMessage::ExperimentState {
+        revision: 21,
+        normalized_experiment: experiment,
+    };
+    let mut bytes = Vec::new();
+    write_message(&mut bytes, &message).unwrap();
+    assert_eq!(
+        read_message(&mut std::io::Cursor::new(bytes)).unwrap(),
+        Some(message)
+    );
+}
+
+#[test]
 fn kitty_parser_handles_split_and_coalesced_apc_commands() {
     let mut parser = KittyStreamParser::default();
     assert!(parser.push(b"prefix\x1b_Ga=T,t=s,S=4;").is_empty());

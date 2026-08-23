@@ -576,6 +576,7 @@ impl App {
     }
 
     pub fn submit_draft(&mut self, request: ApplyRequest) -> Result<ApplyAccepted, ApplyRejected> {
+        let request_id = request.request_id;
         if request.base_revision != self.experiment_revision {
             return Err(ApplyRejected {
                 request_id: request.request_id,
@@ -601,12 +602,12 @@ impl App {
                 .collect(),
         })?;
         let service = ExperimentService::new(request.draft.clone()).map_err(|mut rejected| {
-            rejected.request_id = request.request_id;
+            rejected.request_id = request_id;
             rejected
         })?;
-        if let Some(first) = request.draft.channels.first() {
-            let crate::sim::experiment_model::GeometrySpec::RasterGrid(grid) =
-                &request.draft.geometry;
+        let normalized = service.active_spec().clone();
+        if let Some(first) = normalized.channels.first() {
+            let crate::sim::experiment_model::GeometrySpec::RasterGrid(grid) = &normalized.geometry;
             if self.world.width() != grid.width as usize
                 || self.world.height() != grid.height as usize
             {
@@ -615,14 +616,14 @@ impl App {
             }
             self.world.replace_cells(&first.initial);
         }
-        self.experiment_model = request.draft.clone();
-        self.workbench.accept(request.draft.clone());
+        self.experiment_model = normalized.clone();
+        self.workbench.accept(normalized.clone());
         self.experiment_service = Some(service);
         self.experiment_revision =
             self.experiment_revision
                 .checked_add(1)
                 .ok_or_else(|| ApplyRejected {
-                    request_id: request.request_id,
+                    request_id,
                     diagnostics: vec![Diagnostic {
                         code: "revision_overflow".to_string(),
                         message: "experiment revision overflow".to_string(),
@@ -631,9 +632,9 @@ impl App {
                 })?;
         self.workbench_base_revision = self.experiment_revision;
         Ok(ApplyAccepted {
-            request_id: request.request_id,
+            request_id,
             revision: self.experiment_revision,
-            normalized_experiment: request.draft,
+            normalized_experiment: normalized,
         })
     }
 
