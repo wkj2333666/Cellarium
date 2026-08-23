@@ -769,12 +769,11 @@ impl App {
                     .map(|selection| selection.source_basis)
                     .or_else(|| definition.planes.keys().next().copied())
                     .unwrap_or(self.workbench.selected_basis());
-                let current = self.workbench.periodic_kernel_selection().map_or(
+                let current = self.workbench.periodic_kernel_selection().unwrap_or(
                     crate::workbench::kernel_editor::KernelSelection {
                         offset: [0, 0],
                         source_basis,
                     },
-                    |selection| selection,
                 );
                 let min_x = -(definition.anchor_x as i32);
                 let max_x = definition.width.saturating_sub(definition.anchor_x + 1) as i32;
