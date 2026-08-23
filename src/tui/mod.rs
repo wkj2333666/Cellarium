@@ -658,12 +658,18 @@ mod tests {
 
     #[test]
     fn footer_never_emits_partial_or_overwide_segments() {
-        let segments = ["[界面/T] section", "[Tab] focus", "[Ctrl+Enter] Apply", "[?] help"];
+        let segments = [
+            "[界面/T] section",
+            "[Tab] focus",
+            "[Ctrl+Enter] Apply",
+            "[?] help",
+        ];
         for width in 20..=240 {
             let row = fit_footer_segments(width, &segments);
             assert!(UnicodeWidthStr::width(row.as_str()) <= width);
             assert!(segments.iter().any(|prefix| row.ends_with(prefix)) || row.is_empty());
-            let status = truncate_display_width("Workbench · 生长函数 · Dirty · Kitty graphics", width);
+            let status =
+                truncate_display_width("Workbench · 生长函数 · Dirty · Kitty graphics", width);
             assert!(UnicodeWidthStr::width(status.as_str()) <= width);
         }
     }

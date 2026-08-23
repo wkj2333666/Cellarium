@@ -1,6 +1,6 @@
 use super::TextBuffer;
 use crate::sim::growth::{
-    plot::{PinnedInputs, PlotData, PlotRequest, sample_plot},
+    plot::{HeatmapData, PinnedInputs, PlotData, PlotRequest, sample_plot},
     typecheck::compile,
     types::ExternalSymbols,
 };
@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GrowthPlot {
     pub data: Vec<Option<f32>>,
+    pub heatmap: Option<HeatmapData>,
     pub stale: bool,
 }
 #[derive(Clone, Debug)]
@@ -64,7 +65,30 @@ impl GrowthEditorState {
         match compile(self.buffer.as_str(), &self.symbols) {
             Ok(program) => {
                 self.diagnostics.clear();
-                if let Ok(PlotData::Curve(curve)) = sample_plot(
+                if self.symbols.kernel_inputs.len() >= 2 {
+                    let mut pinned = self.parameters.clone();
+                    pinned.insert("self".into(), 0.5);
+                    if let Ok(PlotData::Heatmap(heatmap)) = sample_plot(
+                        &program,
+                        PlotRequest::Heatmap {
+                            x_axis: self.symbols.kernel_inputs[0].clone(),
+                            y_axis: self.symbols.kernel_inputs[1].clone(),
+                            x_start: 0.0,
+                            x_end: 1.0,
+                            y_start: 0.0,
+                            y_end: 1.0,
+                            width: 96,
+                            height: 64,
+                            pinned: PinnedInputs(pinned),
+                        },
+                    ) {
+                        self.plot = GrowthPlot {
+                            data: Vec::new(),
+                            heatmap: Some(heatmap),
+                            stale: false,
+                        };
+                    }
+                } else if let Ok(PlotData::Curve(curve)) = sample_plot(
                     &program,
                     PlotRequest::Curve {
                         axis: self
@@ -86,6 +110,7 @@ impl GrowthEditorState {
                             .into_iter()
                             .map(|sample| sample.value)
                             .collect(),
+                        heatmap: None,
                         stale: false,
                     };
                 }
@@ -113,7 +138,10 @@ pub fn editor_for_basis(
         .and_then(|binding| spec.rules.get(binding.rule_set));
     let legacy = spec.growth.iter().find(|growth| growth.target == target);
     let inputs: Vec<String> = if let Some(rule) = normalized {
-        rule.kernels.iter().map(|kernel| kernel.symbol.clone()).collect()
+        rule.kernels
+            .iter()
+            .map(|kernel| kernel.symbol.clone())
+            .collect()
     } else {
         legacy
             .map(|growth| {
@@ -172,7 +200,6 @@ mod tests {
         assert!(!editor.diagnostics().is_empty());
     }
 
-
     #[test]
     fn normalized_ruleset_supplies_the_basis_specific_signature_and_source() {
         let mut spec = crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(8, 8)
@@ -186,7 +213,40 @@ mod tests {
             crate::sim::experiment_model::ChannelId(0),
         );
         assert_eq!(editor.buffer().as_str(), "nearby - self");
-        assert_eq!(editor.signature(), "fn growth(self: Scalar, nearby: Scalar) -> Rate");
+        assert_eq!(
+            editor.signature(),
+            "fn growth(self: Scalar, nearby: Scalar) -> Rate"
+        );
         assert!(editor.diagnostics().is_empty());
+    }
+
+    #[test]
+    fn two_kernel_inputs_select_a_precise_two_dimensional_plot() {
+        let editor = GrowthEditorState::new(
+            "first + second * second",
+            ExternalSymbols::new(&["first", "second"], &[]),
+            BTreeMap::new(),
+            "fn growth(self: Scalar, first: Scalar, second: Scalar) -> Rate",
+        );
+        let heatmap = editor.plot().heatmap.as_ref().expect("expected 2D heatmap");
+        assert_eq!((heatmap.width, heatmap.height), (96, 64));
+        assert_eq!(
+            (heatmap.x_axis.as_str(), heatmap.y_axis.as_str()),
+            ("first", "second")
+        );
+        assert!(
+            heatmap
+                .samples
+                .iter()
+                .flatten()
+                .copied()
+                .min_by(f32::total_cmp)
+                != heatmap
+                    .samples
+                    .iter()
+                    .flatten()
+                    .copied()
+                    .max_by(f32::total_cmp)
+        );
     }
 }

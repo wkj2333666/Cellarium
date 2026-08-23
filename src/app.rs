@@ -260,17 +260,20 @@ impl App {
     /// Handle clicks on the Workbench navigation and inspector panels.
     /// Canvas clicks remain available to the normal paint/inspect path.
     pub fn handle_workbench_panel_mouse(&mut self, mouse: MouseEvent) -> bool {
-        if self.mode != AppMode::Workbench
-            || !matches!(
-                mouse.kind,
-                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
-            )
-        {
+        let left_down = matches!(
+            mouse.kind,
+            crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+        );
+        let left_drag = matches!(
+            mouse.kind,
+            crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left)
+        );
+        if self.mode != AppMode::Workbench || (!left_down && !left_drag) {
             return false;
         }
         let layout = crate::tui::workbench::workbench_layout(self.workbench_area);
         let point = ratatui::layout::Position::new(mouse.column, mouse.row);
-        if layout.outline.contains(point) {
+        if left_down && layout.outline.contains(point) {
             self.workbench.set_focus(WorkbenchFocus::Outline);
             let inner = Rect::new(
                 layout.outline.x.saturating_add(1),
@@ -291,7 +294,7 @@ impl App {
             }
             return true;
         }
-        if layout.inspector.is_some_and(|area| area.contains(point)) {
+        if left_down && layout.inspector.is_some_and(|area| area.contains(point)) {
             self.workbench.set_focus(WorkbenchFocus::Inspector);
             return true;
         }
@@ -306,23 +309,35 @@ impl App {
                 );
                 let body = Rect::new(
                     canvas_content.x,
-                    canvas_content.y.saturating_add(canvas_content.height.min(2)),
+                    canvas_content
+                        .y
+                        .saturating_add(canvas_content.height.min(2)),
                     canvas_content.width,
-                    canvas_content.height.saturating_sub(canvas_content.height.min(2)),
+                    canvas_content
+                        .height
+                        .saturating_sub(canvas_content.height.min(2)),
                 );
                 let source_height = body.height.saturating_mul(48) / 100;
                 let source = Rect::new(body.x, body.y, body.width, source_height);
                 if source.contains(point) {
                     let line = usize::from(point.y.saturating_sub(source.y)).saturating_sub(2);
                     let column = usize::from(point.x.saturating_sub(source.x)).saturating_sub(2);
-                    self.workbench
-                        .growth_editor_mut()
-                        .buffer_mut()
-                        .set_cursor_line_column(line, column);
+                    if left_drag {
+                        self.workbench
+                            .growth_editor_mut()
+                            .buffer_mut()
+                            .set_cursor_line_column_extending(line, column);
+                    } else {
+                        self.workbench
+                            .growth_editor_mut()
+                            .buffer_mut()
+                            .set_cursor_line_column(line, column);
+                    }
                     if !self.workbench.growth_editing() {
                         self.workbench.toggle_growth_editing();
                     }
-                    self.workbench_notice = Some("Growth cursor placed · type to edit · Esc finish".into());
+                    self.workbench_notice =
+                        Some("Growth cursor placed · type to edit · Esc finish".into());
                     self.workbench_draft_scene_generation =
                         self.workbench_draft_scene_generation.wrapping_add(1);
                     return true;
@@ -355,6 +370,14 @@ impl App {
                 Ok(())
             }
             UiCommand::ContextAdd => match self.workbench.section() {
+                crate::workbench::WorkbenchSection::Tiling => {
+                    self.workbench.begin_new_basis_polygon();
+                    self.workbench_notice = Some(
+                        "New basis polygon: click vertices · click first/Enter close · Esc cancel"
+                            .into(),
+                    );
+                    Ok(())
+                }
                 crate::workbench::WorkbenchSection::Channels => self
                     .workbench
                     .add_channel()
@@ -363,7 +386,7 @@ impl App {
                     .workbench
                     .add_kernel_for_selected()
                     .map_err(|error| error.to_string()),
-                _ => Err("Add is available in Channels and Kernels".into()),
+                _ => Err("Add is available in Tiling, Channels, and Kernels".into()),
             },
             UiCommand::ContextDelete => match self.workbench.section() {
                 crate::workbench::WorkbenchSection::Channels => {
@@ -458,44 +481,90 @@ impl App {
         if self.mode != AppMode::Workbench || !self.workbench.growth_editing() {
             return false;
         }
-        if key
+        let shift = key
             .modifiers
-            .contains(crossterm::event::KeyModifiers::CONTROL)
-        {
-            return false;
-        }
-        match key.code {
-            KeyCode::Char(character)
-                if !key
-                    .modifiers
-                    .contains(crossterm::event::KeyModifiers::CONTROL) =>
-            {
+            .contains(crossterm::event::KeyModifiers::SHIFT);
+        let control = key
+            .modifiers
+            .contains(crossterm::event::KeyModifiers::CONTROL);
+        let changed_source = match key.code {
+            KeyCode::Char(character) if !control => {
                 self.workbench
                     .growth_editor_mut()
                     .buffer_mut()
-                    .insert_char(character)
+                    .insert_char(character);
+                true
             }
-            KeyCode::Enter => self.workbench.growth_editor_mut().buffer_mut().newline(),
+            KeyCode::Enter => {
+                self.workbench.growth_editor_mut().buffer_mut().newline();
+                true
+            }
             KeyCode::Backspace => {
                 self.workbench.growth_editor_mut().buffer_mut().backspace();
+                true
             }
             KeyCode::Delete => {
                 self.workbench.growth_editor_mut().buffer_mut().delete();
+                true
             }
-            KeyCode::Left => self.workbench.growth_editor_mut().buffer_mut().move_left(),
-            KeyCode::Right => self.workbench.growth_editor_mut().buffer_mut().move_right(),
-            KeyCode::Up => self
-                .workbench
-                .growth_editor_mut()
-                .buffer_mut()
-                .move_vertical(-1),
-            KeyCode::Down => self
-                .workbench
-                .growth_editor_mut()
-                .buffer_mut()
-                .move_vertical(1),
-            KeyCode::Home => self.workbench.growth_editor_mut().buffer_mut().move_home(),
-            KeyCode::End => self.workbench.growth_editor_mut().buffer_mut().move_end(),
+            KeyCode::Left if control => {
+                self.workbench
+                    .growth_editor_mut()
+                    .buffer_mut()
+                    .move_word_left(shift);
+                false
+            }
+            KeyCode::Right if control => {
+                self.workbench
+                    .growth_editor_mut()
+                    .buffer_mut()
+                    .move_word_right(shift);
+                false
+            }
+            KeyCode::Left if shift => {
+                self.workbench
+                    .growth_editor_mut()
+                    .buffer_mut()
+                    .move_left_extending();
+                false
+            }
+            KeyCode::Right if shift => {
+                self.workbench
+                    .growth_editor_mut()
+                    .buffer_mut()
+                    .move_right_extending();
+                false
+            }
+            KeyCode::Left => {
+                self.workbench.growth_editor_mut().buffer_mut().move_left();
+                false
+            }
+            KeyCode::Right => {
+                self.workbench.growth_editor_mut().buffer_mut().move_right();
+                false
+            }
+            KeyCode::Up => {
+                self.workbench
+                    .growth_editor_mut()
+                    .buffer_mut()
+                    .move_vertical(-1);
+                false
+            }
+            KeyCode::Down => {
+                self.workbench
+                    .growth_editor_mut()
+                    .buffer_mut()
+                    .move_vertical(1);
+                false
+            }
+            KeyCode::Home => {
+                self.workbench.growth_editor_mut().buffer_mut().move_home();
+                false
+            }
+            KeyCode::End => {
+                self.workbench.growth_editor_mut().buffer_mut().move_end();
+                false
+            }
             KeyCode::Esc => {
                 self.workbench.stop_growth_editing();
                 self.workbench_draft_scene_generation =
@@ -503,12 +572,14 @@ impl App {
                 return true;
             }
             _ => return false,
+        };
+        if changed_source {
+            self.workbench.growth_editor_mut().refresh_now();
+            self.workbench.sync_growth_source();
         }
-        self.workbench.growth_editor_mut().refresh_now();
-        self.workbench.sync_growth_source();
         self.workbench_draft_scene_generation =
             self.workbench_draft_scene_generation.wrapping_add(1);
-        if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
+        if changed_source && std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
             eprintln!(
                 "E2E_GROWTH_VALID valid={} source={:?}",
                 self.workbench.growth_editor().diagnostics().is_empty(),
@@ -534,11 +605,14 @@ impl App {
                     };
                     self.workbench.set_tiling_tool(next);
                     self.workbench_notice = Some(match next {
-                        crate::workbench::tiling_editor::TilingTool::DrawPolygon =>
-                            "Draw polygon: click vertices · click first/Enter close · Esc cancel".into(),
+                        crate::workbench::tiling_editor::TilingTool::DrawPolygon => {
+                            "Draw polygon: click vertices · click first/Enter close · Esc cancel"
+                                .into()
+                        }
                         _ => "Select tool".into(),
                     });
-                    self.workbench_draft_scene_generation = self.workbench_draft_scene_generation.wrapping_add(1);
+                    self.workbench_draft_scene_generation =
+                        self.workbench_draft_scene_generation.wrapping_add(1);
                     return true;
                 }
                 KeyCode::Esc
@@ -547,7 +621,8 @@ impl App {
                 {
                     self.workbench.cancel_tiling_construction();
                     self.workbench_notice = Some("polygon drawing cancelled".into());
-                    self.workbench_draft_scene_generation = self.workbench_draft_scene_generation.wrapping_add(1);
+                    self.workbench_draft_scene_generation =
+                        self.workbench_draft_scene_generation.wrapping_add(1);
                     return true;
                 }
                 KeyCode::Enter
@@ -555,10 +630,14 @@ impl App {
                         == crate::workbench::tiling_editor::TilingTool::DrawPolygon =>
                 {
                     match self.workbench.finish_tiling_construction() {
-                        Ok(()) => self.workbench_notice = Some("polygon closed; validate seams before Apply".into()),
+                        Ok(()) => {
+                            self.workbench_notice =
+                                Some("polygon closed; validate seams before Apply".into())
+                        }
                         Err(error) => self.workbench_notice = Some(error),
                     }
-                    self.workbench_draft_scene_generation = self.workbench_draft_scene_generation.wrapping_add(1);
+                    self.workbench_draft_scene_generation =
+                        self.workbench_draft_scene_generation.wrapping_add(1);
                     return true;
                 }
                 _ => {}
@@ -586,7 +665,8 @@ impl App {
                                     self.workbench_notice = Some(format!("weight = {value:.6}"));
                                 }
                             } else if let Some(point) = self.workbench.kernel_selection() {
-                                if let Err(error) = self.set_kernel_cell_value(point, value as f32) {
+                                if let Err(error) = self.set_kernel_cell_value(point, value as f32)
+                                {
                                     self.workbench_notice = Some(error);
                                 } else {
                                     let _ = self.workbench.set_kernel_paint_value(value as f32);
@@ -606,7 +686,9 @@ impl App {
                     }
                 }
                 KeyCode::Char(character)
-                    if !key.modifiers.contains(crossterm::event::KeyModifiers::CONTROL) =>
+                    if !key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
                 {
                     if let Some(editor) = self.workbench.numeric_editor_mut() {
                         editor.push(character);
@@ -634,8 +716,7 @@ impl App {
                         -1.0..=1.0,
                     ),
                 );
-                self.workbench_notice =
-                    Some("type exact weight; Enter commit · Esc cancel".into());
+                self.workbench_notice = Some("type exact weight; Enter commit · Esc cancel".into());
                 return true;
             }
             if let Some(point) = self.workbench.kernel_selection()
@@ -648,8 +729,7 @@ impl App {
                         -1.0..=1.0,
                     ),
                 );
-                self.workbench_notice =
-                    Some("type exact weight; Enter commit · Esc cancel".into());
+                self.workbench_notice = Some("type exact weight; Enter commit · Esc cancel".into());
                 return true;
             }
         }
@@ -682,7 +762,10 @@ impl App {
         Ok(())
     }
 
-    fn kernel_cell_value(&self, point: crate::workbench::kernel_editor::KernelPoint) -> Option<f32> {
+    fn kernel_cell_value(
+        &self,
+        point: crate::workbench::kernel_editor::KernelPoint,
+    ) -> Option<f32> {
         let kernel = self.workbench.draft().kernels.first()?;
         if point.x >= kernel.definition.width || point.y >= kernel.definition.height {
             return None;
@@ -691,7 +774,9 @@ impl App {
             KernelValues::Explicit(values) => values.clone(),
             KernelValues::Expression(_) => kernel.definition.build().ok()?.values,
         };
-        values.get(point.y * kernel.definition.width + point.x).copied()
+        values
+            .get(point.y * kernel.definition.width + point.x)
+            .copied()
     }
 
     fn set_kernel_cell_value(
@@ -1636,7 +1721,8 @@ impl App {
                                     Ok(()) => self.workbench_notice = Some("polygon closed".into()),
                                     Err(error) => self.workbench_notice = Some(error),
                                 }
-                                self.workbench_draft_scene_generation = self.workbench_draft_scene_generation.wrapping_add(1);
+                                self.workbench_draft_scene_generation =
+                                    self.workbench_draft_scene_generation.wrapping_add(1);
                                 return true;
                             }
                         }
@@ -1651,16 +1737,61 @@ impl App {
                             "vertex {} placed · click first/Enter close",
                             self.workbench.tiling_construction().len()
                         ));
-                        self.workbench_draft_scene_generation = self.workbench_draft_scene_generation.wrapping_add(1);
+                        self.workbench_draft_scene_generation =
+                            self.workbench_draft_scene_generation.wrapping_add(1);
                         return true;
                     }
+                    if matches!(action, crate::input::MouseAction::Inspect) {
+                        if let Some((prototype, vertex)) = scene.hit_test_vertex(
+                            px,
+                            py,
+                            frame_size[0] as u32,
+                            frame_size[1] as u32,
+                            8,
+                        ) {
+                            if let Some(basis) = scene
+                                .draft
+                                .instances
+                                .iter()
+                                .find(|instance| instance.prototype == prototype)
+                                .map(|instance| instance.id)
+                            {
+                                let _ = self.workbench.set_selected_basis(basis);
+                            }
+                            let _ = scene.apply_gesture(
+                                crate::workbench::tiling_editor::TilingGesture::SelectVertex {
+                                    prototype,
+                                    vertex,
+                                },
+                            );
+                            self.workbench_notice = Some(format!(
+                                "selected basis {} · vertex {} · drag to move",
+                                self.workbench.selected_basis().0,
+                                vertex,
+                            ));
+                            self.workbench_draft_scene_generation =
+                                self.workbench_draft_scene_generation.wrapping_add(1);
+                            return true;
+                        }
+                        if let Some(basis) = scene.hit_test_polygon(
+                            px,
+                            py,
+                            frame_size[0] as u32,
+                            frame_size[1] as u32,
+                        ) {
+                            if self.workbench.set_selected_basis(basis).is_ok() {
+                                self.workbench_notice = Some(format!(
+                                    "selected basis {} · Kernels/Growth now target it",
+                                    basis.0,
+                                ));
+                                self.workbench_draft_scene_generation =
+                                    self.workbench_draft_scene_generation.wrapping_add(1);
+                                return true;
+                            }
+                        }
+                    }
                     let applied = match action {
-                        crate::input::MouseAction::Inspect => scene
-                            .hit_test_vertex(px, py, frame_size[0] as u32, frame_size[1] as u32, 8)
-                            .map(|(prototype, vertex)| {
-                                scene.apply_gesture(crate::workbench::tiling_editor::TilingGesture::SelectVertex { prototype, vertex }).is_ok()
-                            })
-                            .unwrap_or(false),
+                        crate::input::MouseAction::Inspect => false,
                         crate::input::MouseAction::Paint => scene
                             .hit_test_vertex(px, py, frame_size[0] as u32, frame_size[1] as u32, 12)
                             .map(|(prototype, vertex)| {
@@ -1724,10 +1855,7 @@ impl App {
                                     let current =
                                         self.periodic_kernel_value(selection).unwrap_or(0.0);
                                     let next = (current + step * direction).clamp(-1.0, 1.0);
-                                    if self
-                                        .set_periodic_kernel_value(selection, next)
-                                        .is_ok()
-                                    {
+                                    if self.set_periodic_kernel_value(selection, next).is_ok() {
                                         let _ = self.workbench.set_kernel_paint_value(next);
                                         self.workbench_notice = Some(format!(
                                             "offset [{},{}] · basis {} = {:.4} · E exact",
@@ -1892,15 +2020,13 @@ impl App {
                             });
                             return true;
                         }
-                        crate::input::MouseAction::Paint => {
-                            scene.apply_gesture(
-                                crate::workbench::kernel_editor::KernelGesture::SetValue {
-                                    x: point.x,
-                                    y: point.y,
-                                    value: self.workbench.kernel_paint_value(),
-                                },
-                            )
-                        }
+                        crate::input::MouseAction::Paint => scene.apply_gesture(
+                            crate::workbench::kernel_editor::KernelGesture::SetValue {
+                                x: point.x,
+                                y: point.y,
+                                value: self.workbench.kernel_paint_value(),
+                            },
+                        ),
                         crate::input::MouseAction::Erase => scene.apply_gesture(
                             crate::workbench::kernel_editor::KernelGesture::ToggleMask {
                                 x: point.x,

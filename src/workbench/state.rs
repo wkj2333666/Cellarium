@@ -1,7 +1,7 @@
 use super::growth_editor::editor_for_basis;
-use super::{ChannelView, DraftCommand, GrowthEditorState, History, HistoryError};
 use super::kernel_editor::{KernelPoint, KernelSelection};
 use super::numeric_editor::NumericEditor;
+use super::{ChannelView, DraftCommand, GrowthEditorState, History, HistoryError};
 use crate::sim::experiment_model::{
     ChannelId, DisplayColor, ExperimentSpec, KernelId, KernelSlot, RgbColor,
 };
@@ -82,6 +82,7 @@ pub struct WorkbenchState {
     numeric_editor: Option<NumericEditor>,
     tiling_tool: super::tiling_editor::TilingTool,
     tiling_construction: Vec<crate::sim::tiling::Vec2>,
+    tiling_new_basis: bool,
 }
 impl WorkbenchState {
     pub fn new(spec: ExperimentSpec) -> Self {
@@ -122,6 +123,7 @@ impl WorkbenchState {
             numeric_editor: None,
             tiling_tool: super::tiling_editor::TilingTool::Select,
             tiling_construction: Vec::new(),
+            tiling_new_basis: false,
         }
     }
     pub fn draft(&self) -> &ExperimentSpec {
@@ -163,8 +165,21 @@ impl WorkbenchState {
             return Err("unknown basis".into());
         }
         self.selected_basis = basis;
+        self.selected_prototype = self
+            .draft
+            .tiling
+            .as_ref()
+            .and_then(|tiling| {
+                tiling
+                    .instances
+                    .iter()
+                    .find(|instance| instance.id == basis)
+            })
+            .map(|instance| instance.prototype)
+            .or(self.selected_prototype);
         self.refresh_rule_selection();
-        self.growth_editor = editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+        self.growth_editor =
+            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
         Ok(())
     }
     pub fn channel_view(&self) -> ChannelView {
@@ -229,7 +244,16 @@ impl WorkbenchState {
         self.tiling_tool = tool;
         if tool != super::tiling_editor::TilingTool::DrawPolygon {
             self.tiling_construction.clear();
+            self.tiling_new_basis = false;
         }
+    }
+    pub fn begin_new_basis_polygon(&mut self) {
+        self.tiling_tool = super::tiling_editor::TilingTool::DrawPolygon;
+        self.tiling_construction.clear();
+        self.tiling_new_basis = true;
+    }
+    pub fn is_drawing_new_basis(&self) -> bool {
+        self.tiling_new_basis
     }
     pub fn tiling_construction(&self) -> &[crate::sim::tiling::Vec2] {
         &self.tiling_construction
@@ -240,6 +264,7 @@ impl WorkbenchState {
     pub fn cancel_tiling_construction(&mut self) {
         self.tiling_construction.clear();
         self.tiling_tool = super::tiling_editor::TilingTool::Select;
+        self.tiling_new_basis = false;
     }
     pub fn finish_tiling_construction(&mut self) -> Result<(), String> {
         if self.tiling_construction.len() < 3 {
@@ -249,19 +274,116 @@ impl WorkbenchState {
         if let Some(issue) = issues.first() {
             return Err(issue.message.clone());
         }
-        let selected = self.selected_prototype.ok_or("select a basis polygon first")?;
         let mut next = self.draft.clone();
-        let prototype = next
-            .tiling
-            .as_mut()
-            .and_then(|tiling| tiling.prototypes.iter_mut().find(|entry| entry.id == selected))
-            .ok_or("selected basis polygon is missing")?;
-        prototype.shape = PrototypeShape::SimplePolygon {
-            vertices: self.tiling_construction.clone(),
-        };
-        self.replace_draft(next).map_err(|error| error.to_string())?;
+        if self.tiling_new_basis {
+            let tiling = next
+                .tiling
+                .as_mut()
+                .ok_or("create or select a tiling first")?;
+            let prototype = PrototypeId(
+                tiling
+                    .prototypes
+                    .iter()
+                    .map(|entry| entry.id.0)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or("prototype id exhausted")?,
+            );
+            let basis = BasisId(
+                tiling
+                    .instances
+                    .iter()
+                    .map(|entry| entry.id.0)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or("basis id exhausted")?,
+            );
+            tiling.prototypes.push(crate::sim::tiling::TilePrototype {
+                id: prototype,
+                name: format!("basis_{}", basis.0),
+                shape: PrototypeShape::SimplePolygon {
+                    vertices: self.tiling_construction.clone(),
+                },
+            });
+            tiling.instances.push(crate::sim::tiling::TileInstance {
+                id: basis,
+                prototype,
+                transform: crate::sim::tiling::RigidTransform::default(),
+            });
+            if next.rules.is_empty() {
+                next = next.normalize_rules().map_err(|errors| {
+                    errors
+                        .into_iter()
+                        .map(|error| error.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                })?;
+            } else {
+                for rule in &mut next.rules.sets {
+                    for kernel in &mut rule.kernels {
+                        if let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) =
+                            &mut kernel.spatial
+                        {
+                            let plane_len = definition.width * definition.height;
+                            let template = definition.planes.values().next().cloned().unwrap_or(
+                                crate::sim::basis_kernel::BasisWeightPlane {
+                                    values: vec![0.0; plane_len],
+                                    mask: None,
+                                },
+                            );
+                            definition.planes.insert(basis, template);
+                        }
+                    }
+                }
+                for output in next
+                    .channels
+                    .iter()
+                    .filter(|channel| !channel.frozen)
+                    .map(|channel| channel.id)
+                    .collect::<Vec<_>>()
+                {
+                    let default = *next
+                        .rules
+                        .defaults
+                        .get(&output)
+                        .ok_or("active channel has no default rule-set")?;
+                    next.rules.bindings.push(crate::sim::ruleset::RuleBinding {
+                        basis,
+                        output,
+                        rule_set: default,
+                    });
+                }
+            }
+            self.selected_prototype = Some(prototype);
+            self.selected_basis = basis;
+        } else {
+            let selected = self
+                .selected_prototype
+                .ok_or("select a basis polygon first")?;
+            let prototype = next
+                .tiling
+                .as_mut()
+                .and_then(|tiling| {
+                    tiling
+                        .prototypes
+                        .iter_mut()
+                        .find(|entry| entry.id == selected)
+                })
+                .ok_or("selected basis polygon is missing")?;
+            prototype.shape = PrototypeShape::SimplePolygon {
+                vertices: self.tiling_construction.clone(),
+            };
+        }
+        self.replace_draft(next)
+            .map_err(|error| error.to_string())?;
         self.tiling_construction.clear();
         self.tiling_tool = super::tiling_editor::TilingTool::Select;
+        self.tiling_new_basis = false;
+        self.refresh_rule_selection();
+        self.growth_editor =
+            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
         Ok(())
     }
     pub fn growth_editor(&self) -> &GrowthEditorState {
@@ -353,7 +475,8 @@ impl WorkbenchState {
     }
     pub fn revert(&mut self) {
         self.draft = self.authoritative.clone();
-        self.growth_editor = editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+        self.growth_editor =
+            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
         self.growth_editing = false;
         self.selected_prototype = self
             .draft
@@ -374,7 +497,8 @@ impl WorkbenchState {
         self.authoritative = normalized.clone();
         self.draft = normalized;
         self.selected_channel = self.draft.channels.first().map_or(ChannelId(0), |c| c.id);
-        self.growth_editor = editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+        self.growth_editor =
+            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
         self.growth_editing = false;
         self.history.clear();
         self.status = DraftStatus::Clean;
@@ -414,7 +538,8 @@ impl WorkbenchState {
         if self.draft.channels.iter().any(|entry| entry.id == channel) {
             self.selected_channel = channel;
             self.refresh_rule_selection();
-            self.growth_editor = editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+            self.growth_editor =
+                editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
             Ok(())
         } else {
             Err("unknown channel".into())
@@ -515,7 +640,8 @@ impl WorkbenchState {
                 .as_ref()
                 .and_then(|tiling| tiling.prototypes.first().map(|prototype| prototype.id));
         }
-        self.growth_editor = editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+        self.growth_editor =
+            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
         Ok(())
     }
 
@@ -523,8 +649,60 @@ impl WorkbenchState {
         let mut next = self.draft.clone();
         let name = format!("channel_{}", next.channels.len() + 1);
         let id = next.add_channel(name, false);
+        if !next.rules.is_empty() {
+            next.growth.retain(|growth| growth.target != id);
+            let rule_set_id = RuleSetId(
+                next.rules
+                    .sets
+                    .iter()
+                    .map(|rule| rule.id.0)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or_else(|| HistoryError::Edit("rule-set id exhausted".into()))?,
+            );
+            let mut rule_set = RuleSet::identity(rule_set_id, id);
+            if next.tiling.is_some() {
+                let bases = next.basis_ids();
+                let planes = bases
+                    .iter()
+                    .map(|basis| {
+                        (
+                            *basis,
+                            crate::sim::basis_kernel::BasisWeightPlane {
+                                values: vec![1.0],
+                                mask: None,
+                            },
+                        )
+                    })
+                    .collect();
+                rule_set.kernels[0].spatial =
+                    crate::sim::ruleset::KernelSpatialDefinition::Periodic(
+                        crate::sim::basis_kernel::PeriodicKernelDefinition {
+                            width: 1,
+                            height: 1,
+                            anchor_x: 0,
+                            anchor_y: 0,
+                            planes,
+                        },
+                    );
+            }
+            next.rules.defaults.insert(id, rule_set_id);
+            next.rules.sets.push(rule_set);
+            next.rules
+                .bindings
+                .extend(next.basis_ids().into_iter().map(|basis| {
+                    crate::sim::ruleset::RuleBinding {
+                        basis,
+                        output: id,
+                        rule_set: rule_set_id,
+                    }
+                }));
+        }
         self.selected_channel = id;
-        self.replace_draft(next)
+        self.replace_draft(next)?;
+        self.refresh_rule_selection();
+        Ok(())
     }
 
     pub fn remove_selected_channel(&mut self) -> Result<(), String> {
@@ -533,6 +711,17 @@ impl WorkbenchState {
         }
         let removed = self.selected_channel;
         let mut next = self.draft.clone();
+        if !next.rules.is_empty()
+            && next.rules.sets.iter().any(|rule| {
+                rule.kernels
+                    .iter()
+                    .any(|kernel| kernel.source_channel == removed && rule.growth.target != removed)
+            })
+        {
+            return Err(
+                "channel is still used as a kernel source; reroute those kernels first".into(),
+            );
+        }
         next.channels.retain(|channel| channel.id != removed);
         next.kernels
             .retain(|kernel| kernel.source != removed && kernel.target != removed);
@@ -544,8 +733,25 @@ impl WorkbenchState {
                     .any(|kernel| kernel.id == *id && kernel.target == growth.target)
             });
         }
+        if !next.rules.is_empty() {
+            next.rules
+                .bindings
+                .retain(|binding| binding.output != removed);
+            next.rules.defaults.remove(&removed);
+            let referenced = next
+                .rules
+                .bindings
+                .iter()
+                .map(|binding| binding.rule_set)
+                .chain(next.rules.defaults.values().copied())
+                .collect::<std::collections::BTreeSet<_>>();
+            next.rules.sets.retain(|rule| referenced.contains(&rule.id));
+        }
         self.selected_channel = next.channels[0].id;
-        self.replace_draft(next).map_err(|error| error.to_string())
+        self.replace_draft(next)
+            .map_err(|error| error.to_string())?;
+        self.refresh_rule_selection();
+        Ok(())
     }
 
     pub fn select_next_channel(&mut self) {
@@ -556,7 +762,8 @@ impl WorkbenchState {
             .position(|channel| channel.id == self.selected_channel)
             .unwrap_or(0);
         self.selected_channel = self.draft.channels[(index + 1) % self.draft.channels.len()].id;
-        self.growth_editor = editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+        self.growth_editor =
+            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
         self.refresh_rule_selection();
     }
 
@@ -645,6 +852,62 @@ impl WorkbenchState {
     }
 
     pub fn add_kernel_for_selected(&mut self) -> Result<(), HistoryError> {
+        if !self.draft.rules.is_empty() {
+            let binding = BindingKey {
+                basis: self.selected_basis,
+                output: self.selected_channel,
+            };
+            let mut next = self.draft.clone();
+            let rule_set = next
+                .rules
+                .detach(binding)
+                .map_err(|error| HistoryError::Edit(error.to_string()))?;
+            let rule = next
+                .rules
+                .get_mut(rule_set)
+                .ok_or_else(|| HistoryError::Edit("selected rule-set is missing".into()))?;
+            let id = KernelId(
+                rule.kernels
+                    .iter()
+                    .map(|kernel| kernel.id.0)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or_else(|| HistoryError::Edit("kernel id exhausted".into()))?,
+            );
+            let symbol = format!("k{}", id.0);
+            let spatial = rule
+                .kernels
+                .first()
+                .map(|kernel| kernel.spatial.clone())
+                .unwrap_or_else(|| {
+                    crate::sim::ruleset::KernelSpatialDefinition::Raster(
+                        crate::sim::experiment_model::KernelSlot::identity(
+                            id,
+                            &symbol,
+                            self.selected_channel,
+                            self.selected_channel,
+                        )
+                        .definition,
+                    )
+                });
+            rule.kernels.push(crate::sim::ruleset::RuleKernel {
+                id,
+                symbol: symbol.clone(),
+                name: symbol,
+                source_channel: self.selected_channel,
+                spatial,
+            });
+            rule.growth.kernel_inputs.push(id);
+            rule.validate()
+                .map_err(|error| HistoryError::Edit(error.to_string()))?;
+            self.execute(DraftCommand::ReplaceDraft(Box::new(next)))?;
+            self.refresh_rule_selection();
+            self.selected_kernel = Some(id);
+            self.growth_editor =
+                editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+            return Ok(());
+        }
         let target = self.selected_channel;
         let mut next = self.draft.clone();
         let id = KernelId(
@@ -669,6 +932,37 @@ impl WorkbenchState {
     }
 
     pub fn remove_last_kernel_for_selected(&mut self) -> Result<(), String> {
+        if !self.draft.rules.is_empty() {
+            let binding = BindingKey {
+                basis: self.selected_basis,
+                output: self.selected_channel,
+            };
+            let mut next = self.draft.clone();
+            let rule_set = next
+                .rules
+                .detach(binding)
+                .map_err(|error| error.to_string())?;
+            let rule = next
+                .rules
+                .get_mut(rule_set)
+                .ok_or("selected rule-set is missing")?;
+            if rule.kernels.len() <= 1 {
+                return Err("a rule-set must retain at least one kernel".into());
+            }
+            let position = self
+                .selected_kernel
+                .and_then(|id| rule.kernels.iter().position(|kernel| kernel.id == id))
+                .unwrap_or(rule.kernels.len() - 1);
+            let removed = rule.kernels.remove(position).id;
+            rule.growth.kernel_inputs.retain(|id| *id != removed);
+            rule.validate().map_err(|error| error.to_string())?;
+            self.execute(DraftCommand::ReplaceDraft(Box::new(next)))
+                .map_err(|error| error.to_string())?;
+            self.refresh_rule_selection();
+            self.growth_editor =
+                editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+            return Ok(());
+        }
         let target = self.selected_channel;
         let mut next = self.draft.clone();
         let Some(position) = next
@@ -691,12 +985,128 @@ impl WorkbenchState {
 
     pub fn cycle_tiling_preset(&mut self) -> Result<(), HistoryError> {
         let mut next = self.draft.clone();
-        let preset = match next.tiling.as_ref().map(|tiling| tiling.prototypes.len()) {
-            Some(1) => TilingPreset::OctagonSquare,
-            _ => TilingPreset::Square,
+        let preset = match next
+            .tiling
+            .as_ref()
+            .and_then(|tiling| tiling.prototypes.first())
+            .map(|prototype| prototype.name.as_str())
+        {
+            None | Some("octagon") => TilingPreset::Square,
+            Some("square") => TilingPreset::EquilateralTriangles,
+            Some("up-triangle") => TilingPreset::RegularHexagon,
+            Some("hexagon") => TilingPreset::OctagonSquare,
+            Some(_) => TilingPreset::Square,
         };
         next.tiling = Some(build_preset(preset, 1.0));
-        self.replace_draft(next)
+        if next.rules.is_empty() {
+            next = next.normalize_rules().map_err(|errors| {
+                HistoryError::Edit(
+                    errors
+                        .into_iter()
+                        .map(|error| error.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                )
+            })?;
+        }
+        let bases = next.basis_ids();
+        let active_channels = next
+            .channels
+            .iter()
+            .filter(|channel| !channel.frozen)
+            .map(|channel| channel.id)
+            .collect::<Vec<_>>();
+        next.rules.bindings.retain(|binding| {
+            bases.contains(&binding.basis) && active_channels.contains(&binding.output)
+        });
+        for output in &active_channels {
+            let default = *next.rules.defaults.get(output).ok_or_else(|| {
+                HistoryError::Edit(format!("channel {:?} has no default rule-set", output))
+            })?;
+            for basis in &bases {
+                if next.rules.binding(*basis, *output).is_none() {
+                    next.rules.bindings.push(crate::sim::ruleset::RuleBinding {
+                        basis: *basis,
+                        output: *output,
+                        rule_set: default,
+                    });
+                }
+            }
+        }
+        for rule in &mut next.rules.sets {
+            for kernel in &mut rule.kernels {
+                let replacement = match &mut kernel.spatial {
+                    crate::sim::ruleset::KernelSpatialDefinition::Raster(definition) => {
+                        let built = definition
+                            .build()
+                            .map_err(|error| HistoryError::Edit(error.to_string()))?;
+                        let planes = bases
+                            .iter()
+                            .map(|basis| {
+                                (
+                                    *basis,
+                                    crate::sim::basis_kernel::BasisWeightPlane {
+                                        values: built.values.clone(),
+                                        mask: built.mask.clone(),
+                                    },
+                                )
+                            })
+                            .collect();
+                        Some(crate::sim::ruleset::KernelSpatialDefinition::Periodic(
+                            crate::sim::basis_kernel::PeriodicKernelDefinition {
+                                width: built.width,
+                                height: built.height,
+                                anchor_x: built.anchor_x,
+                                anchor_y: built.anchor_y,
+                                planes,
+                            },
+                        ))
+                    }
+                    crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) => {
+                        let plane_len = definition.width * definition.height;
+                        let template = definition.planes.values().next().cloned().unwrap_or(
+                            crate::sim::basis_kernel::BasisWeightPlane {
+                                values: vec![0.0; plane_len],
+                                mask: None,
+                            },
+                        );
+                        let mut updated = std::collections::BTreeMap::new();
+                        for basis in &bases {
+                            updated.insert(
+                                *basis,
+                                definition
+                                    .planes
+                                    .get(basis)
+                                    .cloned()
+                                    .unwrap_or_else(|| template.clone()),
+                            );
+                        }
+                        definition.planes = updated;
+                        None
+                    }
+                };
+                if let Some(replacement) = replacement {
+                    kernel.spatial = replacement;
+                }
+            }
+        }
+        next.rules
+            .validate(&bases, &next.channels)
+            .map_err(|errors| {
+                HistoryError::Edit(
+                    errors
+                        .into_iter()
+                        .map(|error| error.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                )
+            })?;
+        self.selected_basis = bases.first().copied().unwrap_or(BasisId(0));
+        self.replace_draft(next)?;
+        self.refresh_rule_selection();
+        self.growth_editor =
+            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+        Ok(())
     }
 
     pub fn tiling_prototype(&self) -> Option<PrototypeId> {
@@ -707,15 +1117,20 @@ impl WorkbenchState {
         let Some(tiling) = &self.draft.tiling else {
             return;
         };
-        if tiling.prototypes.is_empty() {
+        if tiling.instances.is_empty() {
             return;
         }
         let index = tiling
-            .prototypes
+            .instances
             .iter()
-            .position(|prototype| Some(prototype.id) == self.selected_prototype)
+            .position(|instance| instance.id == self.selected_basis)
             .unwrap_or(0);
-        self.selected_prototype = Some(tiling.prototypes[(index + 1) % tiling.prototypes.len()].id);
+        let instance = &tiling.instances[(index + 1) % tiling.instances.len()];
+        self.selected_basis = instance.id;
+        self.selected_prototype = Some(instance.prototype);
+        self.refresh_rule_selection();
+        self.growth_editor =
+            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
     }
 
     pub fn adjust_prototype_sides(&mut self, delta: i16) -> Result<(), String> {
@@ -853,7 +1268,10 @@ mod tests {
             Some(0.25),
         );
         state.undo().unwrap();
-        assert_eq!(state.rule_for(BasisId(0), ChannelId(0)).unwrap(), &sibling_before);
+        assert_eq!(
+            state.rule_for(BasisId(0), ChannelId(0)).unwrap(),
+            &sibling_before
+        );
     }
 
     #[test]
@@ -882,9 +1300,108 @@ mod tests {
         state.sync_growth_source();
 
         assert_eq!(
-            state.rule_for(BasisId(0), ChannelId(0)).unwrap().growth.source,
+            state
+                .rule_for(BasisId(0), ChannelId(0))
+                .unwrap()
+                .growth
+                .source,
             "self * 0.5",
         );
-        assert_eq!(state.rule_for(BasisId(1), ChannelId(0)).unwrap(), &sibling_before);
+        assert_eq!(
+            state.rule_for(BasisId(1), ChannelId(0)).unwrap(),
+            &sibling_before
+        );
+    }
+
+    #[test]
+    fn normalized_kernel_add_updates_only_selected_ruleset_and_growth_arity() {
+        let mut state = WorkbenchState::new(basis_fixture());
+        let sibling_before = state.rule_for(BasisId(1), ChannelId(0)).unwrap().clone();
+        state.add_kernel_for_selected().unwrap();
+        let selected = state.rule_for(BasisId(0), ChannelId(0)).unwrap();
+        assert_eq!(selected.kernels.len(), 2);
+        assert_eq!(selected.growth.kernel_inputs.len(), 2);
+        assert_eq!(
+            state.rule_for(BasisId(1), ChannelId(0)).unwrap(),
+            &sibling_before
+        );
+        selected.validate().unwrap();
+    }
+
+    #[test]
+    fn normalized_channel_add_creates_one_kernel_default_for_every_basis() {
+        let mut state = WorkbenchState::new(basis_fixture());
+        state.add_channel().unwrap();
+        let channel = state.selected_channel();
+        let default = state.draft().rules.defaults[&channel];
+        assert_eq!(state.draft().rules.get(default).unwrap().kernels.len(), 1);
+        for basis in [BasisId(0), BasisId(1)] {
+            assert!(state.draft().rules.binding(basis, channel).is_some());
+        }
+        state
+            .draft()
+            .rules
+            .validate(&state.draft().basis_ids(), &state.draft().channels)
+            .unwrap();
+    }
+
+    #[test]
+    fn preset_cycle_exposes_square_triangles_hexagon_and_octagon_square_with_periodic_rules() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        for (expected_name, expected_bases) in [
+            ("square", 1),
+            ("up-triangle", 2),
+            ("hexagon", 1),
+            ("octagon", 2),
+        ] {
+            state.cycle_tiling_preset().unwrap();
+            let draft = state.draft();
+            assert_eq!(
+                draft.tiling.as_ref().unwrap().prototypes[0].name,
+                expected_name
+            );
+            assert_eq!(draft.basis_ids().len(), expected_bases);
+            let rule = state.rule_for(BasisId(0), ChannelId(0)).unwrap();
+            let KernelSpatialDefinition::Periodic(definition) = &rule.kernels[0].spatial else {
+                panic!("tiling preset must switch kernels to periodic basis planes");
+            };
+            assert_eq!(definition.planes.len(), expected_bases);
+            draft
+                .rules
+                .validate(&draft.basis_ids(), &draft.channels)
+                .unwrap();
+        }
+    }
+
+    #[test]
+    fn free_draw_can_add_a_second_semantic_basis_with_default_rules() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        state.cycle_tiling_preset().unwrap();
+        state.begin_new_basis_polygon();
+        for point in [
+            crate::sim::tiling::Vec2::new(1.2, 0.1),
+            crate::sim::tiling::Vec2::new(1.8, 0.1),
+            crate::sim::tiling::Vec2::new(1.5, 0.6),
+        ] {
+            state.push_tiling_vertex(point);
+        }
+        state.finish_tiling_construction().unwrap();
+        assert_eq!(state.draft().basis_ids().len(), 2);
+        let added = state.selected_basis();
+        assert!(state.draft().rules.binding(added, ChannelId(0)).is_some());
+        let rule = state.rule_for(added, ChannelId(0)).unwrap();
+        let KernelSpatialDefinition::Periodic(definition) = &rule.kernels[0].spatial else {
+            panic!("new basis needs a periodic kernel plane");
+        };
+        assert!(definition.planes.contains_key(&added));
+    }
+
+    #[test]
+    fn next_basis_changes_the_ruleset_target_not_only_the_prototype_highlight() {
+        let mut state = WorkbenchState::new(basis_fixture());
+        assert_eq!(state.selected_basis(), BasisId(0));
+        state.select_next_prototype();
+        assert_eq!(state.selected_basis(), BasisId(1));
+        assert_eq!(state.tiling_prototype(), Some(PrototypeId(1)));
     }
 }

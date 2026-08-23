@@ -125,6 +125,38 @@ impl TilingScene {
         None
     }
 
+    pub fn hit_test_polygon(
+        &self,
+        x: u32,
+        y: u32,
+        width: u32,
+        height: u32,
+    ) -> Option<crate::sim::tiling::BasisId> {
+        let point = self.pixel_to_world(x, y, width, height);
+        for lattice_a in -1..=1 {
+            for lattice_b in -1..=1 {
+                let translation = self.draft.translation_a * f64::from(lattice_a)
+                    + self.draft.translation_b * f64::from(lattice_b);
+                for instance in self.draft.instances.iter().rev() {
+                    let prototype = self
+                        .draft
+                        .prototypes
+                        .iter()
+                        .find(|prototype| prototype.id == instance.prototype)?;
+                    let base = prototype_vertices(&prototype.shape).ok()?;
+                    let polygon = transform_vertices(&base, instance.transform)
+                        .into_iter()
+                        .map(|vertex| vertex + translation)
+                        .collect::<Vec<_>>();
+                    if polygon_contains(point, &polygon) {
+                        return Some(instance.id);
+                    }
+                }
+            }
+        }
+        None
+    }
+
     pub fn apply_gesture(&mut self, gesture: TilingGesture) -> Result<(), String> {
         match gesture {
             TilingGesture::SelectVertex { prototype, vertex } => {
@@ -214,7 +246,9 @@ impl TilingScene {
         }
         match &mut shape.shape {
             PrototypeShape::SimplePolygon { vertices } => Ok(vertices),
-            PrototypeShape::RegularPolygon { .. } => unreachable!("regular polygon was materialized"),
+            PrototypeShape::RegularPolygon { .. } => {
+                unreachable!("regular polygon was materialized")
+            }
         }
     }
 
@@ -236,6 +270,20 @@ impl TilingScene {
     }
 }
 
+fn polygon_contains(point: Vec2, polygon: &[Vec2]) -> bool {
+    let mut inside = false;
+    for index in 0..polygon.len() {
+        let first = polygon[index];
+        let second = polygon[(index + 1) % polygon.len()];
+        if (first.y > point.y) != (second.y > point.y)
+            && point.x < (second.x - first.x) * (point.y - first.y) / (second.y - first.y) + first.x
+        {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
 impl GraphicsScene for TilingScene {
     fn render_rgba(&self, width: u32, height: u32) -> GraphicsFrame {
         let width = width.max(1);
@@ -252,12 +300,13 @@ impl GraphicsScene for TilingScene {
                 .prototypes
                 .iter()
                 .find(|prototype| prototype.id == instance.prototype)
-            else { continue };
-            let Ok(base) = prototype_vertices(&prototype.shape) else { continue };
-            canonical.push((
-                prototype.id,
-                transform_vertices(&base, instance.transform),
-            ));
+            else {
+                continue;
+            };
+            let Ok(base) = prototype_vertices(&prototype.shape) else {
+                continue;
+            };
+            canonical.push((prototype.id, transform_vertices(&base, instance.transform)));
         }
 
         // The editor intentionally shows one strong canonical cell and only
@@ -266,11 +315,16 @@ impl GraphicsScene for TilingScene {
         // true geometry instead of being forced into an axis-aligned grid.
         for lattice_a in -1..=1 {
             for lattice_b in -1..=1 {
-                if lattice_a == 0 && lattice_b == 0 { continue; }
+                if lattice_a == 0 && lattice_b == 0 {
+                    continue;
+                }
                 let translation = self.draft.translation_a * f64::from(lattice_a)
                     + self.draft.translation_b * f64::from(lattice_b);
                 for (_, polygon) in &canonical {
-                    let ghost = polygon.iter().map(|vertex| *vertex + translation).collect::<Vec<_>>();
+                    let ghost = polygon
+                        .iter()
+                        .map(|vertex| *vertex + translation)
+                        .collect::<Vec<_>>();
                     draw_filled_polygon(&mut rgba, width, height, self, &ghost, [28, 66, 108, 72]);
                     draw_polygon(&mut rgba, width, height, self, &ghost, [90, 145, 205, 130]);
                 }
@@ -293,8 +347,22 @@ impl GraphicsScene for TilingScene {
             }
         }
         let origin = self.world_to_pixel(Vec2::ZERO, width, height);
-        draw_line(&mut rgba, width, height, origin, self.world_to_pixel(self.draft.translation_a, width, height), [255, 110, 90, 230]);
-        draw_line(&mut rgba, width, height, origin, self.world_to_pixel(self.draft.translation_b, width, height), [90, 220, 150, 230]);
+        draw_line(
+            &mut rgba,
+            width,
+            height,
+            origin,
+            self.world_to_pixel(self.draft.translation_a, width, height),
+            [255, 110, 90, 230],
+        );
+        draw_line(
+            &mut rgba,
+            width,
+            height,
+            origin,
+            self.world_to_pixel(self.draft.translation_b, width, height),
+            [90, 220, 150, 230],
+        );
         if !self.construction.is_empty() {
             for segment in self.construction.windows(2) {
                 draw_line(
@@ -307,7 +375,14 @@ impl GraphicsScene for TilingScene {
                 );
             }
             for point in &self.construction {
-                draw_disc(&mut rgba, width, height, self.world_to_pixel(*point, width, height), 4, [255, 245, 190, 255]);
+                draw_disc(
+                    &mut rgba,
+                    width,
+                    height,
+                    self.world_to_pixel(*point, width, height),
+                    4,
+                    [255, 245, 190, 255],
+                );
             }
         }
         if let Some(vertices) = selected_handles {
@@ -342,10 +417,20 @@ fn draw_filled_polygon(
     polygon: &[Vec2],
     color: [u8; 4],
 ) {
-    if polygon.len() < 3 { return; }
-    let points = polygon.iter().map(|point| scene.world_to_pixel(*point, width, height)).collect::<Vec<_>>();
+    if polygon.len() < 3 {
+        return;
+    }
+    let points = polygon
+        .iter()
+        .map(|point| scene.world_to_pixel(*point, width, height))
+        .collect::<Vec<_>>();
     let min_y = points.iter().map(|point| point.1).min().unwrap_or(0).max(0);
-    let max_y = points.iter().map(|point| point.1).max().unwrap_or(-1).min(height as i32 - 1);
+    let max_y = points
+        .iter()
+        .map(|point| point.1)
+        .max()
+        .unwrap_or(-1)
+        .min(height as i32 - 1);
     for y in min_y..=max_y {
         let scan_y = f64::from(y) + 0.5;
         let mut intersections = Vec::with_capacity(points.len());
@@ -598,10 +683,8 @@ mod tests {
 
     #[test]
     fn hexagon_preview_has_a_strong_center_and_oblique_ghost_neighbor() {
-        let draft = crate::sim::tiling::build_preset(
-            crate::sim::tiling::TilingPreset::RegularHexagon,
-            1.0,
-        );
+        let draft =
+            crate::sim::tiling::build_preset(crate::sim::tiling::TilingPreset::RegularHexagon, 1.0);
         let scene = TilingScene::new(draft.clone());
         let frame = scene.render_rgba(640, 480);
         let base = prototype_vertices(&draft.prototypes[0].shape).unwrap();
@@ -612,35 +695,80 @@ mod tests {
         let sample = |point: Vec2| {
             let (x, y) = scene.world_to_pixel(point, 640, 480);
             let index = (y as usize * 640 + x as usize) * 4;
-            [frame.rgba[index], frame.rgba[index + 1], frame.rgba[index + 2]]
+            [
+                frame.rgba[index],
+                frame.rgba[index + 1],
+                frame.rgba[index + 2],
+            ]
         };
         let center_color = sample(center);
         let ghost_color = sample(neighbor);
         assert_ne!(center_color, [5, 10, 24]);
         assert_ne!(ghost_color, [5, 10, 24]);
-        assert_ne!(center_color, ghost_color, "ghost neighbor must be visually subordinate");
+        assert_ne!(
+            center_color, ghost_color,
+            "ghost neighbor must be visually subordinate"
+        );
         assert!(draft.translation_a.x.abs() > 0.1 && draft.translation_a.y.abs() > 0.1);
     }
 
     #[test]
     fn octagon_square_preview_renders_both_canonical_basis_shapes() {
-        let draft = crate::sim::tiling::build_preset(
-            crate::sim::tiling::TilingPreset::OctagonSquare,
-            1.0,
-        );
+        let draft =
+            crate::sim::tiling::build_preset(crate::sim::tiling::TilingPreset::OctagonSquare, 1.0);
         let scene = TilingScene::new(draft.clone());
         let frame = scene.render_rgba(640, 480);
         let mut sampled = Vec::new();
         for instance in &draft.instances {
-            let prototype = draft.prototypes.iter().find(|p| p.id == instance.prototype).unwrap();
-            let polygon = transform_vertices(&prototype_vertices(&prototype.shape).unwrap(), instance.transform);
+            let prototype = draft
+                .prototypes
+                .iter()
+                .find(|p| p.id == instance.prototype)
+                .unwrap();
+            let polygon = transform_vertices(
+                &prototype_vertices(&prototype.shape).unwrap(),
+                instance.transform,
+            );
             let center = polygon.iter().fold(Vec2::ZERO, |sum, point| sum + *point)
                 * (1.0 / polygon.len() as f64);
             let (x, y) = scene.world_to_pixel(center, 640, 480);
             let index = (y as usize * 640 + x as usize) * 4;
-            sampled.push([frame.rgba[index], frame.rgba[index + 1], frame.rgba[index + 2]]);
+            sampled.push([
+                frame.rgba[index],
+                frame.rgba[index + 1],
+                frame.rgba[index + 2],
+            ]);
             assert_ne!(sampled.last().copied().unwrap(), [5, 10, 24]);
         }
-        assert!(sampled.len() >= 2, "mixed tiling must expose multiple basis polygons");
+        assert!(
+            sampled.len() >= 2,
+            "mixed tiling must expose multiple basis polygons"
+        );
+    }
+
+    #[test]
+    fn canonical_and_ghost_polygon_hits_map_back_to_the_semantic_basis() {
+        let draft =
+            crate::sim::tiling::build_preset(crate::sim::tiling::TilingPreset::OctagonSquare, 1.0);
+        let scene = TilingScene::new(draft.clone());
+        let instance = &draft.instances[1];
+        let prototype = draft
+            .prototypes
+            .iter()
+            .find(|p| p.id == instance.prototype)
+            .unwrap();
+        let polygon = transform_vertices(
+            &prototype_vertices(&prototype.shape).unwrap(),
+            instance.transform,
+        );
+        let center = polygon.iter().fold(Vec2::ZERO, |sum, point| sum + *point)
+            * (1.0 / polygon.len() as f64);
+        for world in [center, center + draft.translation_a] {
+            let (x, y) = scene.world_to_pixel(world, 640, 480);
+            assert_eq!(
+                scene.hit_test_polygon(x as u32, y as u32, 640, 480),
+                Some(instance.id),
+            );
+        }
     }
 }

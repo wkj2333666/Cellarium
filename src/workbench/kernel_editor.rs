@@ -400,8 +400,7 @@ impl PeriodicKernelScene {
         let center = polygon.iter().fold(Vec2::ZERO, |sum, point| sum + *point)
             * (1.0 / polygon.len() as f64);
         let (x, y) = self.world_to_pixel(center, width, height);
-        (x >= 0 && y >= 0 && x < width as i32 && y < height as i32)
-            .then_some((x as u32, y as u32))
+        (x >= 0 && y >= 0 && x < width as i32 && y < height as i32).then_some((x as u32, y as u32))
     }
 
     pub fn zoom_at(&mut self, px: u32, py: u32, width: u32, height: u32, factor: f64) {
@@ -468,7 +467,11 @@ impl PeriodicKernelScene {
     }
 
     fn basis_polygon(&self, basis: BasisId, translation: Vec2) -> Option<Vec<Vec2>> {
-        let instance = self.tiling.instances.iter().find(|entry| entry.id == basis)?;
+        let instance = self
+            .tiling
+            .instances
+            .iter()
+            .find(|entry| entry.id == basis)?;
         let prototype = self
             .tiling
             .prototypes
@@ -507,9 +510,7 @@ impl PeriodicKernelScene {
     fn pixel_scale(&self, width: u32, height: u32, bounds: (Vec2, Vec2)) -> f64 {
         let span_x = (bounds.1.x - bounds.0.x).max(1e-9);
         let span_y = (bounds.1.y - bounds.0.y).max(1e-9);
-        (f64::from(width.max(1)) / span_x)
-            .min(f64::from(height.max(1)) / span_y)
-            * self.view.zoom
+        (f64::from(width.max(1)) / span_x).min(f64::from(height.max(1)) / span_y) * self.view.zoom
     }
 
     fn view_center(&self, bounds: (Vec2, Vec2)) -> Vec2 {
@@ -694,14 +695,7 @@ fn draw_pixel_line(
     }
 }
 
-fn set_pixel(
-    rgba: &mut [u8],
-    width: u32,
-    height: u32,
-    x: i32,
-    y: i32,
-    color: [u8; 4],
-) {
+fn set_pixel(rgba: &mut [u8], width: u32, height: u32, x: i32, y: i32, color: [u8; 4]) {
     if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
         return;
     }
@@ -930,8 +924,18 @@ mod tests {
         let scene = PeriodicKernelScene::new(tiling, definition, BasisId(0));
         let frame = scene.render_rgba(640, 480);
 
-        assert!(frame.rgba.chunks_exact(4).any(|pixel| pixel[1] > 120 && pixel[2] > 120));
-        assert!(frame.rgba.chunks_exact(4).any(|pixel| pixel[0] > 120 && pixel[1] < 100));
+        assert!(
+            frame
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel[1] > 120 && pixel[2] > 120)
+        );
+        assert!(
+            frame
+                .rgba
+                .chunks_exact(4)
+                .any(|pixel| pixel[0] > 120 && pixel[1] < 100)
+        );
         for source_basis in [BasisId(0), BasisId(1)] {
             let selection = KernelSelection {
                 offset: [0, 0],

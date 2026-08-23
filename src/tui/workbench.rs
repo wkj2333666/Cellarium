@@ -5,7 +5,7 @@ use crate::workbench::{WorkbenchFocus, WorkbenchSection};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, Widget, Wrap};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -55,10 +55,18 @@ pub fn draw_workbench(
 ) {
     let layout = workbench_layout(area);
     app.set_workbench_area(area);
-    let canvas_block = panel(" Canvas ", app.workbench().focus() == WorkbenchFocus::Canvas);
+    let canvas_block = panel(
+        " Canvas ",
+        app.workbench().focus() == WorkbenchFocus::Canvas,
+    );
     let canvas_content = canvas_block.inner(layout.canvas);
     let header_height = canvas_content.height.min(2);
-    let canvas_header = Rect::new(canvas_content.x, canvas_content.y, canvas_content.width, header_height);
+    let canvas_header = Rect::new(
+        canvas_content.x,
+        canvas_content.y,
+        canvas_content.width,
+        header_height,
+    );
     let canvas_inner = Rect::new(
         canvas_content.x,
         canvas_content.y.saturating_add(header_height),
@@ -226,21 +234,35 @@ pub fn draw_workbench(
     frame.render_widget(canvas_block, layout.canvas);
     let header = match state.section() {
         WorkbenchSection::Tiling => format!(
-            "[S] Select  [D] Draw polygon  [P] Preset  [N] Next basis   tool: {:?}",
-            state.tiling_tool()
+            "[D] Edit selected  [A] Draw new basis  [P] Next preset  [N] Next basis   tool: {:?}{}",
+            state.tiling_tool(),
+            if state.is_drawing_new_basis() {
+                " · NEW BASIS"
+            } else {
+                ""
+            },
         ),
-        WorkbenchSection::Kernels =>
-            "Click select · drag paint · wheel value · E exact · middle pan · empty wheel zoom".into(),
-        WorkbenchSection::Growth =>
-            "Source editor and pixel plot · E edit · Esc finish · diagnostics update live".into(),
+        WorkbenchSection::Kernels => {
+            "Click select · drag paint · wheel value · E exact · middle pan · empty wheel zoom"
+                .into()
+        }
+        WorkbenchSection::Growth => {
+            "Source editor and pixel plot · E edit · Esc finish · diagnostics update live".into()
+        }
         WorkbenchSection::World => "Left paint · right erase · middle pan · wheel zoom".into(),
-        WorkbenchSection::Channels => "Add/remove channels · visibility · color · composite view".into(),
+        WorkbenchSection::Channels => {
+            "Add/remove channels · visibility · color · composite view".into()
+        }
         WorkbenchSection::Experiment => "Review changes; Ctrl+Enter applies explicitly".into(),
     };
-    frame.render_widget(Paragraph::new(header).style(Style::default().fg(Color::Rgb(150, 190, 240))), canvas_header);
+    frame.render_widget(
+        Paragraph::new(header).style(Style::default().fg(Color::Rgb(150, 190, 240))),
+        canvas_header,
+    );
     if matches!(state.section(), WorkbenchSection::World) {
         let (width, height) = display.framebuffer_size(graphics_area);
-        let mut graphics = initial_field_graphics(state, *app.camera(), width as u32, height as u32);
+        let mut graphics =
+            initial_field_graphics(state, *app.camera(), width as u32, height as u32);
         graphics.generation = scene_generation;
         display.render_graphics(frame, graphics_area, &graphics);
     } else if state.section() == WorkbenchSection::Tiling {
@@ -290,14 +312,28 @@ pub fn draw_workbench(
         }
     } else if state.section() == WorkbenchSection::Growth {
         let source_height = canvas_inner.height.saturating_sub(graphics_area.height);
-        let source_area = Rect::new(canvas_inner.x, canvas_inner.y, canvas_inner.width, source_height);
+        let source_area = Rect::new(
+            canvas_inner.x,
+            canvas_inner.y,
+            canvas_inner.width,
+            source_height,
+        );
         let editor = state.growth_editor();
         let mut source_lines = vec![
             Line::styled(
-                format!("target: basis {} / channel {}", state.selected_basis().0, state.selected_channel().0),
+                format!(
+                    "target: basis {} / channel {}",
+                    state.selected_basis().0,
+                    state.selected_channel().0
+                ),
                 Style::default().fg(Color::Rgb(120, 170, 230)),
             ),
-            Line::styled(editor.signature().to_string(), Style::default().fg(Color::Rgb(255, 220, 130)).add_modifier(Modifier::BOLD)),
+            Line::styled(
+                editor.signature().to_string(),
+                Style::default()
+                    .fg(Color::Rgb(255, 220, 130))
+                    .add_modifier(Modifier::BOLD),
+            ),
         ];
         source_lines.extend(growth_source_preview(editor));
         if !editor.diagnostics().is_empty() {
@@ -309,7 +345,15 @@ pub fn draw_workbench(
         frame.render_widget(
             Paragraph::new(source_lines)
                 .wrap(Wrap { trim: false })
-                .block(Block::default().title(if state.growth_editing() { " Source — EDITING " } else { " Source — press E " }).borders(Borders::BOTTOM)),
+                .block(
+                    Block::default()
+                        .title(if state.growth_editing() {
+                            " Source — EDITING "
+                        } else {
+                            " Source — press E "
+                        })
+                        .borders(Borders::BOTTOM),
+                ),
             source_area,
         );
         let scene = crate::workbench::growth_graph::GrowthScene::from_editor(state.growth_editor());
@@ -360,7 +404,10 @@ pub fn draw_workbench(
                     "construction vertices: {}",
                     state.tiling_construction().len()
                 )));
-                lines.push(Line::from("D draw freely · click vertices · Enter close"));
+                lines.push(Line::from("D redraw selected · A draw a new basis"));
+                lines.push(Line::from(
+                    "Click vertices · click first/Enter close · Esc cancel",
+                ));
                 lines.push(Line::from("Select: drag vertex · right remove"));
                 lines.push(Line::from("P preset · N basis · +/- regular sides"));
             }
@@ -403,7 +450,9 @@ pub fn draw_workbench(
                         }
                     }
                 }
-                lines.push(Line::from("Canvas: click polygon · drag paint · right zero"));
+                lines.push(Line::from(
+                    "Canvas: click polygon · drag paint · right zero",
+                ));
                 lines.push(Line::from("Cell wheel ±0.05 · Shift ±0.005 · Ctrl ±0.5"));
                 lines.push(Line::from("Empty wheel zoom · middle pan · E exact value"));
                 lines.push(Line::from("A add · Del remove"));
@@ -412,7 +461,10 @@ pub fn draw_workbench(
                     state.kernel_paint_value()
                 )));
                 if let Some(point) = state.kernel_selection() {
-                    lines.push(Line::from(format!("selected cell: {}, {}", point.x, point.y)));
+                    lines.push(Line::from(format!(
+                        "selected cell: {}, {}",
+                        point.x, point.y
+                    )));
                 }
                 if let Some(selection) = state.periodic_kernel_selection() {
                     lines.push(Line::from(format!(
@@ -421,7 +473,11 @@ pub fn draw_workbench(
                     )));
                 }
                 if let Some(editor) = state.numeric_editor() {
-                    lines.push(Line::from(format!("{} = {}▌", editor.label(), editor.buffer())));
+                    lines.push(Line::from(format!(
+                        "{} = {}▌",
+                        editor.label(),
+                        editor.buffer()
+                    )));
                     lines.push(Line::from("Enter commit · Esc cancel"));
                 }
             }
@@ -511,10 +567,15 @@ fn channel_graphics(
     let channels = &state.draft().channels;
     let colors = channels
         .iter()
-        .map(|channel| crate::workbench::resolved_color(state.draft(), channel.id)
-            .unwrap_or(crate::render::channels::Rgb8::new(255, 255, 255)))
+        .map(|channel| {
+            crate::workbench::resolved_color(state.draft(), channel.id)
+                .unwrap_or(crate::render::channels::Rgb8::new(255, 255, 255))
+        })
         .collect::<Vec<_>>();
-    let selected = channels.iter().position(|channel| channel.id == state.selected_channel()).unwrap_or(0);
+    let selected = channels
+        .iter()
+        .position(|channel| channel.id == state.selected_channel())
+        .unwrap_or(0);
     let columns = (channels.len() as f64).sqrt().ceil().max(1.0) as usize;
     let rows = channels.len().div_ceil(columns).max(1);
     let mut rgba = vec![0_u8; width as usize * height as usize * 4];
@@ -526,7 +587,13 @@ fn channel_graphics(
                     let panel_height = (height as usize).div_ceil(rows).max(1);
                     let column = x / panel_width;
                     let row = y / panel_height;
-                    (Some(row * columns + column), x % panel_width, y % panel_height, panel_width, panel_height)
+                    (
+                        Some(row * columns + column),
+                        x % panel_width,
+                        y % panel_height,
+                        panel_width,
+                        panel_height,
+                    )
                 } else {
                     (None, x, y, width as usize, height as usize)
                 };
@@ -537,10 +604,14 @@ fn channel_graphics(
             let mut values = Vec::new();
             let mut active_colors = Vec::new();
             for index in 0..channels.len() {
-                let include = channels[index].display.visible && match panel {
-                    Some(panel) => panel == index,
-                    None => state.channel_view() == crate::workbench::ChannelView::Composite || index == selected,
-                };
+                let include = channels[index].display.visible
+                    && match panel {
+                        Some(panel) => panel == index,
+                        None => {
+                            state.channel_view() == crate::workbench::ChannelView::Composite
+                                || index == selected
+                        }
+                    };
                 if include {
                     values.push(channels[index].initial.get(tile).copied().unwrap_or(0.0));
                     active_colors.push(colors[index]);
@@ -558,21 +629,85 @@ fn channel_graphics(
 fn growth_source_preview(editor: &crate::workbench::GrowthEditorState) -> Vec<Line<'static>> {
     let text = editor.buffer().as_str();
     let cursor = editor.buffer().cursor();
+    let selection = editor
+        .buffer()
+        .selection()
+        .map(|selection| selection.range());
     let mut lines = Vec::new();
     let mut offset = 0usize;
-    for source_line in text.split('\n').take(12) {
+    for (line_number, source_line) in text.split('\n').take(12).enumerate() {
         let end = offset + source_line.len();
-        let mut rendered = source_line.to_string();
-        if editor.buffer().cursor_is_char_boundary() && cursor >= offset && cursor <= end {
-            rendered.insert_str(cursor.saturating_sub(offset).min(rendered.len()), "▌");
+        let mut spans = vec![Span::styled(
+            format!("{:>3} ", line_number + 1),
+            Style::default().fg(Color::Rgb(80, 95, 120)),
+        )];
+        for (relative, character) in source_line.char_indices() {
+            let absolute = offset + relative;
+            if editor.buffer().cursor_is_char_boundary() && cursor == absolute {
+                spans.push(Span::styled(
+                    "▌",
+                    Style::default().fg(Color::Rgb(255, 220, 90)),
+                ));
+            }
+            let selected = selection
+                .as_ref()
+                .is_some_and(|range| range.contains(&absolute));
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Rgb(255, 255, 255))
+                    .bg(Color::Rgb(55, 85, 145))
+            } else {
+                growth_source_style(source_line, relative)
+            };
+            spans.push(Span::styled(character.to_string(), style));
         }
-        lines.push(Line::from(format!("  {rendered}")));
+        if cursor == end {
+            spans.push(Span::styled(
+                "▌",
+                Style::default().fg(Color::Rgb(255, 220, 90)),
+            ));
+        }
+        lines.push(Line::from(spans));
         offset = end.saturating_add(1);
     }
     if lines.is_empty() {
-        lines.push(Line::from("  ▌"));
+        lines.push(Line::from("  1 ▌"));
     }
     lines
+}
+
+fn growth_source_style(line: &str, byte: usize) -> Style {
+    if line.get(..byte).is_some_and(|prefix| prefix.contains("//")) {
+        return Style::default().fg(Color::Rgb(100, 140, 110));
+    }
+    let is_word = |character: char| character == '_' || character.is_alphanumeric();
+    let start = line[..byte]
+        .char_indices()
+        .rev()
+        .take_while(|(_, character)| is_word(*character))
+        .last()
+        .map_or(byte, |(index, _)| index);
+    let end = line[byte..]
+        .char_indices()
+        .take_while(|(_, character)| is_word(*character))
+        .last()
+        .map_or(byte, |(index, character)| {
+            byte + index + character.len_utf8()
+        });
+    let token = &line[start..end];
+    if matches!(token, "let" | "if" | "else" | "true" | "false") {
+        Style::default()
+            .fg(Color::Rgb(215, 145, 255))
+            .add_modifier(Modifier::BOLD)
+    } else if line[byte..]
+        .chars()
+        .next()
+        .is_some_and(|character| character.is_ascii_digit())
+    {
+        Style::default().fg(Color::Rgb(255, 190, 105))
+    } else {
+        Style::default().fg(Color::Rgb(220, 225, 235))
+    }
 }
 
 #[allow(dead_code)]

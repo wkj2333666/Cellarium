@@ -11,6 +11,7 @@ pub struct GrowthCursor {
 #[derive(Clone, Debug)]
 pub struct GrowthScene {
     pub plot: Vec<Option<f32>>,
+    pub heatmap: Option<crate::sim::growth::plot::HeatmapData>,
     pub stale: bool,
     pub cursor: Option<GrowthCursor>,
 }
@@ -19,6 +20,7 @@ impl GrowthScene {
     pub fn from_editor(editor: &GrowthEditorState) -> Self {
         Self {
             plot: editor.plot().data.clone(),
+            heatmap: editor.plot().heatmap.clone(),
             stale: editor.plot().stale,
             cursor: None,
         }
@@ -56,6 +58,69 @@ impl GraphicsScene for GrowthScene {
             p[3] = 255;
         }
         let axis = [48_u8, 58, 76, 255];
+        if let Some(heatmap) = &self.heatmap {
+            let maximum = heatmap
+                .samples
+                .iter()
+                .flatten()
+                .map(|value| value.abs())
+                .fold(1e-6_f32, f32::max);
+            let plot_width = width.saturating_sub(33).max(1);
+            let plot_height = height.saturating_sub(33).max(1);
+            for py in 0..plot_height {
+                let sample_y = (py as usize * heatmap.height.saturating_sub(1)
+                    / plot_height.saturating_sub(1).max(1) as usize)
+                    .min(heatmap.height - 1);
+                for px in 0..plot_width {
+                    let sample_x = (px as usize * heatmap.width.saturating_sub(1)
+                        / plot_width.saturating_sub(1).max(1) as usize)
+                        .min(heatmap.width - 1);
+                    let sample = heatmap.samples[sample_y * heatmap.width + sample_x];
+                    let color = match sample {
+                        Some(value) if value >= 0.0 => {
+                            let intensity = (value.abs() / maximum * 235.0).round() as u8;
+                            [8, intensity, intensity, 255]
+                        }
+                        Some(value) => {
+                            let intensity = (value.abs() / maximum * 235.0).round() as u8;
+                            [intensity, 24, 8, 255]
+                        }
+                        None => [220, 35, 180, 255],
+                    };
+                    blend(
+                        &mut rgba,
+                        width,
+                        height,
+                        24 + px as i32,
+                        8 + (plot_height - 1 - py) as i32,
+                        color,
+                    );
+                }
+            }
+            for y in 0..heatmap.height {
+                for x in 0..heatmap.width {
+                    let value = heatmap.samples[y * heatmap.width + x];
+                    let crosses = value.is_some_and(|value| {
+                        (x + 1 < heatmap.width
+                            && heatmap.samples[y * heatmap.width + x + 1]
+                                .is_some_and(|other| value.signum() != other.signum()))
+                            || (y + 1 < heatmap.height
+                                && heatmap.samples[(y + 1) * heatmap.width + x]
+                                    .is_some_and(|other| value.signum() != other.signum()))
+                    });
+                    if crosses {
+                        let px = 24
+                            + (x * plot_width as usize / heatmap.width.saturating_sub(1).max(1))
+                                as i32;
+                        let py = 8 + plot_height as i32
+                            - 1
+                            - (y * plot_height as usize / heatmap.height.saturating_sub(1).max(1))
+                                as i32;
+                        blend(&mut rgba, width, height, px, py, [245, 245, 245, 255]);
+                    }
+                }
+            }
+        }
         draw_line(
             &mut rgba,
             width,
@@ -80,23 +145,25 @@ impl GraphicsScene for GrowthScene {
                 (lo.min(value), hi.max(value))
             });
         let span = (max - min).max(1e-6);
-        let mut previous = None;
-        for (index, value) in self.plot.iter().enumerate() {
-            let Some(value) = value else {
-                previous = None;
-                continue;
-            };
-            let x = 24
-                + (index * (width.saturating_sub(33) as usize)
-                    / self.plot.len().saturating_sub(1).max(1)) as i32;
-            let y = height as i32
-                - 24
-                - (((value - min) / span) * (height.saturating_sub(33) as f32)) as i32;
-            let point = (x, y);
-            if let Some(prev) = previous {
-                draw_line(&mut rgba, width, height, prev, point, [80, 220, 140, 255]);
+        if self.heatmap.is_none() {
+            let mut previous = None;
+            for (index, value) in self.plot.iter().enumerate() {
+                let Some(value) = value else {
+                    previous = None;
+                    continue;
+                };
+                let x = 24
+                    + (index * (width.saturating_sub(33) as usize)
+                        / self.plot.len().saturating_sub(1).max(1)) as i32;
+                let y = height as i32
+                    - 24
+                    - (((value - min) / span) * (height.saturating_sub(33) as f32)) as i32;
+                let point = (x, y);
+                if let Some(prev) = previous {
+                    draw_line(&mut rgba, width, height, prev, point, [80, 220, 140, 255]);
+                }
+                previous = Some(point);
             }
-            previous = Some(point);
         }
         if let Some(cursor) = self.cursor {
             if !self.plot.is_empty() {
@@ -215,6 +282,35 @@ mod tests {
         assert!(
             before.rgba != after.rgba,
             "valid edit must change curve pixels"
+        );
+    }
+
+    #[test]
+    fn two_input_heatmap_is_rendered_as_dense_pixels_not_character_art() {
+        let editor = GrowthEditorState::new(
+            "first - second",
+            ExternalSymbols::new(&["first", "second"], &[]),
+            BTreeMap::new(),
+            "growth",
+        );
+        let scene = GrowthScene::from_editor(&editor);
+        let frame = scene.render_rgba(320, 220);
+        let colors = frame
+            .rgba
+            .chunks_exact(4)
+            .map(|pixel| [pixel[0], pixel[1], pixel[2]])
+            .collect::<std::collections::BTreeSet<_>>();
+        assert!(
+            colors.len() > 64,
+            "heatmap should have a continuous pixel palette"
+        );
+        assert!(
+            frame
+                .rgba
+                .chunks_exact(4)
+                .filter(|pixel| pixel[0] > 30 || pixel[1] > 30)
+                .count()
+                > 20_000
         );
     }
 }

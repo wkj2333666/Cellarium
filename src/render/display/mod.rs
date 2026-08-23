@@ -108,10 +108,7 @@ struct GraphicsRequestKey {
     terminal_size: ratatui::layout::Size,
 }
 
-fn should_submit_graphics(
-    previous: Option<GraphicsRequestKey>,
-    next: GraphicsRequestKey,
-) -> bool {
+fn should_submit_graphics(previous: Option<GraphicsRequestKey>, next: GraphicsRequestKey) -> bool {
     previous != Some(next)
 }
 
@@ -939,12 +936,9 @@ impl ViewportDisplay {
             Self::KittyShared(display) => display.should_submit_graphics(key),
         };
         if submit {
-            let image = ImageBuffer::from_raw(
-                graphics.width,
-                graphics.height,
-                graphics.rgba.clone(),
-            )
-            .map(DynamicImage::ImageRgba8);
+            let image =
+                ImageBuffer::from_raw(graphics.width, graphics.height, graphics.rgba.clone())
+                    .map(DynamicImage::ImageRgba8);
             if let Some(image) = image {
                 match self {
                     Self::Pixel(display) => display.submit(image, size),

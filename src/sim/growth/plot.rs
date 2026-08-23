@@ -15,6 +15,17 @@ pub enum PlotRequest {
         pinned: PinnedInputs,
         trace: bool,
     },
+    Heatmap {
+        x_axis: String,
+        y_axis: String,
+        x_start: f32,
+        x_end: f32,
+        y_start: f32,
+        y_end: f32,
+        width: usize,
+        height: usize,
+        pinned: PinnedInputs,
+    },
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -31,8 +42,18 @@ pub struct CurveData {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+pub struct HeatmapData {
+    pub x_axis: String,
+    pub y_axis: String,
+    pub width: usize,
+    pub height: usize,
+    pub samples: Vec<Option<f32>>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
 pub enum PlotData {
     Curve(CurveData),
+    Heatmap(HeatmapData),
 }
 
 impl PlotData {
@@ -42,6 +63,11 @@ impl PlotData {
                 .samples
                 .iter()
                 .filter(|sample| sample.value.is_none())
+                .count(),
+            Self::Heatmap(heatmap) => heatmap
+                .samples
+                .iter()
+                .filter(|sample| sample.is_none())
                 .count(),
         }
     }
@@ -123,7 +149,107 @@ pub fn sample_plot(program: &TypedProgram, request: PlotRequest) -> Result<PlotD
                 samples: result,
             }))
         }
+        PlotRequest::Heatmap {
+            x_axis,
+            y_axis,
+            x_start,
+            x_end,
+            y_start,
+            y_end,
+            width,
+            height,
+            pinned,
+        } => {
+            let sample_count = width.checked_mul(height).ok_or("invalid_heatmap_request")?;
+            if width == 0
+                || height == 0
+                || width > 512
+                || height > 512
+                || sample_count > 262_144
+                || x_axis == y_axis
+                || !x_start.is_finite()
+                || !x_end.is_finite()
+                || !y_start.is_finite()
+                || !y_end.is_finite()
+            {
+                return Err("invalid_heatmap_request");
+            }
+            let externals = program.externals.ordered();
+            if !externals.iter().any(|name| name == &x_axis)
+                || !externals.iter().any(|name| name == &y_axis)
+            {
+                return Err("unknown_plot_axis");
+            }
+            let mut samples = Vec::with_capacity(sample_count);
+            for y in 0..height {
+                let y_t = if height == 1 {
+                    0.0
+                } else {
+                    y as f32 / (height - 1) as f32
+                };
+                let y_value = y_start + (y_end - y_start) * y_t;
+                for x in 0..width {
+                    let x_t = if width == 1 {
+                        0.0
+                    } else {
+                        x as f32 / (width - 1) as f32
+                    };
+                    let x_value = x_start + (x_end - x_start) * x_t;
+                    samples.push(evaluate_point(
+                        program,
+                        &pinned,
+                        &[(x_axis.as_str(), x_value), (y_axis.as_str(), y_value)],
+                    ));
+                }
+            }
+            Ok(PlotData::Heatmap(HeatmapData {
+                x_axis,
+                y_axis,
+                width,
+                height,
+                samples,
+            }))
+        }
     }
+}
+
+fn evaluate_point(
+    program: &TypedProgram,
+    pinned: &PinnedInputs,
+    axes: &[(&str, f32)],
+) -> Option<f32> {
+    let mut parameters = pinned.0.clone();
+    let mut kernel_inputs = program
+        .externals
+        .kernel_inputs
+        .iter()
+        .map(|name| *parameters.get(name).unwrap_or(&0.0))
+        .collect::<Vec<_>>();
+    let mut self_value = *parameters.get("self").unwrap_or(&0.0);
+    for (axis, value) in axes {
+        if *axis == "self" {
+            self_value = *value;
+        } else if let Some(position) = program
+            .externals
+            .kernel_inputs
+            .iter()
+            .position(|name| name == axis)
+        {
+            kernel_inputs[position] = *value;
+        } else {
+            parameters.insert((*axis).to_string(), *value);
+        }
+    }
+    evaluate_with_trace(
+        program,
+        &ScalarInputs {
+            kernel_inputs,
+            self_value,
+            parameters,
+        },
+    )
+    .ok()
+    .map(|trace| trace.result)
 }
 
 #[cfg(test)]
@@ -151,7 +277,9 @@ mod tests {
             request("inner", 0.0, 1.0, 5),
         )
         .unwrap();
-        let PlotData::Curve(curve) = data;
+        let PlotData::Curve(curve) = data else {
+            panic!("curve request must return curve data");
+        };
         assert_eq!(curve.samples.len(), 5);
         assert_eq!(curve.samples[2].value, Some(0.25));
         assert_eq!(
@@ -163,5 +291,36 @@ mod tests {
     fn invalid_samples_are_masked_without_aborting_the_plot() {
         let data = sample_plot(&compiled("sqrt(inner)"), request("inner", -1.0, 1.0, 3)).unwrap();
         assert_eq!(data.invalid_sample_count(), 1);
+    }
+
+    #[test]
+    fn two_axis_request_returns_a_nonuniform_heatmap() {
+        let program = compile(
+            "inner + outer * outer",
+            &ExternalSymbols::new(&["inner", "outer"], &[]),
+        )
+        .unwrap();
+        let data = sample_plot(
+            &program,
+            PlotRequest::Heatmap {
+                x_axis: "inner".into(),
+                y_axis: "outer".into(),
+                x_start: 0.0,
+                x_end: 1.0,
+                y_start: -1.0,
+                y_end: 1.0,
+                width: 9,
+                height: 7,
+                pinned: PinnedInputs(BTreeMap::new()),
+            },
+        )
+        .unwrap();
+        let PlotData::Heatmap(heatmap) = data else {
+            panic!("two-axis request must produce heatmap data");
+        };
+        assert_eq!((heatmap.width, heatmap.height), (9, 7));
+        assert_eq!(heatmap.samples.len(), 63);
+        assert_ne!(heatmap.samples[0], heatmap.samples[31]);
+        assert_ne!(heatmap.samples[31], heatmap.samples[62]);
     }
 }
