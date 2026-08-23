@@ -3,6 +3,7 @@ use crate::sim::kernel::{
 };
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -2835,15 +2836,25 @@ where
     )?;
     let display = crate::render::display::ViewportDisplay::detect();
     if display.uses_async_output() {
+        let redraw_required = Arc::new(AtomicBool::new(false));
         let backend = AsyncTerminalBackend {
-            inner: ratatui::backend::CrosstermBackend::new(AsyncTerminalWriter::new()),
+            inner: ratatui::backend::CrosstermBackend::new(AsyncTerminalWriter::new(Arc::clone(
+                &redraw_required,
+            ))),
         };
         let mut terminal = ratatui::Terminal::new(backend)?;
-        run_remote_loop(&mut app, &mut terminal, display, writer, snapshot_rx)
+        run_remote_loop(
+            &mut app,
+            &mut terminal,
+            display,
+            writer,
+            snapshot_rx,
+            Some(redraw_required),
+        )
     } else {
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let mut terminal = ratatui::Terminal::new(backend)?;
-        run_remote_loop(&mut app, &mut terminal, display, writer, snapshot_rx)
+        run_remote_loop(&mut app, &mut terminal, display, writer, snapshot_rx, None)
     }
 }
 
@@ -2853,6 +2864,7 @@ fn run_remote_loop<B, W>(
     display: crate::render::display::ViewportDisplay,
     writer: std::sync::Arc<std::sync::Mutex<W>>,
     snapshot_rx: LatestRemoteUpdate,
+    redraw_required: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<()>
 where
     B: ratatui::backend::Backend<Error = std::io::Error>,
@@ -2983,6 +2995,12 @@ where
             let render_started = Instant::now();
             let mut fresh_graphics = false;
             let render_generation = app.render_generation();
+            if redraw_required
+                .as_ref()
+                .is_some_and(|required| required.swap(false, Ordering::AcqRel))
+            {
+                terminal.clear()?;
+            }
             terminal.draw(|frame| {
                 fresh_graphics =
                     crate::tui::draw_remote(frame, app, &display, &rasterizer, render_generation);
@@ -3157,15 +3175,24 @@ fn run_app_with_save(app: App, save_path: Option<&Path>) -> std::io::Result<()> 
 
     let display = crate::render::display::ViewportDisplay::detect();
     if display.uses_async_output() {
+        let redraw_required = Arc::new(AtomicBool::new(false));
         let backend = AsyncTerminalBackend {
-            inner: ratatui::backend::CrosstermBackend::new(AsyncTerminalWriter::new()),
+            inner: ratatui::backend::CrosstermBackend::new(AsyncTerminalWriter::new(Arc::clone(
+                &redraw_required,
+            ))),
         };
         let mut terminal = ratatui::Terminal::new(backend)?;
-        run_loop(app, &mut terminal, display, save_path)
+        run_loop(
+            app,
+            &mut terminal,
+            display,
+            save_path,
+            Some(redraw_required),
+        )
     } else {
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let mut terminal = ratatui::Terminal::new(backend)?;
-        run_loop(app, &mut terminal, display, save_path)
+        run_loop(app, &mut terminal, display, save_path, None)
     }
 }
 
@@ -3194,6 +3221,7 @@ impl LatestFrameState {
 struct AsyncTerminalWriter {
     state: Arc<(Mutex<LatestFrameState>, Condvar)>,
     pending: Vec<u8>,
+    redraw_required: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -3256,7 +3284,7 @@ impl ratatui::backend::Backend for AsyncTerminalBackend {
 }
 
 impl AsyncTerminalWriter {
-    fn new() -> Self {
+    fn new(redraw_required: Arc<AtomicBool>) -> Self {
         let state = Arc::new((
             Mutex::new(LatestFrameState {
                 clear_prefix: Vec::new(),
@@ -3298,6 +3326,7 @@ impl AsyncTerminalWriter {
         Self {
             state,
             pending: Vec::new(),
+            redraw_required,
             worker: Some(worker),
         }
     }
@@ -3320,13 +3349,21 @@ impl Write for AsyncTerminalWriter {
         let next = std::mem::take(&mut self.pending);
         if contains_terminal_clear(&next) {
             state.clear_prefix = next;
-            state.frame = None;
-        } else if contains_kitty_transmit(&next)
-            || !state.frame.as_deref().is_some_and(contains_kitty_transmit)
-        {
-            state.frame = Some(next);
+            if !state.frame.as_deref().is_some_and(contains_kitty_transmit) {
+                state.frame = None;
+            }
+        } else {
+            let previous_is_kitty = state.frame.as_deref().is_some_and(contains_kitty_transmit);
+            if contains_kitty_transmit(&next) || !previous_is_kitty {
+                if state.frame.is_some() {
+                    self.redraw_required.store(true, Ordering::Release);
+                }
+                state.frame = Some(next);
+                wake.notify_one();
+            } else {
+                self.redraw_required.store(true, Ordering::Release);
+            }
         }
-        wake.notify_one();
         Ok(())
     }
 }
@@ -3375,6 +3412,7 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
     terminal: &mut ratatui::Terminal<B>,
     display: crate::render::display::ViewportDisplay,
     save_path: Option<&Path>,
+    redraw_required: Option<Arc<AtomicBool>>,
 ) -> std::io::Result<()> {
     let mut tracker = crate::input::MouseTracker::new();
     let mut simulation_meter = RateMeter::new(Duration::from_secs(1));
@@ -3511,6 +3549,12 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
             render_meter.refresh(now);
             let rates = (simulation_meter.rate(), render_meter.rate());
             let render_started = Instant::now();
+            if redraw_required
+                .as_ref()
+                .is_some_and(|required| required.swap(false, Ordering::AcqRel))
+            {
+                terminal.clear()?;
+            }
             terminal.draw(|frame| {
                 app.set_rates(rates.0, rates.1);
                 let _ = crate::tui::draw(frame, &mut app, &display);
@@ -3612,6 +3656,7 @@ mod tests {
 
     #[test]
     fn async_terminal_backend_forwards_clear_to_the_terminal_writer() {
+        let redraw_required = Arc::new(AtomicBool::new(false));
         let state = Arc::new((
             Mutex::new(LatestFrameState {
                 clear_prefix: Vec::new(),
@@ -3623,6 +3668,7 @@ mod tests {
         let writer = AsyncTerminalWriter {
             state: Arc::clone(&state),
             pending: Vec::new(),
+            redraw_required,
             worker: None,
         };
         let mut backend = AsyncTerminalBackend {
@@ -3643,6 +3689,7 @@ mod tests {
 
     #[test]
     fn async_terminal_writer_does_not_drop_a_pending_kitty_transmission() {
+        let redraw_required = Arc::new(AtomicBool::new(false));
         let state = Arc::new((
             Mutex::new(LatestFrameState {
                 clear_prefix: Vec::new(),
@@ -3654,6 +3701,7 @@ mod tests {
         let mut writer = AsyncTerminalWriter {
             state: Arc::clone(&state),
             pending: Vec::new(),
+            redraw_required: Arc::clone(&redraw_required),
             worker: None,
         };
 
@@ -3661,11 +3709,15 @@ mod tests {
             .write_all(b"\x1b_Gq=2,i=41,a=T;pixels\x1b\\")
             .unwrap();
         writer.flush().unwrap();
+        writer.write_all(b"\x1b[2J").unwrap();
+        writer.flush().unwrap();
         writer.write_all(b"ordinary-later-frame").unwrap();
         writer.flush().unwrap();
 
         let emitted = state.0.lock().unwrap().take_output().unwrap_or_default();
+        assert!(contains_terminal_clear(&emitted));
         assert!(contains_kitty_transmit(&emitted));
+        assert!(redraw_required.load(Ordering::Acquire));
         assert!(
             !emitted
                 .windows(b"ordinary-later-frame".len())
