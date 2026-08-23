@@ -28,9 +28,28 @@ jobs:
           test "$GITHUB_REF_NAME" = "v$package_version"
           echo "version=$package_version" >> "$GITHUB_OUTPUT"
 
+  quality:
+    name: Verify release candidate
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+      - name: Test default Linux build
+        run: cargo test --locked --all-targets
+      - name: Test CPU-only Linux build
+        run: cargo test --locked --no-default-features --all-targets
+      - name: Lint all targets
+        run: cargo clippy --locked --all-targets -- -D warnings
+
   build:
     name: Build ${{ matrix.target }}
-    needs: version
+    needs: [version, quality]
     strategy:
       fail-fast: false
       matrix:
@@ -121,7 +140,7 @@ jobs:
           retention-days: 7
 
   release:
-    name: Publish GitHub Release
+    name: Stage draft GitHub Release
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -141,4 +160,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$GITHUB_REF_NAME" cellarium-* SHA256SUMS --verify-tag --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" cellarium-* SHA256SUMS --verify-tag --generate-notes --draft

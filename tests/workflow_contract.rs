@@ -42,3 +42,29 @@ fn linux_release_uses_an_old_glibc_baseline_for_server_compatibility() {
     assert!(RELEASE.contains("gcc-aarch64-linux-gnu"));
     assert!(RELEASE.contains("CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER"));
 }
+
+#[test]
+fn release_is_staged_as_a_draft_after_quality_gates() {
+    assert!(RELEASE.contains("cargo fmt --all -- --check"));
+    assert!(RELEASE.contains("cargo test --locked --all-targets"));
+    assert!(RELEASE.contains("cargo test --locked --no-default-features --all-targets"));
+    assert!(RELEASE.contains("cargo clippy --locked --all-targets -- -D warnings"));
+    assert!(RELEASE.contains("needs: [version, quality]"));
+    assert!(RELEASE.contains("--verify-tag --generate-notes --draft"));
+    assert!(!RELEASE.contains("name: Publish GitHub Release"));
+}
+
+#[test]
+fn release_backend_features_match_target_capabilities() {
+    assert_eq!(
+        RELEASE.matches("cuda: true").count(),
+        2,
+        "only the two Linux binaries include dynamic CUDA support"
+    );
+    assert_eq!(
+        RELEASE.matches("cuda: false").count(),
+        4,
+        "macOS and Windows binaries are CPU-only"
+    );
+    assert!(!RELEASE.to_ascii_lowercase().contains("raspberry pi"));
+}
