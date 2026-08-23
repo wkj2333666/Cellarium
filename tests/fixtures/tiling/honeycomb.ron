@@ -1,0 +1,7 @@
+(
+  translation_a: (x: 1.5, y: 0.8660254037844386),
+  translation_b: (x: 0.0, y: 1.7320508075688772),
+  prototypes: [(id: (0), name: "honeycomb-cell", shape: RegularPolygon(sides: 6, side_length: 1.0))],
+  instances: [(id: (0), prototype: (0), transform: (translation: (x: 0.0, y: 0.0), rotation: 0.0))],
+  mode: Topological,
+)

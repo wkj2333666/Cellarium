@@ -6,11 +6,18 @@ use super::{
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum TilingPreset {
     Square,
+    EquilateralTriangles,
+    RegularHexagon,
     OctagonSquare,
 }
 
 impl TilingPreset {
-    pub const ALL: [Self; 2] = [Self::Square, Self::OctagonSquare];
+    pub const ALL: [Self; 4] = [
+        Self::Square,
+        Self::EquilateralTriangles,
+        Self::RegularHexagon,
+        Self::OctagonSquare,
+    ];
 }
 
 pub fn build_preset(preset: TilingPreset, scale: f64) -> PeriodicTilingDraft {
@@ -29,6 +36,62 @@ pub fn build_preset(preset: TilingPreset, scale: f64) -> PeriodicTilingDraft {
                         Vec2::new(s, s),
                         Vec2::new(0.0, s),
                     ],
+                },
+            }],
+            instances: vec![TileInstance {
+                id: TileId(0),
+                prototype: PrototypeId(0),
+                transform: RigidTransform::default(),
+            }],
+            mode: TilingMode::Topological,
+        },
+        TilingPreset::EquilateralTriangles => {
+            let height = s * 3.0_f64.sqrt() / 2.0;
+            let a = Vec2::new(s, 0.0);
+            let b = Vec2::new(s / 2.0, height);
+            PeriodicTilingDraft {
+                translation_a: a,
+                translation_b: b,
+                prototypes: vec![
+                    TilePrototype {
+                        id: PrototypeId(0),
+                        name: "up-triangle".into(),
+                        shape: PrototypeShape::SimplePolygon {
+                            vertices: vec![Vec2::ZERO, a, a + b],
+                        },
+                    },
+                    TilePrototype {
+                        id: PrototypeId(1),
+                        name: "down-triangle".into(),
+                        shape: PrototypeShape::SimplePolygon {
+                            vertices: vec![Vec2::ZERO, a + b, b],
+                        },
+                    },
+                ],
+                instances: vec![
+                    TileInstance {
+                        id: TileId(0),
+                        prototype: PrototypeId(0),
+                        transform: RigidTransform::default(),
+                    },
+                    TileInstance {
+                        id: TileId(1),
+                        prototype: PrototypeId(1),
+                        transform: RigidTransform::default(),
+                    },
+                ],
+                mode: TilingMode::Topological,
+            }
+        }
+        TilingPreset::RegularHexagon => PeriodicTilingDraft {
+            translation_a: Vec2::new(1.5 * s, 3.0_f64.sqrt() * s / 2.0),
+            translation_b: Vec2::new(0.0, 3.0_f64.sqrt() * s),
+            prototypes: vec![TilePrototype {
+                id: PrototypeId(0),
+                name: "hexagon".into(),
+                shape: PrototypeShape::RegularPolygon {
+                    sides: 6,
+                    side_length: s,
                 },
             }],
             instances: vec![TileInstance {
@@ -111,5 +174,14 @@ mod tests {
         );
         assert!(validate_coverage(&draft).is_ok());
         assert!(canonical_half_edges(&draft, 1e-9).is_ok());
+    }
+
+    #[test]
+    fn every_preset_is_an_exact_once_periodic_tiling() {
+        for preset in TilingPreset::ALL {
+            let report = validate_coverage(&build_preset(preset, 1.0)).unwrap();
+            assert_eq!(report.coverage_multiplicity, 1, "{preset:?}");
+            assert_eq!(report.euler_characteristic, 0, "{preset:?}");
+        }
     }
 }

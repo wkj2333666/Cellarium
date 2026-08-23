@@ -1,16 +1,26 @@
+use std::collections::BTreeMap;
+
 use super::{
-    PeriodicTilingDraft, Vec2,
-    polygon::{instance_polygon, signed_area},
+    BasisId, GeometryBudget, NeighborPlacement, PeriodicArrangement, PeriodicTilingDraft,
+    polygon::instance_polygon,
 };
 
 #[derive(Clone, Debug, PartialEq)]
-pub struct CoverageReport {
+pub struct TilingValidationReport {
+    pub coverage_multiplicity: u32,
+    pub face_area: f64,
     pub patch_area: f64,
     pub covered_area: f64,
     pub overlap_area: f64,
     pub gap_area: f64,
     pub tolerance: f64,
+    pub euler_characteristic: i64,
+    pub atomic_edges: usize,
+    pub neighbor_ring: BTreeMap<BasisId, Vec<NeighborPlacement>>,
+    pub arrangement: PeriodicArrangement,
 }
+
+pub type CoverageReport = TilingValidationReport;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct TilingDiagnostic {
@@ -22,111 +32,138 @@ pub struct TilingDiagnostic {
 pub fn validate_coverage(
     draft: &PeriodicTilingDraft,
 ) -> Result<CoverageReport, Vec<TilingDiagnostic>> {
-    let patch = vec![
-        Vec2::ZERO,
-        draft.translation_a,
-        draft.translation_a + draft.translation_b,
-        draft.translation_b,
-    ];
-    let patch_area = signed_area(&patch).abs();
-    let basis = draft
+    validate_periodic_tiling(draft, GeometryBudget::authoritative())
+}
+
+pub fn validate_periodic_tiling(
+    draft: &PeriodicTilingDraft,
+    budget: GeometryBudget,
+) -> Result<TilingValidationReport, Vec<TilingDiagnostic>> {
+    let patch_area = draft.translation_a.cross(draft.translation_b).abs();
+    let lattice_scale = draft
         .translation_a
         .length()
         .max(draft.translation_b.length());
-    let tolerance = (patch_area * 1e-10).max(basis * basis * 1e-12);
+    let tolerance = (patch_area * 1e-9)
+        .max(lattice_scale * lattice_scale * f64::EPSILON * 64.0)
+        .max(f64::MIN_POSITIVE);
     if !patch_area.is_finite() || patch_area <= tolerance {
-        return Err(vec![diag(
+        return Err(vec![diagnostic(
             "invalid_period",
             "translation vectors must span a non-zero finite period",
         )]);
     }
-    if draft.translation_a.cross(draft.translation_b).abs() <= tolerance {
-        return Err(vec![diag(
-            "collinear_period",
-            "translation vectors must be non-collinear",
+
+    let mut diagnostics = Vec::new();
+    let mut raw_face_area = 0.0;
+    for (index, instance) in draft.instances.iter().enumerate() {
+        match instance_polygon(draft, index) {
+            Ok(polygon) => raw_face_area += polygon.unsigned_area(),
+            Err(issues) => diagnostics.extend(issues.into_iter().map(|issue| TilingDiagnostic {
+                code: issue.code,
+                message: issue.message,
+                path: Some(format!("basis/{}", instance.id.0)),
+            })),
+        }
+    }
+    if raw_face_area < patch_area - tolerance {
+        diagnostics.push(diagnostic(
+            "coverage_gap",
+            format!(
+                "periodic faces cover area {raw_face_area:.12e}; patch area is {patch_area:.12e}"
+            ),
+        ));
+    } else if raw_face_area > patch_area + tolerance {
+        diagnostics.push(diagnostic(
+            "coverage_overlap",
+            format!(
+                "periodic faces cover area {raw_face_area:.12e}; patch area is {patch_area:.12e}"
+            ),
+        ));
+    }
+
+    let arrangement = match PeriodicArrangement::build(draft, budget) {
+        Ok(arrangement) => Some(arrangement),
+        Err(errors) => {
+            diagnostics.extend(errors);
+            None
+        }
+    };
+    if !diagnostics.is_empty() {
+        stable_diagnostics(&mut diagnostics);
+        return Err(diagnostics);
+    }
+    let arrangement = arrangement.expect("successful arrangement is present");
+    let face_area = arrangement
+        .faces
+        .iter()
+        .map(|face| face.signed_area)
+        .sum::<f64>();
+    if (face_area - patch_area).abs() > tolerance {
+        return Err(vec![diagnostic(
+            if face_area < patch_area {
+                "coverage_gap"
+            } else {
+                "coverage_overlap"
+            },
+            format!(
+                "oriented arrangement area {face_area:.12e} differs from patch area {patch_area:.12e}"
+            ),
         )]);
     }
-    let mut fragments: Vec<Vec<Vec2>> = Vec::new();
-    for index in 0..draft.instances.len() {
-        let polygon = match instance_polygon(draft, index) {
-            Ok(p) => p.vertices,
-            Err(issues) => {
-                return Err(issues
-                    .into_iter()
-                    .map(|i| diag("invalid_polygon", i.message))
-                    .collect());
-            }
-        };
-        // A bounded stencil is sufficient for a fundamental patch and avoids
-        // unbounded allocations from hostile translations.
-        for ax in -2..=2 {
-            for by in -2..=2 {
-                let shift =
-                    draft.translation_a * f64::from(ax) + draft.translation_b * f64::from(by);
-                let shifted: Vec<Vec2> = polygon.iter().map(|v| *v + shift).collect();
-                let clipped = clip_convex(&shifted, &patch);
-                if clipped.len() >= 3 && signed_area(&clipped).abs() > tolerance * 0.01 {
-                    fragments.push(clipped);
-                }
-            }
-        }
+
+    // Unique opposite atomic twins and no proper crossings make the winding
+    // number constant on the connected torus. The oriented area ratio fixes
+    // that integer constant to one, proving exact-once coverage without
+    // pairwise inclusion/exclusion.
+    let multiplicity = (face_area / patch_area).round();
+    if multiplicity != 1.0 {
+        return Err(vec![diagnostic(
+            "coverage_multiplicity",
+            format!("periodic coverage multiplicity is {multiplicity}"),
+        )]);
     }
-    let covered_area: f64 = fragments.iter().map(|p| signed_area(p).abs()).sum();
-    let mut overlap_area = 0.0;
-    for i in 0..fragments.len() {
-        for j in (i + 1)..fragments.len() {
-            let intersection = clip_convex(&fragments[i], &fragments[j]);
-            if intersection.len() >= 3 {
-                overlap_area += signed_area(&intersection).abs();
-            }
-        }
+    let vertices = i64::try_from(arrangement.vertices.len()).unwrap_or(i64::MAX);
+    let undirected_edges = i64::try_from(arrangement.atomic_edges.len() / 2).unwrap_or(i64::MAX);
+    let faces = i64::try_from(arrangement.faces.len()).unwrap_or(i64::MAX);
+    let euler_characteristic = vertices - undirected_edges + faces;
+    if euler_characteristic != 0 {
+        return Err(vec![diagnostic(
+            "invalid_euler_characteristic",
+            format!("toroidal arrangement has V-E+F={euler_characteristic}; expected 0"),
+        )]);
     }
-    let union_area = (covered_area - overlap_area).max(0.0);
-    let gap_area = (patch_area - union_area).max(0.0);
-    // A single representative that is shifted inside its own period leaves a
-    // seam mismatch in the editable fundamental patch.  Periodic copies would
-    // hide that mismatch numerically, so surface it as a user-facing
-    // diagnostic instead of silently accepting an ambiguous seam.
-    let seam_shift = if draft.instances.len() == 1 {
-        let t = draft.instances[0].transform.translation;
-        let denom = basis.max(1e-12);
-        (t.x.abs() + t.y.abs()) % denom
-    } else {
-        0.0
-    };
-    let seam_error = if seam_shift > tolerance {
-        seam_shift.min(patch_area.sqrt()) * patch_area.sqrt()
-    } else {
-        0.0
-    };
-    let report = CoverageReport {
+    let neighbor_ring = arrangement
+        .faces
+        .iter()
+        .map(|face| (face.basis, arrangement.neighbor_ring(face.basis)))
+        .collect();
+    Ok(TilingValidationReport {
+        coverage_multiplicity: 1,
+        face_area,
         patch_area,
-        covered_area,
-        overlap_area,
-        gap_area,
+        covered_area: face_area,
+        overlap_area: 0.0,
+        gap_area: 0.0,
         tolerance,
-    };
-    let mut errors = Vec::new();
-    if report.overlap_area > tolerance || seam_error > tolerance {
-        errors.push(diag(
-            "coverage_overlap",
-            format!("periodic patch overlaps by {:.6e}", report.overlap_area),
-        ));
-    }
-    if report.gap_area > tolerance || seam_error > tolerance {
-        errors.push(diag(
-            "coverage_gap",
-            format!("periodic patch has {:.6e} uncovered area", report.gap_area),
-        ));
-    }
-    if errors.is_empty() {
-        Ok(report)
-    } else {
-        Err(errors)
-    }
+        euler_characteristic,
+        atomic_edges: arrangement.atomic_edges.len(),
+        neighbor_ring,
+        arrangement,
+    })
 }
 
-fn diag(code: &'static str, message: impl Into<String>) -> TilingDiagnostic {
+fn stable_diagnostics(diagnostics: &mut Vec<TilingDiagnostic>) {
+    diagnostics.sort_by(|left, right| {
+        left.code
+            .cmp(right.code)
+            .then_with(|| left.path.cmp(&right.path))
+            .then_with(|| left.message.cmp(&right.message))
+    });
+    diagnostics.dedup();
+}
+
+fn diagnostic(code: &'static str, message: impl Into<String>) -> TilingDiagnostic {
     TilingDiagnostic {
         code,
         message: message.into(),
@@ -134,88 +171,191 @@ fn diag(code: &'static str, message: impl Into<String>) -> TilingDiagnostic {
     }
 }
 
-fn clip_convex(subject: &[Vec2], clip: &[Vec2]) -> Vec<Vec2> {
-    let mut output = subject.to_vec();
-    for i in 0..clip.len() {
-        let a = clip[i];
-        let b = clip[(i + 1) % clip.len()];
-        let input = output;
-        output = Vec::new();
-        if input.is_empty() {
-            break;
-        }
-        let mut prev = *input.last().unwrap();
-        let mut prev_inside = (b - a).cross(prev - a) >= -1e-12;
-        for &current in &input {
-            let current_inside = (b - a).cross(current - a) >= -1e-12;
-            if current_inside != prev_inside {
-                let d = current - prev;
-                let edge = b - a;
-                let denominator = edge.cross(d);
-                if denominator.abs() > 1e-15 {
-                    output.push(prev + d * (edge.cross(a - prev) / denominator));
-                }
-            }
-            if current_inside {
-                output.push(current);
-            }
-            prev = current;
-            prev_inside = current_inside;
-        }
-    }
-    output
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::sim::tiling::{
         PrototypeId, PrototypeShape, RigidTransform, TileId, TileInstance, TilePrototype,
-        TilingMode,
+        TilingMode, TilingPreset, Vec2, build_preset,
     };
-    fn square(scale: f64, shift: f64) -> PeriodicTilingDraft {
+
+    fn polygon(id: u32, vertices: &[[f64; 2]]) -> TilePrototype {
+        TilePrototype {
+            id: PrototypeId(id),
+            name: format!("polygon-{id}"),
+            shape: PrototypeShape::SimplePolygon {
+                vertices: vertices
+                    .iter()
+                    .map(|point| Vec2::new(point[0], point[1]))
+                    .collect(),
+            },
+        }
+    }
+
+    fn instance(id: u32) -> TileInstance {
+        TileInstance {
+            id: TileId(id),
+            prototype: PrototypeId(id),
+            transform: RigidTransform::default(),
+        }
+    }
+
+    fn t_fixture() -> PeriodicTilingDraft {
         PeriodicTilingDraft {
-            translation_a: Vec2::new(scale, 0.0),
-            translation_b: Vec2::new(0.0, scale),
-            prototypes: vec![TilePrototype {
-                id: PrototypeId(0),
-                name: "square".into(),
-                shape: PrototypeShape::SimplePolygon {
-                    vertices: vec![
-                        Vec2::ZERO,
-                        Vec2::new(scale, 0.0),
-                        Vec2::new(scale, scale),
-                        Vec2::new(0.0, scale),
-                    ],
-                },
-            }],
-            instances: vec![TileInstance {
-                id: TileId(0),
-                prototype: PrototypeId(0),
-                transform: RigidTransform {
-                    translation: Vec2::new(shift, 0.0),
-                    rotation: 0.0,
-                },
-            }],
+            translation_a: Vec2::new(2.0, 0.0),
+            translation_b: Vec2::new(0.0, 2.0),
+            prototypes: vec![
+                polygon(0, &[[0.0, 0.0], [1.0, 0.0], [1.0, 2.0], [0.0, 2.0]]),
+                polygon(1, &[[1.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0]]),
+                polygon(2, &[[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0]]),
+            ],
+            instances: vec![instance(0), instance(1), instance(2)],
             mode: TilingMode::Topological,
         }
     }
+
     #[test]
-    fn one_square_exactly_covers_its_period() {
-        let report = validate_coverage(&square(1.0, 0.0)).unwrap();
-        assert!(report.gap_area <= report.tolerance);
-        assert!(report.overlap_area <= report.tolerance);
+    fn exact_once_fixtures_have_unit_multiplicity_and_torus_euler_zero() {
+        for draft in [
+            build_preset(TilingPreset::Square, 1.0),
+            build_preset(TilingPreset::EquilateralTriangles, 1.0),
+            build_preset(TilingPreset::RegularHexagon, 1.0),
+            build_preset(TilingPreset::OctagonSquare, 1.0),
+            t_fixture(),
+        ] {
+            let report = validate_periodic_tiling(&draft, GeometryBudget::authoritative()).unwrap();
+            assert_eq!(report.coverage_multiplicity, 1);
+            assert_eq!(report.euler_characteristic, 0);
+            assert!((report.face_area - report.patch_area).abs() <= report.tolerance);
+        }
     }
+
     #[test]
-    fn shifted_tile_reports_both_gap_and_overlap() {
-        let errors = validate_coverage(&square(1.0, 0.1)).unwrap_err();
-        assert!(errors.iter().any(|e| e.code == "coverage_gap"));
-        assert!(errors.iter().any(|e| e.code == "coverage_overlap"));
+    fn translating_the_representative_inside_its_period_remains_a_valid_tiling() {
+        let mut square = build_preset(TilingPreset::Square, 1.0);
+        square.instances[0].transform.translation = Vec2::new(0.1, 0.35);
+        assert!(validate_coverage(&square).is_ok());
     }
+
     #[test]
-    fn validity_is_unchanged_under_uniform_scaling() {
-        for scale in [1e-3, 1.0, 1e3] {
-            assert!(validate_coverage(&square(scale, 0.0)).is_ok());
+    fn gap_overlap_duplicate_and_crossing_fixtures_fail() {
+        let gap = PeriodicTilingDraft {
+            translation_a: Vec2::new(2.0, 0.0),
+            translation_b: Vec2::new(0.0, 2.0),
+            prototypes: vec![polygon(
+                0,
+                &[[0.0, 0.0], [1.0, 0.0], [1.0, 1.0], [0.0, 1.0]],
+            )],
+            instances: vec![instance(0)],
+            mode: TilingMode::Topological,
+        };
+        let gap_errors = validate_coverage(&gap).unwrap_err();
+        assert!(gap_errors.iter().any(|error| error.code == "coverage_gap"));
+
+        let mut overlap = build_preset(TilingPreset::Square, 1.0);
+        overlap.instances.push(TileInstance {
+            id: TileId(1),
+            prototype: PrototypeId(0),
+            transform: RigidTransform::default(),
+        });
+        let overlap_errors = validate_coverage(&overlap).unwrap_err();
+        assert!(
+            overlap_errors
+                .iter()
+                .any(|error| error.code == "coverage_overlap")
+        );
+        assert!(
+            overlap_errors
+                .iter()
+                .any(|error| error.code == "competing_twins")
+        );
+
+        overlap.instances.push(TileInstance {
+            id: TileId(2),
+            prototype: PrototypeId(0),
+            transform: RigidTransform::default(),
+        });
+        let triple_errors = validate_coverage(&overlap).unwrap_err();
+        assert!(
+            triple_errors
+                .iter()
+                .any(|error| error.code == "coverage_overlap")
+        );
+
+        let mut crossing = build_preset(TilingPreset::Square, 2.0);
+        crossing.prototypes.push(polygon(
+            1,
+            &[[0.5, -0.5], [2.5, 0.5], [1.5, 2.5], [-0.5, 1.5]],
+        ));
+        crossing.instances.push(instance(1));
+        assert!(
+            validate_coverage(&crossing)
+                .unwrap_err()
+                .iter()
+                .any(|error| error.code == "proper_crossing")
+        );
+    }
+
+    #[test]
+    fn uniform_scaling_does_not_change_validity() {
+        for scale in [1e-6, 1.0, 1e6] {
+            assert!(validate_coverage(&build_preset(TilingPreset::Square, scale)).is_ok());
+        }
+    }
+
+    #[test]
+    fn persisted_valid_and_invalid_fixtures_match_the_validator() {
+        const VALID: &[(&str, &str)] = &[
+            (
+                "square",
+                include_str!("../../../tests/fixtures/tiling/square.ron"),
+            ),
+            (
+                "triangles",
+                include_str!("../../../tests/fixtures/tiling/triangles.ron"),
+            ),
+            (
+                "regular hexagon",
+                include_str!("../../../tests/fixtures/tiling/regular_hexagon.ron"),
+            ),
+            (
+                "honeycomb",
+                include_str!("../../../tests/fixtures/tiling/honeycomb.ron"),
+            ),
+            (
+                "octagon-square",
+                include_str!("../../../tests/fixtures/tiling/octagon_square.ron"),
+            ),
+            (
+                "T junction",
+                include_str!("../../../tests/fixtures/tiling/t_junction.ron"),
+            ),
+        ];
+        for (name, source) in VALID {
+            let draft: PeriodicTilingDraft = ron::from_str(source).unwrap();
+            let report =
+                validate_coverage(&draft).unwrap_or_else(|errors| panic!("{name}: {errors:?}"));
+            assert_eq!(report.coverage_multiplicity, 1, "{name}");
+            assert_eq!(report.euler_characteristic, 0, "{name}");
+        }
+
+        const INVALID: &[(&str, &str)] = &[
+            (
+                "gap",
+                include_str!("../../../tests/fixtures/tiling/invalid_gap.ron"),
+            ),
+            (
+                "overlap",
+                include_str!("../../../tests/fixtures/tiling/invalid_overlap.ron"),
+            ),
+            (
+                "crossing",
+                include_str!("../../../tests/fixtures/tiling/invalid_crossing.ron"),
+            ),
+        ];
+        for (name, source) in INVALID {
+            let draft: PeriodicTilingDraft = ron::from_str(source).unwrap();
+            assert!(validate_coverage(&draft).is_err(), "{name}");
         }
     }
 }

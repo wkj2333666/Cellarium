@@ -1,0 +1,16 @@
+(
+  translation_a: (x: 2.414213562373095, y: 0.0),
+  translation_b: (x: 0.0, y: 2.414213562373095),
+  prototypes: [
+    (id: (0), name: "octagon", shape: RegularPolygon(sides: 8, side_length: 1.0)),
+    (id: (1), name: "square", shape: SimplePolygon(vertices: [
+      (x: -0.5, y: -0.5), (x: 0.5, y: -0.5),
+      (x: 0.5, y: 0.5), (x: -0.5, y: 0.5),
+    ])),
+  ],
+  instances: [
+    (id: (0), prototype: (0), transform: (translation: (x: 0.0, y: 0.0), rotation: 0.0)),
+    (id: (1), prototype: (1), transform: (translation: (x: 1.2071067811865475, y: 1.2071067811865475), rotation: 0.7853981633974483)),
+  ],
+  mode: Topological,
+)

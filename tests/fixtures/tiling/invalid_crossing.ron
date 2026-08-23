@@ -1,0 +1,12 @@
+(
+  translation_a: (x: 2.0, y: 0.0), translation_b: (x: 0.0, y: 2.0),
+  prototypes: [
+    (id: (0), name: "square", shape: SimplePolygon(vertices: [(x: 0.0,y: 0.0),(x: 2.0,y: 0.0),(x: 2.0,y: 2.0),(x: 0.0,y: 2.0)])),
+    (id: (1), name: "crossing", shape: SimplePolygon(vertices: [(x: 0.5,y: -0.5),(x: 2.5,y: 0.5),(x: 1.5,y: 2.5),(x: -0.5,y: 1.5)])),
+  ],
+  instances: [
+    (id: (0), prototype: (0), transform: (translation: (x: 0.0,y: 0.0), rotation: 0.0)),
+    (id: (1), prototype: (1), transform: (translation: (x: 0.0,y: 0.0), rotation: 0.0)),
+  ],
+  mode: Topological,
+)

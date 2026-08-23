@@ -1,0 +1,17 @@
+(
+  translation_a: (x: 1.0, y: 0.0),
+  translation_b: (x: 0.5, y: 0.8660254037844386),
+  prototypes: [
+    (id: (0), name: "up-triangle", shape: SimplePolygon(vertices: [
+      (x: 0.0, y: 0.0), (x: 1.0, y: 0.0), (x: 1.5, y: 0.8660254037844386),
+    ])),
+    (id: (1), name: "down-triangle", shape: SimplePolygon(vertices: [
+      (x: 0.0, y: 0.0), (x: 1.5, y: 0.8660254037844386), (x: 0.5, y: 0.8660254037844386),
+    ])),
+  ],
+  instances: [
+    (id: (0), prototype: (0), transform: (translation: (x: 0.0, y: 0.0), rotation: 0.0)),
+    (id: (1), prototype: (1), transform: (translation: (x: 0.0, y: 0.0), rotation: 0.0)),
+  ],
+  mode: Topological,
+)

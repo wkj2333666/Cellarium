@@ -1,0 +1,15 @@
+(
+  translation_a: (x: 2.0, y: 0.0),
+  translation_b: (x: 0.0, y: 2.0),
+  prototypes: [
+    (id: (0), name: "left", shape: SimplePolygon(vertices: [(x: 0.0,y: 0.0),(x: 1.0,y: 0.0),(x: 1.0,y: 2.0),(x: 0.0,y: 2.0)])),
+    (id: (1), name: "right-lower", shape: SimplePolygon(vertices: [(x: 1.0,y: 0.0),(x: 2.0,y: 0.0),(x: 2.0,y: 1.0),(x: 1.0,y: 1.0)])),
+    (id: (2), name: "right-upper", shape: SimplePolygon(vertices: [(x: 1.0,y: 1.0),(x: 2.0,y: 1.0),(x: 2.0,y: 2.0),(x: 1.0,y: 2.0)])),
+  ],
+  instances: [
+    (id: (0), prototype: (0), transform: (translation: (x: 0.0,y: 0.0), rotation: 0.0)),
+    (id: (1), prototype: (1), transform: (translation: (x: 0.0,y: 0.0), rotation: 0.0)),
+    (id: (2), prototype: (2), transform: (translation: (x: 0.0,y: 0.0), rotation: 0.0)),
+  ],
+  mode: Topological,
+)

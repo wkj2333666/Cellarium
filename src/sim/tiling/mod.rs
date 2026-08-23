@@ -21,7 +21,10 @@ pub use arrangement::{
 };
 pub use compile::{CompiledTiling, compile_tiling};
 pub use copies::{Aabb, GeometryBudget, LatticeCopyBounds};
-pub use coverage::{CoverageReport, TilingDiagnostic, validate_coverage};
+pub use coverage::{
+    CoverageReport, TilingDiagnostic, TilingValidationReport, validate_coverage,
+    validate_periodic_tiling,
+};
 pub use half_edge::{EdgePair, EdgeRef, HalfEdge, canonical_half_edges};
 pub use model::{
     BasisId, GeometryIssue, PeriodicTilingDraft, PrototypeId, PrototypeShape, RigidTransform,
