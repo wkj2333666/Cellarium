@@ -101,9 +101,55 @@ mod tests {
             diagnostic.path.0 == ["basis", "0", "channel", "0", "ruleset", "0", "kernel", "0"]
         }));
     }
+
+    #[test]
+    fn service_accepts_and_steps_a_periodic_two_basis_experiment() {
+        use crate::sim::basis_kernel::{BasisWeightPlane, PeriodicKernelDefinition};
+        use crate::sim::ruleset::KernelSpatialDefinition;
+        use crate::sim::tiling::{BasisId, TilingPreset, build_preset};
+
+        let mut spec = ExperimentSpec::single_channel_lenia(1, 1);
+        spec.tiling = Some(build_preset(TilingPreset::EquilateralTriangles, 1.0));
+        let mut spec = spec.normalize_rules().unwrap();
+        spec.channels[0].initial = vec![0.2, 0.8];
+        let rule = spec
+            .rules
+            .get_mut(spec.rules.defaults[&crate::sim::experiment_model::ChannelId(0)])
+            .unwrap();
+        rule.growth.mode = crate::sim::experiment_model::UpdateMode::DirectUpdate;
+        rule.growth.source = "potential".into();
+        rule.kernels[0].spatial = KernelSpatialDefinition::Periodic(PeriodicKernelDefinition {
+            width: 1,
+            height: 1,
+            anchor_x: 0,
+            anchor_y: 0,
+            planes: [
+                (
+                    BasisId(0),
+                    BasisWeightPlane {
+                        values: vec![1.0],
+                        mask: None,
+                    },
+                ),
+                (
+                    BasisId(1),
+                    BasisWeightPlane {
+                        values: vec![0.0],
+                        mask: None,
+                    },
+                ),
+            ]
+            .into(),
+        });
+        let mut service = ExperimentService::new(spec).unwrap();
+        assert_eq!(service.world().bases(), 2);
+        service.step().unwrap();
+        assert!((service.world().get_basis(0, 0, 0, 0) - 0.2).abs() < 1e-6);
+        assert!((service.world().get_basis(0, 0, 0, 1) - 0.2).abs() < 1e-6);
+    }
 }
-use crate::sim::experiment_model::{ExperimentSpec, KernelId, KernelSlot, validate_structure};
-use crate::sim::ruleset::{KernelSpatialDefinition, RuleSetError};
+use crate::sim::experiment_model::{ExperimentSpec, validate_structure};
+use crate::sim::ruleset::RuleSetError;
 use crate::sim::runtime::{
     CompiledExperiment, CpuExperimentBackend, RuntimeError, compile_experiment,
 };
@@ -203,6 +249,24 @@ impl ExperimentService {
     }
     pub fn world_mut(&mut self) -> &mut ChannelWorld {
         &mut self.active.world
+    }
+
+    pub fn rasterized_channel(&self, channel: usize) -> Vec<f32> {
+        let world = &self.active.world;
+        if world.bases() == 1 {
+            return world.channel_cells(channel).to_vec();
+        }
+        let mut pixels = Vec::with_capacity(world.width() * world.height());
+        for y in 0..world.height() {
+            for x in 0..world.width() {
+                let value = (0..world.bases())
+                    .map(|basis| world.get_basis(channel, x as isize, y as isize, basis))
+                    .sum::<f32>()
+                    / world.bases() as f32;
+                pixels.push(value);
+            }
+        }
+        pixels
     }
 
     pub fn step(&mut self) -> Result<(), RuntimeError> {
@@ -409,58 +473,7 @@ fn compile_or_reject(
             })
             .collect(),
     })?;
-    let runtime_spec = legacy_runtime_view(spec).map_err(|message| reject(request_id, message))?;
-    compile_experiment(&runtime_spec).map_err(|error| reject(request_id, error.to_string()))
-}
-
-fn legacy_runtime_view(spec: &ExperimentSpec) -> Result<ExperimentSpec, String> {
-    if spec.rules.is_empty() {
-        return Ok(spec.clone());
-    }
-    let mut legacy = spec.clone();
-    legacy.rules = Default::default();
-    legacy.kernels.clear();
-    legacy.growth.clear();
-    let mut next_kernel = 0_u32;
-    for channel in spec.channels.iter().filter(|channel| !channel.frozen) {
-        let rule_set_id = spec
-            .rules
-            .defaults
-            .get(&channel.id)
-            .ok_or_else(|| format!("channel {:?} has no default rule set", channel.id))?;
-        let rule = spec
-            .rules
-            .get(*rule_set_id)
-            .ok_or_else(|| format!("missing default rule set {rule_set_id:?}"))?;
-        let mut growth = rule.growth.clone();
-        growth.kernel_inputs.clear();
-        for kernel in &rule.kernels {
-            let id = KernelId(next_kernel);
-            next_kernel = next_kernel
-                .checked_add(1)
-                .ok_or_else(|| "too many kernels for legacy raster runtime".to_string())?;
-            let definition = match &kernel.spatial {
-                KernelSpatialDefinition::Raster(definition) => definition.clone(),
-                KernelSpatialDefinition::Periodic(_) => {
-                    return Err(format!(
-                        "periodic kernel {:?} in rule set {:?} requires the basis runtime",
-                        kernel.id, rule.id
-                    ));
-                }
-            };
-            legacy.kernels.push(KernelSlot {
-                id,
-                symbol: kernel.symbol.clone(),
-                name: kernel.name.clone(),
-                source: kernel.source_channel,
-                target: channel.id,
-                definition,
-            });
-            growth.kernel_inputs.push(id);
-        }
-        legacy.growth.push(growth);
-    }
-    Ok(legacy)
+    compile_experiment(spec).map_err(|error| reject(request_id, error.to_string()))
 }
 
 fn world_from_spec(spec: &ExperimentSpec) -> Result<ChannelWorld, ChannelWorldError> {
@@ -469,15 +482,26 @@ fn world_from_spec(spec: &ExperimentSpec) -> Result<ChannelWorld, ChannelWorldEr
             (grid.width as usize, grid.height as usize)
         }
     };
-    ChannelWorld::from_channels(
-        width,
-        height,
-        &spec
-            .channels
-            .iter()
-            .map(|channel| channel.initial.clone())
-            .collect::<Vec<_>>(),
-    )
+    let bases = spec.basis_ids().len();
+    let cell_count = width
+        .checked_mul(height)
+        .ok_or(ChannelWorldError::InvalidDimensions)?;
+    let channels = spec
+        .channels
+        .iter()
+        .map(|channel| {
+            if bases > 1 && channel.initial.len() == cell_count {
+                channel
+                    .initial
+                    .iter()
+                    .flat_map(|value| std::iter::repeat_n(*value, bases))
+                    .collect()
+            } else {
+                channel.initial.clone()
+            }
+        })
+        .collect::<Vec<_>>();
+    ChannelWorld::from_basis_channels(width, height, bases, &channels)
 }
 
 fn reject(request_id: u64, message: impl Into<String>) -> ApplyRejected {

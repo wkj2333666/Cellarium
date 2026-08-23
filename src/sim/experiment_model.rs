@@ -488,14 +488,16 @@ pub fn validate_structure(spec: &ExperimentSpec) -> Result<(), Vec<ExperimentMod
                 channel.name.clone(),
             ));
         }
-        if let Some(expected) = tile_count
-            && channel.initial.len() != expected
-        {
-            errors.push(ExperimentModelError::InvalidInitialLength {
-                channel: channel.id,
-                expected,
-                actual: channel.initial.len(),
-            });
+        if let Some(cell_count) = tile_count {
+            let basis_count = spec.basis_ids().len();
+            let expanded = cell_count.checked_mul(basis_count);
+            if channel.initial.len() != cell_count && expanded != Some(channel.initial.len()) {
+                errors.push(ExperimentModelError::InvalidInitialLength {
+                    channel: channel.id,
+                    expected: expanded.unwrap_or(cell_count),
+                    actual: channel.initial.len(),
+                });
+            }
         }
         if channel.initial.iter().any(|value| !value.is_finite()) {
             errors.push(ExperimentModelError::NonFiniteChannel(channel.id));

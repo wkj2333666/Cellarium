@@ -1298,7 +1298,7 @@ impl App {
         if let Some(service) = &mut self.experiment_service {
             let result = service.step();
             if result.is_ok() {
-                self.world.replace_cells(service.world().channel_cells(0));
+                self.world.replace_cells(&service.rasterized_channel(0));
             }
             self.record_step_duration(started.elapsed());
             return match result {

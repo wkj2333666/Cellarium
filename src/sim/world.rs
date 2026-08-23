@@ -10,6 +10,7 @@ pub struct World {
 pub struct ChannelWorld {
     width: usize,
     height: usize,
+    bases: usize,
     channels: usize,
     current: Vec<f32>,
     next: Vec<f32>,
@@ -41,6 +42,7 @@ impl ChannelWorld {
         Self {
             width,
             height,
+            bases: 1,
             channels,
             current: vec![0.0; len],
             next: vec![0.0; len],
@@ -52,11 +54,21 @@ impl ChannelWorld {
         height: usize,
         channels: &[Vec<f32>],
     ) -> Result<Self, ChannelWorldError> {
-        if width == 0 || height == 0 || channels.is_empty() {
+        Self::from_basis_channels(width, height, 1, channels)
+    }
+
+    pub fn from_basis_channels(
+        width: usize,
+        height: usize,
+        bases: usize,
+        channels: &[Vec<f32>],
+    ) -> Result<Self, ChannelWorldError> {
+        if width == 0 || height == 0 || bases == 0 || channels.is_empty() {
             return Err(ChannelWorldError::InvalidDimensions);
         }
         let channel_len = width
             .checked_mul(height)
+            .and_then(|cells| cells.checked_mul(bases))
             .ok_or(ChannelWorldError::InvalidDimensions)?;
         let total_len = channel_len
             .checked_mul(channels.len())
@@ -78,6 +90,7 @@ impl ChannelWorld {
         Ok(Self {
             width,
             height,
+            bases,
             channels: channels.len(),
             current,
             next: vec![0.0; total_len],
@@ -92,6 +105,9 @@ impl ChannelWorld {
     }
     pub fn channels(&self) -> usize {
         self.channels
+    }
+    pub fn bases(&self) -> usize {
+        self.bases
     }
 
     pub fn get(&self, channel: usize, x: isize, y: isize) -> f32 {
@@ -109,6 +125,21 @@ impl ChannelWorld {
         self.next[index] = value;
     }
 
+    pub fn get_basis(&self, channel: usize, x: isize, y: isize, basis: usize) -> f32 {
+        self.current[self.basis_index(channel, x, y, basis)]
+    }
+
+    pub fn set_basis(&mut self, channel: usize, x: isize, y: isize, basis: usize, value: f32) {
+        let index = self.basis_index(channel, x, y, basis);
+        self.current[index] = value;
+        self.next[index] = 0.0;
+    }
+
+    pub fn set_next_basis(&mut self, channel: usize, x: isize, y: isize, basis: usize, value: f32) {
+        let index = self.basis_index(channel, x, y, basis);
+        self.next[index] = value;
+    }
+
     pub fn swap_buffers(&mut self) {
         std::mem::swap(&mut self.current, &mut self.next);
     }
@@ -119,7 +150,7 @@ impl ChannelWorld {
     }
 
     pub fn replace_channel(&mut self, channel: usize, values: &[f32]) {
-        assert_eq!(values.len(), self.width * self.height);
+        assert_eq!(values.len(), self.width * self.height * self.bases);
         let range = self.channel_range(channel);
         self.current[range.clone()].copy_from_slice(values);
         self.next[range].fill(0.0);
@@ -153,18 +184,26 @@ impl ChannelWorld {
     }
 
     fn index(&self, channel: usize, x: isize, y: isize) -> usize {
+        self.basis_index(channel, x, y, 0)
+    }
+
+    fn basis_index(&self, channel: usize, x: isize, y: isize, basis: usize) -> usize {
         assert!(channel < self.channels, "channel index is out of range");
+        assert!(basis < self.bases, "basis index is out of range");
         let width = self.width as isize;
         let height = self.height as isize;
         let wrapped_x = ((x % width) + width) % width;
         let wrapped_y = ((y % height) + height) % height;
-        channel * self.width * self.height + (wrapped_y * width + wrapped_x) as usize
+        channel * self.width * self.height * self.bases
+            + (wrapped_y * width + wrapped_x) as usize * self.bases
+            + basis
     }
 
     fn channel_range(&self, channel: usize) -> std::ops::Range<usize> {
         assert!(channel < self.channels, "channel index is out of range");
-        let start = channel * self.width * self.height;
-        start..start + self.width * self.height
+        let channel_len = self.width * self.height * self.bases;
+        let start = channel * channel_len;
+        start..start + channel_len
     }
 }
 

@@ -45,6 +45,7 @@ pub struct CompiledExperiment {
     pub simulation_dt: f32,
     pub boundary: CompiledBoundary,
     pub rules: Vec<CompiledChannelRule>,
+    pub basis: Option<Box<crate::sim::basis_runtime::CompiledBasisExperiment>>,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -95,6 +96,17 @@ pub fn compile_experiment(spec: &ExperimentSpec) -> Result<CompiledExperiment, R
         .enumerate()
         .map(|(index, channel)| (channel.id, index))
         .collect::<BTreeMap<_, _>>();
+    if !spec.rules.is_empty() {
+        let basis = crate::sim::basis_runtime::compile_basis_experiment(spec)?;
+        return Ok(CompiledExperiment {
+            width,
+            height,
+            simulation_dt: spec.simulation_dt,
+            boundary,
+            rules: Vec::new(),
+            basis: Some(Box::new(basis)),
+        });
+    }
     let channel_constants = spec
         .channels
         .iter()
@@ -195,6 +207,7 @@ pub fn compile_experiment(spec: &ExperimentSpec) -> Result<CompiledExperiment, R
         simulation_dt: spec.simulation_dt,
         boundary,
         rules,
+        basis: None,
     })
 }
 
@@ -217,6 +230,11 @@ impl CpuExperimentBackend {
     }
 
     pub fn step(&mut self, world: &mut ChannelWorld) -> Result<(), RuntimeError> {
+        if let Some(basis) = &self.compiled.basis {
+            basis.step(world)?;
+            self.tick += 1;
+            return Ok(());
+        }
         if world.width() != self.compiled.width
             || world.height() != self.compiled.height
             || world.channels() != self.compiled.rules.len()
