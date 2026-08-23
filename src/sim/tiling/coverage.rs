@@ -16,6 +16,7 @@ pub struct CoverageReport {
 pub struct TilingDiagnostic {
     pub code: &'static str,
     pub message: String,
+    pub path: Option<String>,
 }
 
 pub fn validate_coverage(
@@ -129,6 +130,7 @@ fn diag(code: &'static str, message: impl Into<String>) -> TilingDiagnostic {
     TilingDiagnostic {
         code,
         message: message.into(),
+        path: None,
     }
 }
 

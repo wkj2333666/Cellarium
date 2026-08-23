@@ -37,13 +37,15 @@ pub fn segment_relation(a0: Vec2, a1: Vec2, b0: Vec2, b1: Vec2) -> SegmentRelati
         let low = a_min.max(b_min);
         let high = a_max.min(b_max);
         let tolerance = scalar_tolerance(&[a_min, a_max, b_min, b_max]);
-        if high < low - tolerance {
+        if low - high > tolerance {
             SegmentRelation::Disjoint
         } else if (high - low).abs() <= tolerance {
             SegmentRelation::Endpoint
         } else {
             SegmentRelation::CollinearOverlap
         }
+    } else if shared_endpoint {
+        SegmentRelation::Endpoint
     } else if opposite(orientation[0], orientation[1]) && opposite(orientation[2], orientation[3]) {
         SegmentRelation::ProperCrossing
     } else {
@@ -51,14 +53,16 @@ pub fn segment_relation(a0: Vec2, a1: Vec2, b0: Vec2, b1: Vec2) -> SegmentRelati
         let a1_on_b = orientation[3] == Ordering::Equal && in_bounds(a1, b0, b1);
         let b0_on_a = orientation[0] == Ordering::Equal && in_bounds(b0, a0, a1);
         let b1_on_a = orientation[1] == Ordering::Equal && in_bounds(b1, a0, a1);
-        if shared_endpoint {
-            SegmentRelation::Endpoint
-        } else if a0_on_b || a1_on_b || b0_on_a || b1_on_a {
+        if a0_on_b || a1_on_b || b0_on_a || b1_on_a {
             SegmentRelation::TEndpoint
         } else {
             SegmentRelation::Disjoint
         }
     }
+}
+
+pub(crate) fn point_on_segment(point: Vec2, start: Vec2, end: Vec2) -> bool {
+    sign(start, end, point) == Ordering::Equal && in_bounds(point, start, end)
 }
 
 fn sign(a: Vec2, b: Vec2, c: Vec2) -> Ordering {
@@ -96,7 +100,7 @@ fn scalar_tolerance(values: &[f64]) -> f64 {
         .iter()
         .fold(1.0_f64, |scale, value| scale.max(value.abs()))
         * f64::EPSILON
-        * 2.0
+        * 3.5
 }
 
 fn ordered(left: f64, right: f64) -> (f64, f64) {

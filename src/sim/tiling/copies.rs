@@ -198,6 +198,7 @@ fn diagnostic(code: &'static str, message: impl Into<String>) -> TilingDiagnosti
     TilingDiagnostic {
         code,
         message: message.into(),
+        path: None,
     }
 }
 

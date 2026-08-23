@@ -4,6 +4,7 @@
 //! third-party geometry types is kept in [`polygon`] so persisted experiments
 //! do not depend on a geometry crate's wire format.
 
+pub mod arrangement;
 pub mod compile;
 pub mod copies;
 pub mod coverage;
@@ -14,6 +15,10 @@ pub mod predicates;
 pub mod presets;
 pub mod snap;
 
+pub use arrangement::{
+    ArrangementFace, AtomicEdge, HalfEdgeId, NeighborPlacement, PeriodicArrangement, ShapeEdgeRef,
+    VertexId,
+};
 pub use compile::{CompiledTiling, compile_tiling};
 pub use copies::{Aabb, GeometryBudget, LatticeCopyBounds};
 pub use coverage::{CoverageReport, TilingDiagnostic, validate_coverage};
