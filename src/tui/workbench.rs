@@ -55,6 +55,14 @@ pub fn draw_workbench(
 ) {
     let layout = workbench_layout(area);
     app.set_workbench_area(area);
+    let canvas_block = panel(" Canvas ", app.workbench().focus() == WorkbenchFocus::Canvas);
+    let canvas_inner = canvas_block.inner(layout.canvas);
+    let (pixel_width, pixel_height) = display.framebuffer_size(canvas_inner);
+    let (placement_action, scene_generation) = app.prepare_workbench_scene(
+        canvas_inner,
+        [pixel_width as u32, pixel_height as u32],
+        display.protocol(),
+    );
     let state = app.workbench();
     let outline_lines = WorkbenchSection::ALL
         .into_iter()
@@ -196,18 +204,18 @@ pub fn draw_workbench(
             "Runtime changes only after Apply".into(),
         ],
     };
-    let canvas_block = panel(" Canvas ", state.focus() == WorkbenchFocus::Canvas);
-    let canvas_inner = canvas_block.inner(layout.canvas);
     frame.render_widget(canvas_block, layout.canvas);
     if matches!(state.section(), WorkbenchSection::World) {
         let (width, height) = display.framebuffer_size(canvas_inner);
-        let graphics = initial_field_graphics(state, *app.camera(), width as u32, height as u32);
+        let mut graphics = initial_field_graphics(state, *app.camera(), width as u32, height as u32);
+        graphics.generation = scene_generation;
         display.render_graphics(frame, canvas_inner, &graphics);
     } else if state.section() == WorkbenchSection::Tiling {
         if let Some(tiling) = &state.draft().tiling {
             let scene = crate::workbench::tiling_editor::TilingScene::new(tiling.clone());
             let (width, height) = display.framebuffer_size(canvas_inner);
-            let graphics = scene.render_rgba(width as u32, height as u32);
+            let mut graphics = scene.render_rgba(width as u32, height as u32);
+            graphics.generation = scene_generation;
             display.render_graphics(frame, canvas_inner, &graphics);
         } else {
             frame.render_widget(
@@ -222,13 +230,15 @@ pub fn draw_workbench(
                 crate::workbench::kernel_editor::KernelScene::new(kernel.definition.clone())
                     .with_view(state.kernel_view());
             let (width, height) = display.framebuffer_size(canvas_inner);
-            let graphics = scene.render_rgba(width as u32, height as u32);
+            let mut graphics = scene.render_rgba(width as u32, height as u32);
+            graphics.generation = scene_generation;
             display.render_graphics(frame, canvas_inner, &graphics);
         }
     } else if state.section() == WorkbenchSection::Growth {
         let scene = crate::workbench::growth_graph::GrowthScene::from_editor(state.growth_editor());
         let (width, height) = display.framebuffer_size(canvas_inner);
-        let graphics = scene.render_rgba(width as u32, height as u32);
+        let mut graphics = scene.render_rgba(width as u32, height as u32);
+        graphics.generation = scene_generation;
         display.render_graphics(frame, canvas_inner, &graphics);
     } else {
         frame.render_widget(
@@ -237,6 +247,7 @@ pub fn draw_workbench(
             canvas_inner,
         );
     }
+    display.apply_placement_action(frame, canvas_inner, placement_action);
     if let Some(inspector) = layout.inspector {
         let selected = state
             .draft()

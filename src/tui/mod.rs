@@ -51,9 +51,6 @@ fn draw_impl(
     .split(chunks[0]);
     if app.mode() == crate::workbench::AppMode::Workbench {
         workbench::draw_workbench(frame, app, display, chunks[0]);
-        if app.take_workbench_display_clear() {
-            display.clear_graphics(frame, chunks[0]);
-        }
         draw_footer(frame, app, display, chunks[1]);
         if app.help_visible() {
             render_help(frame, outer);

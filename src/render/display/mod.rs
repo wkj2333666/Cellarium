@@ -20,7 +20,10 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::render::raster::{Framebuffer, Rgb8, rasterize_world_into_while};
-use crate::render::{camera::Camera, workbench_graphics::GraphicsFrame};
+use crate::render::{
+    camera::Camera,
+    workbench_graphics::{GraphicsFrame, PlacementAction},
+};
 use crate::sim::world::World;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -52,6 +55,7 @@ pub struct PixelDisplay {
     ready_sequence: Arc<AtomicU64>,
     displayed_sequence: AtomicU64,
     queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size)>,
+    last_graphics_request: Mutex<Option<GraphicsRequestKey>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -94,6 +98,21 @@ struct RasterRequestKey {
     frame_width: usize,
     frame_height: usize,
     terminal_size: ratatui::layout::Size,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GraphicsRequestKey {
+    generation: u64,
+    width: u32,
+    height: u32,
+    terminal_size: ratatui::layout::Size,
+}
+
+fn should_submit_graphics(
+    previous: Option<GraphicsRequestKey>,
+    next: GraphicsRequestKey,
+) -> bool {
+    previous != Some(next)
 }
 
 fn should_submit_raster(previous: Option<RasterRequestKey>, next: RasterRequestKey) -> bool {
@@ -280,6 +299,7 @@ pub struct KittySharedDisplay {
     font_size: (u16, u16),
     state: Arc<Mutex<KittySharedState>>,
     queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size)>,
+    last_graphics_request: Mutex<Option<GraphicsRequestKey>>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -330,6 +350,7 @@ impl KittySharedDisplay {
             font_size,
             state,
             queue,
+            last_graphics_request: Mutex::new(None),
             worker: Some(worker),
         }
     }
@@ -339,6 +360,17 @@ impl KittySharedDisplay {
             return;
         }
         self.queue.submit((image, size));
+    }
+
+    fn should_submit_graphics(&self, key: GraphicsRequestKey) -> bool {
+        let Ok(mut previous) = self.last_graphics_request.lock() else {
+            return false;
+        };
+        if !should_submit_graphics(*previous, key) {
+            return false;
+        }
+        *previous = Some(key);
+        true
     }
 
     fn render(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) -> RenderStatus {
@@ -438,6 +470,33 @@ struct GraphicsCommandWidget<'a> {
     skip_area: bool,
 }
 
+struct GraphicsPlacementWidget {
+    action: PlacementAction,
+}
+
+impl ratatui::widgets::Widget for GraphicsPlacementWidget {
+    fn render(self, area: ratatui::layout::Rect, buffer: &mut ratatui::buffer::Buffer) {
+        use ratatui::buffer::CellDiffOption;
+        use std::num::NonZeroU16;
+
+        if !matches!(
+            self.action,
+            PlacementAction::DeleteBeforePresent | PlacementAction::DeleteOnly
+        ) {
+            return;
+        }
+        let Some(cell) = buffer.cell_mut(area.as_position()) else {
+            return;
+        };
+        let previous = cell.symbol().to_string();
+        let command = format!("{}{previous}", kitty_delete_all_images_command());
+        cell.set_symbol(&command)
+            .set_diff_option(CellDiffOption::ForcedWidth(
+                NonZeroU16::new(1).expect("one is non-zero"),
+            ));
+    }
+}
+
 impl ratatui::widgets::Widget for GraphicsCommandWidget<'_> {
     fn render(self, area: ratatui::layout::Rect, buffer: &mut ratatui::buffer::Buffer) {
         use ratatui::buffer::CellDiffOption;
@@ -487,12 +546,24 @@ impl PixelDisplay {
             ready_sequence,
             displayed_sequence: AtomicU64::new(0),
             queue,
+            last_graphics_request: Mutex::new(None),
             worker: Some(worker),
         }
     }
 
     fn submit(&self, image: DynamicImage, size: ratatui::layout::Size) {
         self.queue.submit((image, size));
+    }
+
+    fn should_submit_graphics(&self, key: GraphicsRequestKey) -> bool {
+        let Ok(mut previous) = self.last_graphics_request.lock() else {
+            return false;
+        };
+        if !should_submit_graphics(*previous, key) {
+            return false;
+        }
+        *previous = Some(key);
+        true
     }
 
     fn render(&self, frame: &mut ratatui::Frame, area: ratatui::layout::Rect) -> RenderStatus {
@@ -854,6 +925,46 @@ impl ViewportDisplay {
         area: ratatui::layout::Rect,
         graphics: &GraphicsFrame,
     ) -> bool {
+        let size = ratatui::layout::Size::new(area.width, area.height);
+        let key = GraphicsRequestKey {
+            generation: graphics.generation,
+            width: graphics.width,
+            height: graphics.height,
+            terminal_size: size,
+        };
+        let submit = match self {
+            Self::HalfBlock => true,
+            Self::Pixel(display) => display.should_submit_graphics(key),
+            #[cfg(unix)]
+            Self::KittyShared(display) => display.should_submit_graphics(key),
+        };
+        if submit {
+            let image = ImageBuffer::from_raw(
+                graphics.width,
+                graphics.height,
+                graphics.rgba.clone(),
+            )
+            .map(DynamicImage::ImageRgba8);
+            if let Some(image) = image {
+                match self {
+                    Self::Pixel(display) => display.submit(image, size),
+                    #[cfg(unix)]
+                    Self::KittyShared(display) => display.submit(image, size),
+                    Self::HalfBlock => {}
+                }
+            }
+        }
+        match self {
+            Self::Pixel(display) => return display.render(frame, area).fresh,
+            #[cfg(unix)]
+            Self::KittyShared(display) => {
+                let status = display.render(frame, area);
+                if status.rendered {
+                    return status.fresh;
+                }
+            }
+            Self::HalfBlock => {}
+        }
         let mut framebuffer = Framebuffer::new(graphics.width as usize, graphics.height as usize);
         for y in 0..graphics.height as usize {
             for x in 0..graphics.width as usize {
@@ -869,7 +980,22 @@ impl ViewportDisplay {
                 );
             }
         }
-        self.render(frame, area, &framebuffer)
+        frame.render_widget(
+            ratatui::widgets::Paragraph::new(half_block::half_block_lines(&framebuffer)),
+            area,
+        );
+        true
+    }
+
+    pub fn apply_placement_action(
+        &self,
+        frame: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        action: PlacementAction,
+    ) {
+        if self.protocol() == DisplayProtocol::Kitty {
+            frame.render_widget(GraphicsPlacementWidget { action }, area);
+        }
     }
 
     pub fn render_async(
@@ -982,6 +1108,7 @@ mod tests {
     use super::*;
     use crate::render::raster::{Framebuffer, Rgb8};
     use image::GenericImageView;
+    use ratatui::widgets::Widget;
     use std::time::{Duration, Instant};
 
     #[test]
@@ -1021,6 +1148,46 @@ mod tests {
                 ..request
             }
         ));
+    }
+
+    #[test]
+    fn graphics_requests_are_deduplicated_by_generation_size_and_area() {
+        let request = GraphicsRequestKey {
+            generation: 7,
+            width: 64,
+            height: 32,
+            terminal_size: ratatui::layout::Size::new(8, 4),
+        };
+
+        assert!(!should_submit_graphics(Some(request), request));
+        assert!(should_submit_graphics(
+            Some(request),
+            GraphicsRequestKey {
+                generation: 8,
+                ..request
+            }
+        ));
+        assert!(should_submit_graphics(
+            Some(request),
+            GraphicsRequestKey {
+                terminal_size: ratatui::layout::Size::new(9, 4),
+                ..request
+            }
+        ));
+    }
+
+    #[test]
+    fn delete_before_present_prefixes_the_existing_graphics_command() {
+        let mut buffer = ratatui::buffer::Buffer::empty(ratatui::layout::Rect::new(0, 0, 2, 1));
+        buffer.cell_mut((0, 0)).unwrap().set_symbol("PRESENT");
+        GraphicsPlacementWidget {
+            action: crate::render::workbench_graphics::PlacementAction::DeleteBeforePresent,
+        }
+        .render(ratatui::layout::Rect::new(0, 0, 2, 1), &mut buffer);
+
+        let symbol = buffer.cell((0, 0)).unwrap().symbol();
+        assert!(symbol.starts_with(kitty_delete_all_images_command()));
+        assert!(symbol.ends_with("PRESENT"));
     }
 
     #[test]

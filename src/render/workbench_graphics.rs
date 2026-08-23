@@ -90,6 +90,40 @@ pub enum PresentResult {
     Stale,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PlacementAction {
+    Keep,
+    Present,
+    DeleteBeforePresent,
+    DeleteOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneKey {
+    pub section: crate::workbench::WorkbenchSection,
+    pub selected_basis: crate::sim::tiling::BasisId,
+    pub selected_channel: crate::sim::experiment_model::ChannelId,
+    pub selected_kernel: Option<crate::sim::experiment_model::KernelId>,
+    pub display_mode: crate::render::display::DisplayProtocol,
+    pub transform_generation: u64,
+    pub draft_scene_generation: u64,
+}
+
+#[cfg(test)]
+impl SceneKey {
+    fn test(section: u8, transform_generation: u64, draft_scene_generation: u64) -> Self {
+        Self {
+            section: crate::workbench::WorkbenchSection::ALL[section as usize],
+            selected_basis: crate::sim::tiling::BasisId(0),
+            selected_channel: crate::sim::experiment_model::ChannelId(0),
+            selected_kernel: None,
+            display_mode: crate::render::display::DisplayProtocol::Kitty,
+            transform_generation,
+            draft_scene_generation,
+        }
+    }
+}
+
 /// Dirty-generation gate between Workbench editor scenes and the display
 /// presenters.
 ///
@@ -101,6 +135,8 @@ pub struct GraphicsSurface {
     dirty: bool,
     presented_generation: Option<u64>,
     max_dimensions: Option<(u32, u32)>,
+    scene: Option<SceneKey>,
+    fresh_presentations: u64,
 }
 
 impl GraphicsSurface {
@@ -113,6 +149,8 @@ impl GraphicsSurface {
             dirty: false,
             presented_generation: None,
             max_dimensions: Some((max_width.max(1), max_height.max(1))),
+            scene: None,
+            fresh_presentations: 0,
         }
     }
 
@@ -129,6 +167,33 @@ impl GraphicsSurface {
     /// Generation of the most recently presented frame, if any.
     pub fn presented_generation(&self) -> Option<u64> {
         self.presented_generation
+    }
+
+    pub fn transition(&mut self, scene: SceneKey) -> PlacementAction {
+        if self.scene == Some(scene) {
+            return PlacementAction::Keep;
+        }
+        let replacing = self.scene.replace(scene).is_some();
+        self.presented_generation = None;
+        self.dirty = true;
+        if replacing {
+            PlacementAction::DeleteBeforePresent
+        } else {
+            PlacementAction::Present
+        }
+    }
+
+    pub fn leave_scene(&mut self) -> PlacementAction {
+        if self.scene.take().is_none() {
+            return PlacementAction::Keep;
+        }
+        self.presented_generation = None;
+        self.dirty = false;
+        PlacementAction::DeleteOnly
+    }
+
+    pub fn fresh_presentations(&self) -> u64 {
+        self.fresh_presentations
     }
 
     /// Present `frame`, returning whether it became the fresh on-screen
@@ -163,6 +228,7 @@ impl GraphicsSurface {
         self.dirty = false;
         if fresh {
             self.presented_generation = Some(frame.generation);
+            self.fresh_presentations = self.fresh_presentations.saturating_add(1);
             Ok(PresentResult::Fresh)
         } else {
             Ok(PresentResult::Stale)
@@ -283,5 +349,26 @@ mod tests {
             surface.needs_present(),
             "an invalid frame must not consume the dirty flag"
         );
+    }
+
+    #[test]
+    fn scene_transitions_delete_before_present_and_repeated_draws_are_stale() {
+        let mut surface = GraphicsSurface::new();
+        let first = SceneKey::test(1, 10, 5);
+        assert_eq!(surface.transition(first), PlacementAction::Present);
+        assert_eq!(surface.present(frame(2, 2, 5)), Ok(PresentResult::Fresh));
+        assert_eq!(surface.fresh_presentations(), 1);
+        assert_eq!(surface.transition(first), PlacementAction::Keep);
+        assert_eq!(surface.present(frame(2, 2, 5)), Ok(PresentResult::Stale));
+        assert_eq!(surface.fresh_presentations(), 1);
+
+        let resized = SceneKey::test(1, 11, 6);
+        assert_eq!(
+            surface.transition(resized),
+            PlacementAction::DeleteBeforePresent
+        );
+        assert!(surface.needs_present());
+        assert_eq!(surface.leave_scene(), PlacementAction::DeleteOnly);
+        assert_eq!(surface.leave_scene(), PlacementAction::Keep);
     }
 }

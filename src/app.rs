@@ -9,7 +9,10 @@ use std::time::{Duration, Instant};
 
 use crate::input::{Command, UiCommand};
 use crate::render::camera::Camera;
+use crate::render::display::DisplayProtocol;
 use crate::render::raster::{Framebuffer, rasterize_world_into};
+use crate::render::scene_transform::{SceneCamera, SceneTransform};
+use crate::render::workbench_graphics::{GraphicsSurface, PlacementAction, SceneKey};
 use crate::sim::backend::{BackendKind, SimulationBackend};
 use crate::sim::experiment::{ExperimentError, ExperimentFile, ExperimentMetadata};
 use crate::sim::experiment_model::{ExperimentSpec, validate_structure};
@@ -94,6 +97,11 @@ pub struct App {
     workbench_notice: Option<String>,
     workbench_display_needs_clear: bool,
     workbench_area: Rect,
+    workbench_graphics_surface: GraphicsSurface,
+    workbench_scene_transform: Option<SceneTransform>,
+    workbench_transform_generation: u64,
+    workbench_draft_scene_generation: u64,
+    workbench_frame_generation: u64,
 }
 
 impl App {
@@ -156,6 +164,11 @@ impl App {
             workbench_notice: None,
             workbench_display_needs_clear: false,
             workbench_area: Rect::default(),
+            workbench_graphics_surface: GraphicsSurface::new(),
+            workbench_scene_transform: None,
+            workbench_transform_generation: 0,
+            workbench_draft_scene_generation: 0,
+            workbench_frame_generation: 0,
         }
     }
 
@@ -192,9 +205,57 @@ impl App {
     }
     pub fn request_workbench_display_clear(&mut self) {
         self.workbench_display_needs_clear = true;
+        self.workbench_draft_scene_generation =
+            self.workbench_draft_scene_generation.wrapping_add(1);
     }
     pub fn set_workbench_area(&mut self, area: Rect) {
         self.workbench_area = area;
+    }
+    pub fn prepare_workbench_scene(
+        &mut self,
+        terminal_rect: Rect,
+        pixel_size: [u32; 2],
+        display_mode: DisplayProtocol,
+    ) -> (PlacementAction, u64) {
+        let center = self.camera.center();
+        let camera = SceneCamera::new(
+            [f64::from(center[0]), f64::from(center[1])],
+            f64::from(self.camera.zoom()),
+        );
+        let changed = self.workbench_scene_transform.is_none_or(|transform| {
+            transform.terminal_rect != terminal_rect
+                || transform.pixel_size != pixel_size
+                || transform.camera != camera
+        });
+        if changed {
+            self.workbench_transform_generation =
+                self.workbench_transform_generation.wrapping_add(1);
+            self.workbench_scene_transform = SceneTransform::new(
+                terminal_rect,
+                pixel_size,
+                camera,
+                self.workbench_transform_generation,
+            )
+            .ok();
+        }
+        let scene = SceneKey {
+            section: self.workbench.section(),
+            selected_basis: self.workbench.selected_basis(),
+            selected_channel: self.workbench.selected_channel(),
+            selected_kernel: self.workbench.selected_kernel(),
+            display_mode,
+            transform_generation: self.workbench_transform_generation,
+            draft_scene_generation: self.workbench_draft_scene_generation,
+        };
+        let action = self.workbench_graphics_surface.transition(scene);
+        if action != PlacementAction::Keep {
+            self.workbench_frame_generation = self.workbench_frame_generation.wrapping_add(1);
+        }
+        (action, self.workbench_frame_generation)
+    }
+
+    pub fn workbench_scene_transform(&self) -> Option<SceneTransform> {
+        self.workbench_scene_transform
     }
     /// Handle clicks on the Workbench navigation and inspector panels.
     /// Canvas clicks remain available to the normal paint/inspect path.
@@ -247,7 +308,7 @@ impl App {
         }
     }
     pub fn handle_workbench_ui(&mut self, command: UiCommand) -> Result<(), String> {
-        match command {
+        let result = match command {
             UiCommand::Undo => self.workbench.undo().map_err(|error| error.to_string()),
             UiCommand::Redo => self.workbench.redo().map_err(|error| error.to_string()),
             UiCommand::RevertDraft => {
@@ -355,7 +416,12 @@ impl App {
                         .join("; ")
                 })
             }
+        };
+        if result.is_ok() {
+            self.workbench_draft_scene_generation =
+                self.workbench_draft_scene_generation.wrapping_add(1);
         }
+        result
     }
     pub fn handle_workbench_growth_key(&mut self, key: KeyEvent) -> bool {
         if self.mode != AppMode::Workbench || !self.workbench.growth_editing() {
@@ -401,12 +467,16 @@ impl App {
             KeyCode::End => self.workbench.growth_editor_mut().buffer_mut().move_end(),
             KeyCode::Esc => {
                 self.workbench.stop_growth_editing();
+                self.workbench_draft_scene_generation =
+                    self.workbench_draft_scene_generation.wrapping_add(1);
                 return true;
             }
             _ => return false,
         }
         self.workbench.growth_editor_mut().refresh_now();
         self.workbench.sync_growth_source();
+        self.workbench_draft_scene_generation =
+            self.workbench_draft_scene_generation.wrapping_add(1);
         if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
             eprintln!(
                 "E2E_GROWTH_VALID valid={} source={:?}",
