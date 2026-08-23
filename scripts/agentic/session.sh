@@ -113,7 +113,7 @@ start_session() {
   (( columns >= 40 && columns <= 300 && rows >= 12 && rows <= 120 )) || \
     agentic_die 'terminal dimensions are outside the safe range'
 
-  agentic_require Xvfb openbox kitty xdotool setsid ps realpath
+  agentic_require Xvfb openbox kitty xdotool xrefresh setsid ps realpath
   local run_dir manifest state_root display display_number claim title
   local screen_w screen_h supervisor_pid supervisor_start pgid window_id deadline
   run_dir=$(agentic_state_dir "$run_id")
@@ -189,6 +189,7 @@ start_session() {
     }
     sleep 0.05
   done
+  DISPLAY="$display" XAUTHORITY="$run_dir/Xauthority" xrefresh -solid black
   agentic_manifest_set "$manifest" KITTY_WINDOW_ID "$window_id"
   agentic_manifest_set "$manifest" CLIENT_PID "$(<"$run_dir/client.pid")"
   agentic_manifest_set "$manifest" XVFB_PID "$(<"$run_dir/xvfb.pid")"
