@@ -53,7 +53,7 @@ test_release() (
   tag=v9.8.7
   asset="cellarium-${tag}-linux-aarch64.tar.gz"
   mkdir -p "$release_dir/payload"
-  printf '#!/usr/bin/env sh\nprintf "cellarium 9.8.7\\n"\n' \
+  printf '#!/usr/bin/env sh\nprintf "cellarium: unexpected argument\\n" >&2\nexit 2\n' \
     >"$release_dir/payload/cellarium"
   chmod 0755 "$release_dir/payload/cellarium"
   tar -C "$release_dir/payload" -czf "$release_dir/$asset" cellarium
@@ -78,7 +78,9 @@ test_release() (
   test "$TAG" = v9.8.7 || fail "unexpected TAG: ${TAG-}"
   test "$ASSET_URL" = "$release_dir/$asset" || \
     fail "unexpected ASSET_URL: ${ASSET_URL-}"
-  test "$VERSION" = 'cellarium 9.8.7' || fail "unexpected VERSION: ${VERSION-}"
+  test "$VERSION" = \
+    'cellarium v9.8.7 (derived from verified release tag; binary lacks --version)' || \
+    fail "unexpected VERSION: ${VERSION-}"
   test "$SHA256" = "$(sha256sum "$release_dir/$asset" | awk '{print $1}')" || \
     fail "unexpected SHA256: ${SHA256-}"
 

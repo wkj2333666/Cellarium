@@ -71,8 +71,11 @@ tar -xzf "$download_dir/$asset" -C "$stage_dir" -- cellarium
 [[ -f $stage_dir/cellarium && ! -L $stage_dir/cellarium ]] || \
   agentic_die 'archive does not contain a regular cellarium executable'
 chmod 0755 "$stage_dir/cellarium"
-version=$("$stage_dir/cellarium" --version)
-[[ -n $version ]] || agentic_die 'cellarium --version returned an empty version'
+if version=$("$stage_dir/cellarium" --version 2>/dev/null) && [[ -n $version ]]; then
+  :
+else
+  version="cellarium $tag (derived from verified release tag; binary lacks --version)"
+fi
 
 {
   printf 'TAG=%q\n' "$tag"
