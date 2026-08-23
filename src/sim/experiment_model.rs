@@ -137,11 +137,13 @@ pub struct ExperimentSpec {
     pub name: String,
     pub geometry: GeometrySpec,
     pub channels: Vec<ChannelSpec>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kernels: Vec<KernelSlot>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub growth: Vec<GrowthSource>,
     /// Normalized basis-aware rules. Empty means a legacy global rule model
     /// that has not yet crossed the one-way normalization boundary.
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "RuleLibrary::is_empty")]
     pub rules: RuleLibrary,
     pub simulation_dt: f32,
     pub seed: u64,
@@ -245,7 +247,12 @@ impl ExperimentSpec {
     }
 
     pub fn normalize_rules(mut self) -> Result<Self, Vec<ExperimentModelError>> {
-        if self.rules.is_empty() {
+        let has_legacy = !self.kernels.is_empty() || !self.growth.is_empty();
+        let has_normalized = !self.rules.is_empty();
+        if has_legacy && has_normalized {
+            return Err(vec![ExperimentModelError::AmbiguousRuleRepresentations]);
+        }
+        if !has_normalized {
             if let Err(errors) = validate_structure(&self) {
                 return Err(errors);
             }
@@ -270,7 +277,7 @@ impl ExperimentSpec {
                         "too many active channels".to_string(),
                     )]
                 })?);
-                let kernels = self
+                let mut kernels = self
                     .kernels
                     .iter()
                     .filter(|kernel| kernel.target == output)
@@ -281,7 +288,8 @@ impl ExperimentSpec {
                         source_channel: kernel.source,
                         spatial: KernelSpatialDefinition::Raster(kernel.definition.clone()),
                     })
-                    .collect();
+                    .collect::<Vec<_>>();
+                kernels.sort_by_key(|kernel| kernel.id);
                 self.rules.defaults.insert(output, id);
                 self.rules.sets.push(RuleSet {
                     id,
@@ -297,6 +305,8 @@ impl ExperimentSpec {
                         rule_set: id,
                     }));
             }
+            self.kernels.clear();
+            self.growth.clear();
         }
         if let Err(errors) = self.rules.validate(&self.basis_ids(), &self.channels) {
             return Err(errors
@@ -371,6 +381,8 @@ pub enum ExperimentModelError {
     InvalidTiling(String),
     #[error("basis rules are invalid: {0}")]
     InvalidRules(String),
+    #[error("legacy global rules and normalized basis rules cannot both be present")]
+    AmbiguousRuleRepresentations,
 }
 
 pub fn validate_structure(spec: &ExperimentSpec) -> Result<(), Vec<ExperimentModelError>> {
@@ -501,9 +513,16 @@ pub fn validate_structure(spec: &ExperimentSpec) -> Result<(), Vec<ExperimentMod
         .iter()
         .map(|channel| (channel.id, channel))
         .collect::<BTreeMap<_, _>>();
+    let has_legacy = !spec.kernels.is_empty() || !spec.growth.is_empty();
+    let has_normalized = !spec.rules.is_empty();
+    if has_legacy && has_normalized {
+        errors.push(ExperimentModelError::AmbiguousRuleRepresentations);
+    }
+    let validate_legacy = !has_normalized;
+
     let mut kernel_ids = BTreeSet::new();
     let mut kernel_symbols = BTreeSet::new();
-    for kernel in &spec.kernels {
+    for kernel in spec.kernels.iter().filter(|_| validate_legacy) {
         if !kernel_ids.insert(kernel.id) {
             errors.push(ExperimentModelError::DuplicateKernelId(kernel.id));
         }
@@ -545,7 +564,7 @@ pub fn validate_structure(spec: &ExperimentSpec) -> Result<(), Vec<ExperimentMod
     }
 
     let mut growth_targets = BTreeSet::new();
-    for growth in &spec.growth {
+    for growth in spec.growth.iter().filter(|_| validate_legacy) {
         if !growth_targets.insert(growth.target) {
             errors.push(ExperimentModelError::DuplicateGrowthTarget(growth.target));
         }
@@ -584,7 +603,11 @@ pub fn validate_structure(spec: &ExperimentSpec) -> Result<(), Vec<ExperimentMod
             errors.push(ExperimentModelError::EmptyGrowthSource(growth.target));
         }
     }
-    for channel in spec.channels.iter().filter(|channel| !channel.frozen) {
+    for channel in spec
+        .channels
+        .iter()
+        .filter(|channel| validate_legacy && !channel.frozen)
+    {
         if !growth_targets.contains(&channel.id) {
             errors.push(ExperimentModelError::MissingGrowthProgram(channel.id));
         }
@@ -610,6 +633,7 @@ pub fn validate_structure(spec: &ExperimentSpec) -> Result<(), Vec<ExperimentMod
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::tiling::{TilingPreset, build_preset};
 
     #[test]
     fn default_model_is_single_channel_and_runnable() {
@@ -657,5 +681,80 @@ mod tests {
         assert!(validate_structure(&model).is_ok());
         model.kernels[0].target = frozen;
         assert!(validate_structure(&model).is_err());
+    }
+
+    #[test]
+    fn legacy_global_rule_is_shared_by_all_existing_bases() {
+        let mut legacy = ExperimentSpec::single_channel_lenia(4, 4);
+        legacy.tiling = Some(build_preset(TilingPreset::OctagonSquare, 1.0));
+
+        let normalized = legacy.normalize_rules().unwrap();
+        let ids = normalized
+            .rules
+            .bindings
+            .iter()
+            .map(|binding| binding.rule_set)
+            .collect::<BTreeSet<_>>();
+        assert_eq!(ids.len(), 1);
+        assert!(normalized.kernels.is_empty());
+        assert!(normalized.growth.is_empty());
+    }
+
+    #[test]
+    fn normalized_and_legacy_rules_are_ambiguous() {
+        let normalized = ExperimentSpec::single_channel_lenia(4, 4)
+            .normalize_rules()
+            .unwrap();
+        let mut ambiguous = normalized.clone();
+        ambiguous.kernels = ExperimentSpec::single_channel_lenia(4, 4).kernels;
+
+        assert!(
+            ambiguous
+                .normalize_rules()
+                .unwrap_err()
+                .iter()
+                .any(|error| {
+                    matches!(error, ExperimentModelError::AmbiguousRuleRepresentations)
+                })
+        );
+    }
+
+    #[test]
+    fn normalized_ron_omits_empty_legacy_rule_vectors() {
+        let normalized = ExperimentSpec::single_channel_lenia(4, 4)
+            .normalize_rules()
+            .unwrap();
+        let encoded = ron::ser::to_string(&normalized).unwrap();
+        assert!(!encoded.contains("kernels:[]"));
+        assert!(!encoded.contains("growth:[]"));
+        assert_eq!(
+            ron::from_str::<ExperimentSpec>(&encoded).unwrap(),
+            normalized
+        );
+    }
+
+    #[test]
+    fn legacy_kernel_storage_order_normalizes_to_growth_input_order() {
+        let mut legacy = ExperimentSpec::single_channel_lenia(2, 2);
+        let channel = legacy.channels[0].id;
+        legacy.kernels[0].id = KernelId(5);
+        legacy
+            .kernels
+            .push(KernelSlot::identity(KernelId(3), "inner", channel, channel));
+        legacy.growth[0].kernel_inputs = vec![KernelId(3), KernelId(5)];
+
+        let normalized = legacy.normalize_rules().unwrap();
+        assert_eq!(
+            normalized.rules.sets[0]
+                .kernels
+                .iter()
+                .map(|kernel| kernel.id)
+                .collect::<Vec<_>>(),
+            vec![KernelId(3), KernelId(5)]
+        );
+        assert_eq!(
+            normalized.rules.sets[0].growth.kernel_inputs,
+            vec![KernelId(3), KernelId(5)]
+        );
     }
 }

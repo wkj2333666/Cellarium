@@ -190,6 +190,77 @@ impl RuleLibrary {
             .find(|binding| binding.basis == basis && binding.output == output)
     }
 
+    pub fn detach(&mut self, binding: BindingKey) -> Result<RuleSetId, RuleSetError> {
+        let current = self
+            .binding(binding.basis, binding.output)
+            .ok_or(RuleSetError::MissingBinding(binding))?
+            .rule_set;
+        let is_shared = self
+            .bindings
+            .iter()
+            .filter(|entry| entry.rule_set == current)
+            .count()
+            > 1
+            || self.defaults.values().any(|default| *default == current);
+        if !is_shared {
+            return Ok(current);
+        }
+        let mut detached = self
+            .get(current)
+            .cloned()
+            .ok_or(RuleSetError::MissingRuleSet(current))?;
+        let next = self
+            .sets
+            .iter()
+            .map(|rule| rule.id.0)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or(RuleSetError::RuleSetIdExhausted)?;
+        detached.id = RuleSetId(next);
+        detached.shared_name = None;
+        self.sets.push(detached);
+        self.binding_mut(binding)?.rule_set = RuleSetId(next);
+        Ok(RuleSetId(next))
+    }
+
+    pub fn reset_to_default(&mut self, binding: BindingKey) -> Result<(), RuleSetError> {
+        let default = *self
+            .defaults
+            .get(&binding.output)
+            .ok_or(RuleSetError::MissingDefault(binding.output))?;
+        self.binding_mut(binding)?.rule_set = default;
+        Ok(())
+    }
+
+    pub fn edit_default(
+        &mut self,
+        channel: ChannelId,
+        edit: impl FnOnce(&mut RuleSet),
+    ) -> Result<(), RuleSetError> {
+        let default = *self
+            .defaults
+            .get(&channel)
+            .ok_or(RuleSetError::MissingDefault(channel))?;
+        let mut replacement = self
+            .get(default)
+            .cloned()
+            .ok_or(RuleSetError::MissingRuleSet(default))?;
+        edit(&mut replacement);
+        replacement.validate()?;
+        *self
+            .get_mut(default)
+            .ok_or(RuleSetError::MissingRuleSet(default))? = replacement;
+        Ok(())
+    }
+
+    fn binding_mut(&mut self, key: BindingKey) -> Result<&mut RuleBinding, RuleSetError> {
+        self.bindings
+            .iter_mut()
+            .find(|binding| binding.key() == key)
+            .ok_or(RuleSetError::MissingBinding(key))
+    }
+
     pub fn validate(
         &self,
         basis_ids: &[BasisId],
@@ -378,6 +449,8 @@ pub enum RuleSetError {
         channel: ChannelId,
         rule_set: RuleSetId,
     },
+    #[error("no further rule-set IDs are available")]
+    RuleSetIdExhausted,
 }
 
 #[cfg(test)]
@@ -510,5 +583,58 @@ mod tests {
             rule.validate(),
             Err(RuleSetError::InvalidKernelSymbol { .. })
         ));
+    }
+
+    #[test]
+    fn detach_and_reset_preserve_shared_default_semantics() {
+        let mut library = valid_library();
+        let first = BindingKey {
+            basis: BasisId(10),
+            output: ChannelId(0),
+        };
+        let detached = library.detach(first).unwrap();
+        assert_ne!(detached, RuleSetId(7));
+        library.get_mut(detached).unwrap().shared_name = Some("local first".into());
+        assert_eq!(
+            library.binding(BasisId(20), ChannelId(0)).unwrap().rule_set,
+            RuleSetId(7)
+        );
+
+        library.reset_to_default(first).unwrap();
+        assert_eq!(
+            library.binding(BasisId(10), ChannelId(0)).unwrap().rule_set,
+            RuleSetId(7)
+        );
+        assert_eq!(
+            library.get(detached).unwrap().shared_name.as_deref(),
+            Some("local first")
+        );
+    }
+
+    #[test]
+    fn editing_default_updates_shared_bindings_transactionally() {
+        let mut library = valid_library();
+        library
+            .edit_default(ChannelId(0), |rule| {
+                rule.shared_name = Some("all polygons".into())
+            })
+            .unwrap();
+        assert_eq!(
+            library
+                .get(library.binding(BasisId(10), ChannelId(0)).unwrap().rule_set)
+                .unwrap()
+                .shared_name
+                .as_deref(),
+            Some("all polygons")
+        );
+
+        let before = library.clone();
+        assert!(
+            library
+                .edit_default(ChannelId(0), |rule| rule.kernels[0].symbol =
+                    "bad symbol".into())
+                .is_err()
+        );
+        assert_eq!(library, before);
     }
 }
