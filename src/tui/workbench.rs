@@ -300,6 +300,11 @@ pub fn draw_workbench(
         let mut graphics = scene.render_rgba(width as u32, height as u32);
         graphics.generation = scene_generation;
         display.render_graphics(frame, graphics_area, &graphics);
+    } else if state.section() == WorkbenchSection::Channels {
+        let (width, height) = display.framebuffer_size(graphics_area);
+        let mut graphics = channel_graphics(state, width as u32, height as u32);
+        graphics.generation = scene_generation;
+        display.render_graphics(frame, graphics_area, &graphics);
     } else {
         frame.render_widget(
             Paragraph::new(canvas_lines.into_iter().map(Line::from).collect::<Vec<_>>())
@@ -432,6 +437,65 @@ fn initial_field_graphics(
     }
     crate::render::workbench_graphics::GraphicsFrame::new(width, height, rgba, 0)
         .expect("initial field dimensions are valid")
+}
+
+fn channel_graphics(
+    state: &crate::workbench::WorkbenchState,
+    width: u32,
+    height: u32,
+) -> crate::render::workbench_graphics::GraphicsFrame {
+    let width = width.max(1);
+    let height = height.max(1);
+    let (grid_width, grid_height) = match &state.draft().geometry {
+        crate::sim::experiment_model::GeometrySpec::RasterGrid(grid) => {
+            (grid.width as usize, grid.height as usize)
+        }
+    };
+    let channels = &state.draft().channels;
+    let colors = channels
+        .iter()
+        .map(|channel| crate::workbench::resolved_color(state.draft(), channel.id)
+            .unwrap_or(crate::render::channels::Rgb8::new(255, 255, 255)))
+        .collect::<Vec<_>>();
+    let selected = channels.iter().position(|channel| channel.id == state.selected_channel()).unwrap_or(0);
+    let columns = (channels.len() as f64).sqrt().ceil().max(1.0) as usize;
+    let rows = channels.len().div_ceil(columns).max(1);
+    let mut rgba = vec![0_u8; width as usize * height as usize * 4];
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let (panel, local_x, local_y, panel_width, panel_height) =
+                if state.channel_view() == crate::workbench::ChannelView::Grid {
+                    let panel_width = (width as usize).div_ceil(columns).max(1);
+                    let panel_height = (height as usize).div_ceil(rows).max(1);
+                    let column = x / panel_width;
+                    let row = y / panel_height;
+                    (Some(row * columns + column), x % panel_width, y % panel_height, panel_width, panel_height)
+                } else {
+                    (None, x, y, width as usize, height as usize)
+                };
+            let wx = local_x * grid_width / panel_width.max(1);
+            let wy = local_y * grid_height / panel_height.max(1);
+            let tile = wy.min(grid_height.saturating_sub(1)) * grid_width
+                + wx.min(grid_width.saturating_sub(1));
+            let mut values = Vec::new();
+            let mut active_colors = Vec::new();
+            for index in 0..channels.len() {
+                let include = channels[index].display.visible && match panel {
+                    Some(panel) => panel == index,
+                    None => state.channel_view() == crate::workbench::ChannelView::Composite || index == selected,
+                };
+                if include {
+                    values.push(channels[index].initial.get(tile).copied().unwrap_or(0.0));
+                    active_colors.push(colors[index]);
+                }
+            }
+            let pixel = crate::render::channels::composite_pixel(&values, &active_colors);
+            let offset = (y * width as usize + x) * 4;
+            rgba[offset..offset + 4].copy_from_slice(&[pixel.red, pixel.green, pixel.blue, 255]);
+        }
+    }
+    crate::render::workbench_graphics::GraphicsFrame::new(width, height, rgba, 0)
+        .expect("channel graphics dimensions are valid")
 }
 
 fn growth_source_preview(editor: &crate::workbench::GrowthEditorState) -> Vec<Line<'static>> {

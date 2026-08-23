@@ -194,17 +194,27 @@ impl TilingScene {
     }
 
     fn simple_polygon_mut(&mut self, prototype: PrototypeId) -> Result<&mut Vec<Vec2>, String> {
+        let materialized = self
+            .draft
+            .prototypes
+            .iter()
+            .find(|entry| entry.id == prototype)
+            .and_then(|entry| match &entry.shape {
+                PrototypeShape::RegularPolygon { .. } => prototype_vertices(&entry.shape).ok(),
+                PrototypeShape::SimplePolygon { .. } => None,
+            });
         let shape = self
             .draft
             .prototypes
             .iter_mut()
             .find(|entry| entry.id == prototype)
             .ok_or_else(|| "unknown prototype".to_string())?;
+        if let Some(vertices) = materialized {
+            shape.shape = PrototypeShape::SimplePolygon { vertices };
+        }
         match &mut shape.shape {
             PrototypeShape::SimplePolygon { vertices } => Ok(vertices),
-            PrototypeShape::RegularPolygon { .. } => {
-                Err("regular polygons must be converted to a custom polygon before editing".into())
-            }
+            PrototypeShape::RegularPolygon { .. } => unreachable!("regular polygon was materialized"),
         }
     }
 
