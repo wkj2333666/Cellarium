@@ -60,3 +60,8 @@ stores JSON Lines plus `report.md`; it never interprets a screenshot.
 The C/S journey is the performance oracle. Direct and half-block journeys are
 interaction and visual-correctness gates. All server processes must be started
 with recorded PIDs and stopped by those identities.
+
+The versioned release gate is
+[`tests/agentic/full-journey.md`](../tests/agentic/full-journey.md). The
+shorter baseline journey documents earlier product defects and is not
+sufficient to certify a release.
