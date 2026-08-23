@@ -120,6 +120,7 @@ test_lifecycle_contract() (
 test_lifecycle_smoke() (
   local case_dir run_id manifest display window_id geometry
   local window_x window_y window_width window_height screen_width screen_height
+  local startup_frame colored_pixels
   case_dir=$(mktemp -d)
   trap 'rm -rf -- "$case_dir"' EXIT
   AGENTIC_TARGET_DIR="$case_dir/state"
@@ -151,6 +152,24 @@ test_lifecycle_smoke() (
   test "$window_x,$window_y,$window_width,$window_height" = \
     "0,0,$screen_width,$screen_height" || \
     fail "Kitty is not a 1:1 fullscreen viewport: $window_x,$window_y ${window_width}x$window_height"
+  startup_frame=$("$repo_root/scripts/agentic/capture.sh" "$run_id" startup)
+  colored_pixels=$(ffmpeg -v error -i "$startup_frame" -f rawvideo -pix_fmt rgb24 - | \
+    od -An -v -tu1 | awk '
+      { for (i = 1; i <= NF; i++) {
+          value[count % 3] = $i; count++
+          if (count % 3 == 0) {
+            max = value[0]; min = value[0]
+            for (channel = 1; channel < 3; channel++) {
+              if (value[channel] > max) max = value[channel]
+              if (value[channel] < min) min = value[channel]
+            }
+            if (max - min > 20) colored++
+          }
+        }
+      }
+      END { print colored + 0 }')
+  (( colored_pixels <= 50 )) || \
+    fail "fullscreen startup retained $colored_pixels colored WM pixels"
 
   "$repo_root/scripts/agentic/session.sh" stop "$run_id"
   if "$repo_root/scripts/agentic/session.sh" status "$run_id"; then
