@@ -45,7 +45,7 @@ test_lib() (
 )
 
 test_release() (
-  local case_dir release_dir out_dir tag asset
+  local case_dir release_dir out_dir public_dir public_out tag asset
   case_dir=$(mktemp -d)
   trap 'rm -rf -- "$case_dir"' EXIT
   release_dir="$case_dir/release"
@@ -81,6 +81,20 @@ test_release() (
   test "$VERSION" = 'cellarium 9.8.7' || fail "unexpected VERSION: ${VERSION-}"
   test "$SHA256" = "$(sha256sum "$release_dir/$asset" | awk '{print $1}')" || \
     fail "unexpected SHA256: ${SHA256-}"
+
+  # Public releases must remain downloadable on a headless test host without
+  # relying on a cached gh login. file:// exercises the same curl boundary.
+  public_dir="$case_dir/public/$tag"
+  public_out="$case_dir/public-out"
+  mkdir -p "$public_dir"
+  cp -- "$release_dir/$asset" "$release_dir/SHA256SUMS" "$public_dir/"
+  binary=$(CELLARIUM_RELEASE_BASE_URL="file://$case_dir/public" \
+    "$repo_root/scripts/agentic/fetch-release.sh" "$tag" "$public_out")
+  test "$binary" = "$public_out/cellarium" || fail 'public fallback path is wrong'
+  # shellcheck disable=SC1090
+  source "$public_out/release.env"
+  test "$ASSET_URL" = "file://$case_dir/public/$tag/$asset" || \
+    fail "public fallback URL was not recorded: ${ASSET_URL-}"
 )
 
 test_lifecycle_contract() (
@@ -189,13 +203,62 @@ test_actions() (
   "$repo_root/scripts/agentic/session.sh" stop "$run_id"
 )
 
+test_ledger() (
+  local case_dir run_id run_dir evidence timestamps
+  case_dir=$(mktemp -d)
+  trap 'rm -rf -- "$case_dir"' EXIT
+  AGENTIC_TARGET_DIR="$case_dir/state"
+  export AGENTIC_TARGET_DIR
+  run_id=ledger-test
+  run_dir="$AGENTIC_TARGET_DIR/$run_id"
+  mkdir -p "$run_dir/frames"
+  printf 'before' >"$run_dir/frames/before.png"
+  printf 'after' >"$run_dir/frames/after.png"
+  printf '%s\n' \
+    'TAG=v1.2.3' \
+    'ASSET_URL=https://example.invalid/cellarium-v1.2.3-linux-aarch64.tar.gz' \
+    'SHA256=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' \
+    'VERSION=cellarium\ 1.2.3' >"$case_dir/release.env"
+
+  "$repo_root/scripts/agentic/evidence.sh" "$run_id" begin \
+    baseline cs "$case_dir/release.env"
+  "$repo_root/scripts/agentic/evidence.sh" "$run_id" action discover-workbench \
+    key-W 'Press W from Simulation' \
+    "$run_dir/frames/before.png" "$run_dir/frames/after.png"
+  "$repo_root/scripts/agentic/evidence.sh" "$run_id" observation discover-workbench \
+    fail 'Workbench opened, but the editor was not discoverable.'
+  "$repo_root/scripts/agentic/evidence.sh" "$run_id" defect UX-001 \
+    discover-workbench blocker 'Editor entry is unclear' 'Start Simulation; press W.'
+  if "$repo_root/scripts/agentic/evidence.sh" "$run_id" finish pass \
+      'must not pass'; then
+    fail 'ledger accepted PASS with an open defect'
+  fi
+  "$repo_root/scripts/agentic/evidence.sh" "$run_id" finish fail \
+    'baseline intentionally retains known defects'
+
+  evidence="$run_dir/evidence.jsonl"
+  jq -e -s 'length == 5 and all(.[]; has("timestamp_ns"))' "$evidence" >/dev/null || \
+    fail 'ledger is not valid JSONL with complete timestamps'
+  jq -e -s '[.[] | select(.type == "action")][0] |
+    .before_image | endswith("before.png")' "$evidence" >/dev/null || \
+    fail 'action did not retain its before frame'
+  jq -e -s '[.[] | select(.type == "action")][0] |
+    .after_image | endswith("after.png")' "$evidence" >/dev/null || \
+    fail 'action did not retain its after frame'
+  timestamps=$(jq -r '.timestamp_ns' "$evidence")
+  awk 'NR > 1 && $1 <= previous { exit 1 } { previous = $1 }' <<<"$timestamps" || \
+    fail 'ledger timestamps are not strictly monotonic'
+  test -s "$run_dir/report.md" || fail 'human-readable report was not written'
+)
+
 case "${1:-contract}" in
   release) test_release ;;
   lib) test_lib ;;
   lifecycle-contract) test_lifecycle_contract ;;
   lifecycle-smoke) test_lifecycle_smoke ;;
   actions) test_actions ;;
-  contract) test_lib; test_release; test_lifecycle_contract ;;
+  ledger) test_ledger ;;
+  contract) test_lib; test_release; test_lifecycle_contract; test_ledger ;;
   *) fail "unknown suite: ${1-}" ;;
 esac
 

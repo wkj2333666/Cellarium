@@ -29,9 +29,6 @@ mkdir -p -- "$parent"
 [[ ! -e $output_dir ]] || agentic_die "output already exists: $output_dir"
 
 agentic_require sha256sum tar realpath mktemp
-if [[ -z $source_dir ]]; then
-  agentic_require gh
-fi
 
 work_dir=$(mktemp -d "$parent/.agentic-release.XXXXXX")
 cleanup() {
@@ -46,10 +43,20 @@ if [[ -n $source_dir ]]; then
   cp -- "$source_dir/$asset" "$download_dir/$asset"
   cp -- "$source_dir/SHA256SUMS" "$download_dir/SHA256SUMS"
   asset_url="$source_dir/$asset"
-else
+elif [[ -z ${CELLARIUM_RELEASE_BASE_URL:-} ]] && command -v gh >/dev/null 2>&1 && \
+     gh auth status --hostname github.com >/dev/null 2>&1; then
   gh release download "$tag" --repo wkj2333666/Cellarium \
     --pattern "$asset" --pattern SHA256SUMS --dir "$download_dir"
   asset_url="https://github.com/wkj2333666/Cellarium/releases/download/$tag/$asset"
+else
+  agentic_require curl
+  base_url=${CELLARIUM_RELEASE_BASE_URL:-https://github.com/wkj2333666/Cellarium/releases/download}
+  base_url=${base_url%/}
+  asset_url="$base_url/$tag/$asset"
+  curl --fail --location --silent --show-error \
+    --output "$download_dir/$asset" "$asset_url"
+  curl --fail --location --silent --show-error \
+    --output "$download_dir/SHA256SUMS" "$base_url/$tag/SHA256SUMS"
 fi
 
 checksum_line=$(awk -v asset="$asset" '$2 == asset { print }' \
