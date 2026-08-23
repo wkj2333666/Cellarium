@@ -580,31 +580,6 @@ mod tests {
     }
 
     #[test]
-    fn small_period_preview_still_fills_the_viewport() {
-        let scene = TilingScene::new(crate::sim::tiling::build_preset(
-            crate::sim::tiling::TilingPreset::Square,
-            0.05,
-        ));
-        let frame = scene.render_rgba(464, 512);
-        for (name, x0, y0, x1, y1) in [
-            ("top-left", 0, 0, 232, 256),
-            ("top-right", 232, 0, 464, 256),
-            ("bottom-left", 0, 256, 232, 512),
-            ("bottom-right", 232, 256, 464, 512),
-        ] {
-            let lit = (y0..y1)
-                .flat_map(|y| (x0..x1).map(move |x| (y * 464 + x) * 4))
-                .filter(|index| {
-                    frame.rgba[*index..*index + 3]
-                        .iter()
-                        .any(|value| *value > 0)
-                })
-                .count();
-            assert!(lit > 500, "{name} preview is empty at minimum scale");
-        }
-    }
-
-    #[test]
     fn huge_offscreen_lines_are_clipped_before_rasterization() {
         let mut rgba = vec![0_u8; 64 * 64 * 4];
         draw_line(
@@ -622,28 +597,50 @@ mod tests {
     }
 
     #[test]
-    fn periodic_preview_fills_all_canvas_quadrants() {
-        let scene = TilingScene::new(crate::sim::tiling::build_preset(
-            crate::sim::tiling::TilingPreset::Square,
+    fn hexagon_preview_has_a_strong_center_and_oblique_ghost_neighbor() {
+        let draft = crate::sim::tiling::build_preset(
+            crate::sim::tiling::TilingPreset::RegularHexagon,
             1.0,
-        ));
-        let frame = scene.render_rgba(464, 512);
-        let lit = |x0: usize, y0: usize, x1: usize, y1: usize| {
-            (y0..y1)
-                .flat_map(|y| (x0..x1).map(move |x| (y * 464 + x) * 4))
-                .filter(|index| {
-                    frame.rgba[*index..*index + 3]
-                        .iter()
-                        .any(|value| *value > 0)
-                })
-                .count()
-        };
-        assert!(lit(0, 0, 232, 256) > 500, "top-left preview is empty");
-        assert!(lit(232, 0, 464, 256) > 500, "top-right preview is empty");
-        assert!(lit(0, 256, 232, 512) > 500, "bottom-left preview is empty");
-        assert!(
-            lit(232, 256, 464, 512) > 500,
-            "bottom-right preview is empty"
         );
+        let scene = TilingScene::new(draft.clone());
+        let frame = scene.render_rgba(640, 480);
+        let base = prototype_vertices(&draft.prototypes[0].shape).unwrap();
+        let polygon = transform_vertices(&base, draft.instances[0].transform);
+        let center = polygon.iter().fold(Vec2::ZERO, |sum, point| sum + *point)
+            * (1.0 / polygon.len() as f64);
+        let neighbor = center + draft.translation_a;
+        let sample = |point: Vec2| {
+            let (x, y) = scene.world_to_pixel(point, 640, 480);
+            let index = (y as usize * 640 + x as usize) * 4;
+            [frame.rgba[index], frame.rgba[index + 1], frame.rgba[index + 2]]
+        };
+        let center_color = sample(center);
+        let ghost_color = sample(neighbor);
+        assert_ne!(center_color, [5, 10, 24]);
+        assert_ne!(ghost_color, [5, 10, 24]);
+        assert_ne!(center_color, ghost_color, "ghost neighbor must be visually subordinate");
+        assert!(draft.translation_a.x.abs() > 0.1 && draft.translation_a.y.abs() > 0.1);
+    }
+
+    #[test]
+    fn octagon_square_preview_renders_both_canonical_basis_shapes() {
+        let draft = crate::sim::tiling::build_preset(
+            crate::sim::tiling::TilingPreset::OctagonSquare,
+            1.0,
+        );
+        let scene = TilingScene::new(draft.clone());
+        let frame = scene.render_rgba(640, 480);
+        let mut sampled = Vec::new();
+        for instance in &draft.instances {
+            let prototype = draft.prototypes.iter().find(|p| p.id == instance.prototype).unwrap();
+            let polygon = transform_vertices(&prototype_vertices(&prototype.shape).unwrap(), instance.transform);
+            let center = polygon.iter().fold(Vec2::ZERO, |sum, point| sum + *point)
+                * (1.0 / polygon.len() as f64);
+            let (x, y) = scene.world_to_pixel(center, 640, 480);
+            let index = (y as usize * 640 + x as usize) * 4;
+            sampled.push([frame.rgba[index], frame.rgba[index + 1], frame.rgba[index + 2]]);
+            assert_ne!(sampled.last().copied().unwrap(), [5, 10, 24]);
+        }
+        assert!(sampled.len() >= 2, "mixed tiling must expose multiple basis polygons");
     }
 }

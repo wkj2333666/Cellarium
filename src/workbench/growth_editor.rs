@@ -102,26 +102,42 @@ impl GrowthEditorState {
         }
     }
 }
-pub fn editor_for(
+pub fn editor_for_basis(
     spec: &crate::sim::experiment_model::ExperimentSpec,
+    basis: crate::sim::tiling::BasisId,
     target: crate::sim::experiment_model::ChannelId,
 ) -> GrowthEditorState {
-    let growth = spec.growth.iter().find(|growth| growth.target == target);
-    let inputs: Vec<String> = growth
-        .map(|g| {
-            g.kernel_inputs
-                .iter()
-                .filter_map(|id| {
-                    spec.kernels
-                        .iter()
-                        .find(|k| k.id == *id)
-                        .map(|k| k.symbol.clone())
-                })
-                .collect()
-        })
+    let normalized = spec
+        .rules
+        .binding(basis, target)
+        .and_then(|binding| spec.rules.get(binding.rule_set));
+    let legacy = spec.growth.iter().find(|growth| growth.target == target);
+    let inputs: Vec<String> = if let Some(rule) = normalized {
+        rule.kernels.iter().map(|kernel| kernel.symbol.clone()).collect()
+    } else {
+        legacy
+            .map(|growth| {
+                growth
+                    .kernel_inputs
+                    .iter()
+                    .filter_map(|id| {
+                        spec.kernels
+                            .iter()
+                            .find(|kernel| kernel.id == *id)
+                            .map(|kernel| kernel.symbol.clone())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let parameters = normalized
+        .map(|rule| rule.growth.parameters.clone())
+        .or_else(|| legacy.map(|growth| growth.parameters.clone()))
         .unwrap_or_default();
-    let parameters = growth.map(|g| g.parameters.clone()).unwrap_or_default();
-    let source = growth.map_or("self", |g| g.source.as_str());
+    let source = normalized
+        .map(|rule| rule.growth.source.as_str())
+        .or_else(|| legacy.map(|growth| growth.source.as_str()))
+        .unwrap_or("self");
     let mut arguments = vec!["self: Scalar".to_string()];
     arguments.extend(inputs.iter().map(|symbol| format!("{symbol}: Scalar")));
     let signature = format!("fn growth({}) -> Rate", arguments.join(", "));
@@ -154,5 +170,23 @@ mod tests {
         assert_eq!(editor.plot().data, valid);
         assert!(editor.plot().stale);
         assert!(!editor.diagnostics().is_empty());
+    }
+
+
+    #[test]
+    fn normalized_ruleset_supplies_the_basis_specific_signature_and_source() {
+        let mut spec = crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(8, 8)
+            .normalize_rules()
+            .unwrap();
+        spec.rules.sets[0].kernels[0].symbol = "nearby".into();
+        spec.rules.sets[0].growth.source = "nearby - self".into();
+        let editor = editor_for_basis(
+            &spec,
+            crate::sim::tiling::BasisId(0),
+            crate::sim::experiment_model::ChannelId(0),
+        );
+        assert_eq!(editor.buffer().as_str(), "nearby - self");
+        assert_eq!(editor.signature(), "fn growth(self: Scalar, nearby: Scalar) -> Rate");
+        assert!(editor.diagnostics().is_empty());
     }
 }

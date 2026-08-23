@@ -1,11 +1,11 @@
-use super::growth_editor::editor_for;
+use super::growth_editor::editor_for_basis;
 use super::{ChannelView, DraftCommand, GrowthEditorState, History, HistoryError};
-use super::kernel_editor::KernelPoint;
+use super::kernel_editor::{KernelPoint, KernelSelection};
 use super::numeric_editor::NumericEditor;
 use crate::sim::experiment_model::{
     ChannelId, DisplayColor, ExperimentSpec, KernelId, KernelSlot, RgbColor,
 };
-use crate::sim::ruleset::{BindingKey, RuleSet, RuleSetId};
+use crate::sim::ruleset::{BindingKey, RuleKernel, RuleSet, RuleSetId};
 use crate::sim::tiling::{BasisId, PrototypeId, PrototypeShape, TilingPreset, build_preset};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -77,6 +77,7 @@ pub struct WorkbenchState {
     selected_prototype: Option<PrototypeId>,
     kernel_view: super::kernel_editor::KernelView,
     kernel_selection: Option<KernelPoint>,
+    periodic_kernel_selection: Option<KernelSelection>,
     kernel_paint_value: f32,
     numeric_editor: Option<NumericEditor>,
     tiling_tool: super::tiling_editor::TilingTool,
@@ -94,7 +95,7 @@ impl WorkbenchState {
             .and_then(|rule_set| spec.rules.get(rule_set))
             .and_then(|rule| rule.kernels.first())
             .map(|kernel| kernel.id);
-        let growth_editor = editor_for(&spec, selected_channel);
+        let growth_editor = editor_for_basis(&spec, selected_basis, selected_channel);
         let selected_prototype = spec
             .tiling
             .as_ref()
@@ -116,6 +117,7 @@ impl WorkbenchState {
             selected_prototype,
             kernel_view: super::kernel_editor::KernelView::default(),
             kernel_selection: None,
+            periodic_kernel_selection: None,
             kernel_paint_value: 0.05,
             numeric_editor: None,
             tiling_tool: super::tiling_editor::TilingTool::Select,
@@ -162,6 +164,7 @@ impl WorkbenchState {
         }
         self.selected_basis = basis;
         self.refresh_rule_selection();
+        self.growth_editor = editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
         Ok(())
     }
     pub fn channel_view(&self) -> ChannelView {
@@ -178,6 +181,24 @@ impl WorkbenchState {
     }
     pub fn select_kernel_point(&mut self, point: KernelPoint) {
         self.kernel_selection = Some(point);
+        self.periodic_kernel_selection = None;
+    }
+    pub fn periodic_kernel_selection(&self) -> Option<KernelSelection> {
+        self.periodic_kernel_selection
+    }
+    pub fn select_periodic_kernel(&mut self, selection: KernelSelection) {
+        self.periodic_kernel_selection = Some(selection);
+        self.kernel_selection = None;
+    }
+    pub fn selected_rule_kernel(&self) -> Option<&RuleKernel> {
+        let rule_set = self.selected_rule_set?;
+        let kernel = self.selected_kernel?;
+        self.draft
+            .rules
+            .get(rule_set)?
+            .kernels
+            .iter()
+            .find(|entry| entry.id == kernel)
     }
     pub fn kernel_paint_value(&self) -> f32 {
         self.kernel_paint_value
@@ -265,6 +286,38 @@ impl WorkbenchState {
     }
     pub fn sync_growth_source(&mut self) {
         let source = self.growth_editor.buffer().as_str().to_string();
+        let binding = BindingKey {
+            basis: self.selected_basis,
+            output: self.selected_channel,
+        };
+        if self
+            .draft
+            .rules
+            .binding(binding.basis, binding.output)
+            .is_some()
+        {
+            match self.draft.rules.detach(binding) {
+                Ok(rule_set) => {
+                    if let Some(rule) = self.draft.rules.get_mut(rule_set) {
+                        rule.growth.source = source;
+                    }
+                    self.selected_rule_set = Some(rule_set);
+                    self.selected_kernel = self
+                        .draft
+                        .rules
+                        .get(rule_set)
+                        .and_then(|rule| rule.kernels.first())
+                        .map(|kernel| kernel.id);
+                    self.status = if self.growth_editor.diagnostics().is_empty() {
+                        DraftStatus::Dirty
+                    } else {
+                        DraftStatus::Invalid
+                    };
+                }
+                Err(_) => self.status = DraftStatus::Invalid,
+            }
+            return;
+        }
         if let Some(growth) = self
             .draft
             .growth
@@ -300,7 +353,7 @@ impl WorkbenchState {
     }
     pub fn revert(&mut self) {
         self.draft = self.authoritative.clone();
-        self.growth_editor = editor_for(&self.draft, self.selected_channel);
+        self.growth_editor = editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
         self.growth_editing = false;
         self.selected_prototype = self
             .draft
@@ -321,7 +374,7 @@ impl WorkbenchState {
         self.authoritative = normalized.clone();
         self.draft = normalized;
         self.selected_channel = self.draft.channels.first().map_or(ChannelId(0), |c| c.id);
-        self.growth_editor = editor_for(&self.draft, self.selected_channel);
+        self.growth_editor = editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
         self.growth_editing = false;
         self.history.clear();
         self.status = DraftStatus::Clean;
@@ -361,6 +414,7 @@ impl WorkbenchState {
         if self.draft.channels.iter().any(|entry| entry.id == channel) {
             self.selected_channel = channel;
             self.refresh_rule_selection();
+            self.growth_editor = editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
             Ok(())
         } else {
             Err("unknown channel".into())
@@ -378,6 +432,8 @@ impl WorkbenchState {
             .and_then(|rule_set| self.draft.rules.get(rule_set))
             .and_then(|rule| rule.kernels.first())
             .map(|kernel| kernel.id);
+        self.kernel_selection = None;
+        self.periodic_kernel_selection = None;
     }
 
     pub fn detach_selected_ruleset(&mut self) -> Result<(), HistoryError> {
@@ -406,19 +462,36 @@ impl WorkbenchState {
         source_basis: BasisId,
         value: f32,
     ) -> Result<(), HistoryError> {
-        let rule_set = self.selected_rule_set.ok_or_else(|| {
-            HistoryError::Edit("selected basis/channel has no rule-set".to_string())
-        })?;
+        let binding = BindingKey {
+            basis: self.selected_basis,
+            output: self.selected_channel,
+        };
         let kernel = self
             .selected_kernel
             .ok_or_else(|| HistoryError::Edit("selected rule-set has no kernel".to_string()))?;
-        self.execute(DraftCommand::SetPeriodicKernelWeight {
-            rule_set,
-            kernel,
-            offset,
-            source_basis,
-            value,
-        })
+        let mut next = self.draft.clone();
+        let rule_set = next
+            .rules
+            .detach(binding)
+            .map_err(|error| HistoryError::Edit(error.to_string()))?;
+        let target = next
+            .rules
+            .get_mut(rule_set)
+            .and_then(|rule| rule.kernels.iter_mut().find(|entry| entry.id == kernel))
+            .ok_or_else(|| HistoryError::Edit("selected rule kernel is missing".to_string()))?;
+        let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) =
+            &mut target.spatial
+        else {
+            return Err(HistoryError::Edit(
+                "selected kernel is not periodic".to_string(),
+            ));
+        };
+        definition
+            .set_weight(offset, source_basis, value)
+            .map_err(|error| HistoryError::Edit(error.to_string()))?;
+        self.execute(DraftCommand::ReplaceDraft(Box::new(next)))?;
+        self.refresh_rule_selection();
+        Ok(())
     }
     pub fn set_channel_view(&mut self, view: ChannelView) {
         self.channel_view = view;
@@ -442,7 +515,7 @@ impl WorkbenchState {
                 .as_ref()
                 .and_then(|tiling| tiling.prototypes.first().map(|prototype| prototype.id));
         }
-        self.growth_editor = editor_for(&self.draft, self.selected_channel);
+        self.growth_editor = editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
         Ok(())
     }
 
@@ -483,7 +556,7 @@ impl WorkbenchState {
             .position(|channel| channel.id == self.selected_channel)
             .unwrap_or(0);
         self.selected_channel = self.draft.channels[(index + 1) % self.draft.channels.len()].id;
-        self.growth_editor = editor_for(&self.draft, self.selected_channel);
+        self.growth_editor = editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
         self.refresh_rule_selection();
     }
 
@@ -754,5 +827,64 @@ mod tests {
             state.rule_for(BasisId(0), ChannelId(0)).unwrap(),
             &sibling_before
         );
+    }
+
+    #[test]
+    fn periodic_weight_edit_automatically_detaches_one_basis_binding() {
+        let mut state = WorkbenchState::new(basis_fixture());
+        let sibling_before = state.rule_for(BasisId(1), ChannelId(0)).unwrap().clone();
+
+        state
+            .set_selected_kernel_weight([0, 0], BasisId(0), 0.25)
+            .unwrap();
+
+        assert_eq!(
+            state.rule_for(BasisId(1), ChannelId(0)).unwrap(),
+            &sibling_before,
+            "editing one basis must not mutate its shared sibling",
+        );
+        assert_eq!(
+            match &state.rule_for(BasisId(0), ChannelId(0)).unwrap().kernels[0].spatial {
+                KernelSpatialDefinition::Periodic(definition) => {
+                    definition.weight([0, 0], BasisId(0))
+                }
+                KernelSpatialDefinition::Raster(_) => None,
+            },
+            Some(0.25),
+        );
+        state.undo().unwrap();
+        assert_eq!(state.rule_for(BasisId(0), ChannelId(0)).unwrap(), &sibling_before);
+    }
+
+    #[test]
+    fn changing_basis_refreshes_the_basis_specific_growth_program() {
+        let mut spec = basis_fixture();
+        let second = spec
+            .rules
+            .detach(BindingKey {
+                basis: BasisId(1),
+                output: ChannelId(0),
+            })
+            .unwrap();
+        spec.rules.get_mut(second).unwrap().growth.source = "self * 0.25".into();
+        let mut state = WorkbenchState::new(spec);
+        assert_ne!(state.growth_editor().buffer().as_str(), "self * 0.25");
+        state.set_selected_basis(BasisId(1)).unwrap();
+        assert_eq!(state.growth_editor().buffer().as_str(), "self * 0.25");
+    }
+
+    #[test]
+    fn normalized_growth_edit_updates_only_the_selected_basis_ruleset() {
+        let mut state = WorkbenchState::new(basis_fixture());
+        let sibling_before = state.rule_for(BasisId(1), ChannelId(0)).unwrap().clone();
+        state.growth_editor_mut().replace_source("self * 0.5");
+        state.growth_editor_mut().refresh_now();
+        state.sync_growth_source();
+
+        assert_eq!(
+            state.rule_for(BasisId(0), ChannelId(0)).unwrap().growth.source,
+            "self * 0.5",
+        );
+        assert_eq!(state.rule_for(BasisId(1), ChannelId(0)).unwrap(), &sibling_before);
     }
 }

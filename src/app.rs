@@ -576,7 +576,16 @@ impl App {
                     };
                     match editor.commit() {
                         Ok(value) => {
-                            if let Some(point) = self.workbench.kernel_selection() {
+                            if let Some(selection) = self.workbench.periodic_kernel_selection() {
+                                if let Err(error) =
+                                    self.set_periodic_kernel_value(selection, value as f32)
+                                {
+                                    self.workbench_notice = Some(error);
+                                } else {
+                                    let _ = self.workbench.set_kernel_paint_value(value as f32);
+                                    self.workbench_notice = Some(format!("weight = {value:.6}"));
+                                }
+                            } else if let Some(point) = self.workbench.kernel_selection() {
                                 if let Err(error) = self.set_kernel_cell_value(point, value as f32) {
                                     self.workbench_notice = Some(error);
                                 } else {
@@ -611,20 +620,66 @@ impl App {
         }
         if self.workbench.section() == WorkbenchSection::Kernels
             && matches!(key.code, KeyCode::Enter | KeyCode::Char('e'))
-            && let Some(point) = self.workbench.kernel_selection()
-            && let Some(value) = self.kernel_cell_value(point)
         {
-            self.workbench.begin_numeric_editor(
-                crate::workbench::numeric_editor::NumericEditor::begin(
-                    format!("weight[{},{}]", point.x, point.y),
-                    f64::from(value),
-                    -1.0..=1.0,
-                ),
-            );
-            self.workbench_notice = Some("type exact weight; Enter commit · Esc cancel".into());
-            return true;
+            if let Some(selection) = self.workbench.periodic_kernel_selection()
+                && let Some(value) = self.periodic_kernel_value(selection)
+            {
+                self.workbench.begin_numeric_editor(
+                    crate::workbench::numeric_editor::NumericEditor::begin(
+                        format!(
+                            "weight[offset {},{} · basis {}]",
+                            selection.offset[0], selection.offset[1], selection.source_basis.0
+                        ),
+                        f64::from(value),
+                        -1.0..=1.0,
+                    ),
+                );
+                self.workbench_notice =
+                    Some("type exact weight; Enter commit · Esc cancel".into());
+                return true;
+            }
+            if let Some(point) = self.workbench.kernel_selection()
+                && let Some(value) = self.kernel_cell_value(point)
+            {
+                self.workbench.begin_numeric_editor(
+                    crate::workbench::numeric_editor::NumericEditor::begin(
+                        format!("weight[{},{}]", point.x, point.y),
+                        f64::from(value),
+                        -1.0..=1.0,
+                    ),
+                );
+                self.workbench_notice =
+                    Some("type exact weight; Enter commit · Esc cancel".into());
+                return true;
+            }
         }
         self.handle_workbench_growth_key(key)
+    }
+
+    fn periodic_kernel_value(
+        &self,
+        selection: crate::workbench::kernel_editor::KernelSelection,
+    ) -> Option<f32> {
+        let kernel = self.workbench.selected_rule_kernel()?;
+        let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) = &kernel.spatial
+        else {
+            return None;
+        };
+        definition.weight(selection.offset, selection.source_basis)
+    }
+
+    fn set_periodic_kernel_value(
+        &mut self,
+        selection: crate::workbench::kernel_editor::KernelSelection,
+        value: f32,
+    ) -> Result<(), String> {
+        self.workbench
+            .set_selected_kernel_weight(selection.offset, selection.source_basis, value)
+            .map_err(|error| error.to_string())?;
+        self.workbench.select_periodic_kernel(selection);
+        self.workbench_draft_scene_generation =
+            self.workbench_draft_scene_generation.wrapping_add(1);
+        Ok(())
     }
 
     fn kernel_cell_value(&self, point: crate::workbench::kernel_editor::KernelPoint) -> Option<f32> {
@@ -1628,6 +1683,128 @@ impl App {
                     return applied;
                 }
                 crate::workbench::WorkbenchSection::Kernels => {
+                    if let (Some(tiling), Some(rule_kernel)) = (
+                        self.workbench.draft().tiling.clone(),
+                        self.workbench.selected_rule_kernel().cloned(),
+                    ) && let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) =
+                        rule_kernel.spatial
+                    {
+                        let mut scene = crate::workbench::kernel_editor::PeriodicKernelScene::new(
+                            tiling,
+                            definition,
+                            self.workbench.selected_basis(),
+                        )
+                        .with_view(self.workbench.kernel_view())
+                        .with_selected(self.workbench.periodic_kernel_selection());
+                        match action {
+                            crate::input::MouseAction::Zoom { direction } => {
+                                if let Some(selection) = scene.selection_at_pixel(
+                                    px,
+                                    py,
+                                    frame_size[0] as u32,
+                                    frame_size[1] as u32,
+                                ) {
+                                    let step = if event
+                                        .modifiers
+                                        .contains(crossterm::event::KeyModifiers::CONTROL)
+                                    {
+                                        0.5
+                                    } else if event
+                                        .modifiers
+                                        .contains(crossterm::event::KeyModifiers::SHIFT)
+                                    {
+                                        0.005
+                                    } else {
+                                        0.05
+                                    };
+                                    let direction = match direction {
+                                        crate::input::ZoomDirection::In => 1.0,
+                                        crate::input::ZoomDirection::Out => -1.0,
+                                    };
+                                    let current =
+                                        self.periodic_kernel_value(selection).unwrap_or(0.0);
+                                    let next = (current + step * direction).clamp(-1.0, 1.0);
+                                    if self
+                                        .set_periodic_kernel_value(selection, next)
+                                        .is_ok()
+                                    {
+                                        let _ = self.workbench.set_kernel_paint_value(next);
+                                        self.workbench_notice = Some(format!(
+                                            "offset [{},{}] · basis {} = {:.4} · E exact",
+                                            selection.offset[0],
+                                            selection.offset[1],
+                                            selection.source_basis.0,
+                                            next,
+                                        ));
+                                        return true;
+                                    }
+                                }
+                                let factor = match direction {
+                                    crate::input::ZoomDirection::In => 1.4,
+                                    crate::input::ZoomDirection::Out => 1.0 / 1.4,
+                                };
+                                scene.zoom_at(
+                                    px,
+                                    py,
+                                    frame_size[0] as u32,
+                                    frame_size[1] as u32,
+                                    factor,
+                                );
+                                self.workbench.set_kernel_view(scene.view);
+                                return true;
+                            }
+                            crate::input::MouseAction::Pan { dx, dy } => {
+                                scene.pan_pixels(
+                                    f64::from(dx) * frame_size[0] as f64
+                                        / f64::from(viewport.width.max(1)),
+                                    f64::from(dy) * frame_size[1] as f64
+                                        / f64::from(viewport.height.max(1)),
+                                    frame_size[0] as u32,
+                                    frame_size[1] as u32,
+                                );
+                                self.workbench.set_kernel_view(scene.view);
+                                return true;
+                            }
+                            _ => {}
+                        }
+                        let Some(selection) = scene.selection_at_pixel(
+                            px,
+                            py,
+                            frame_size[0] as u32,
+                            frame_size[1] as u32,
+                        ) else {
+                            return false;
+                        };
+                        match action {
+                            crate::input::MouseAction::Inspect => {
+                                self.workbench.select_periodic_kernel(selection);
+                                self.workbench_notice =
+                                    self.periodic_kernel_value(selection).map(|value| {
+                                        format!(
+                                            "selected offset [{},{}] · source basis {} = {:.6}",
+                                            selection.offset[0],
+                                            selection.offset[1],
+                                            selection.source_basis.0,
+                                            value,
+                                        )
+                                    });
+                                return true;
+                            }
+                            crate::input::MouseAction::Paint => {
+                                return self
+                                    .set_periodic_kernel_value(
+                                        selection,
+                                        self.workbench.kernel_paint_value(),
+                                    )
+                                    .is_ok();
+                            }
+                            crate::input::MouseAction::Erase => {
+                                return self.set_periodic_kernel_value(selection, 0.0).is_ok();
+                            }
+                            crate::input::MouseAction::Pan { .. }
+                            | crate::input::MouseAction::Zoom { .. } => unreachable!(),
+                        }
+                    }
                     let Some(kernel) = self.workbench.draft().kernels.first().cloned() else {
                         return false;
                     };

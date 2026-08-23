@@ -261,7 +261,24 @@ pub fn draw_workbench(
             );
         }
     } else if state.section() == WorkbenchSection::Kernels {
-        if let Some(kernel) = state.draft().kernels.first() {
+        if let (Some(tiling), Some(rule_kernel)) = (
+            state.draft().tiling.clone(),
+            state.selected_rule_kernel().cloned(),
+        ) && let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) =
+            rule_kernel.spatial
+        {
+            let scene = crate::workbench::kernel_editor::PeriodicKernelScene::new(
+                tiling,
+                definition,
+                state.selected_basis(),
+            )
+            .with_view(state.kernel_view())
+            .with_selected(state.periodic_kernel_selection());
+            let (width, height) = display.framebuffer_size(graphics_area);
+            let mut graphics = scene.render_rgba(width as u32, height as u32);
+            graphics.generation = scene_generation;
+            display.render_graphics(frame, graphics_area, &graphics);
+        } else if let Some(kernel) = state.draft().kernels.first() {
             let scene =
                 crate::workbench::kernel_editor::KernelScene::new(kernel.definition.clone())
                     .with_view(state.kernel_view())
@@ -352,7 +369,41 @@ pub fn draw_workbench(
                 lines.push(Line::from("V view · C color · X visible · F freeze"));
             }
             WorkbenchSection::Kernels => {
-                lines.push(Line::from("Canvas: click select · drag paint · right mask"));
+                if let Some(rule) = state
+                    .selected_rule_set()
+                    .and_then(|id| state.draft().rules.get(id))
+                {
+                    lines.push(Line::from(format!(
+                        "target: basis {} · channel {}",
+                        state.selected_basis().0,
+                        state.selected_channel().0,
+                    )));
+                    lines.push(Line::from(format!(
+                        "rule-set {} · {} · {} kernel(s)",
+                        rule.id.0,
+                        rule.shared_name.as_deref().unwrap_or("local/default"),
+                        rule.kernels.len(),
+                    )));
+                    if let Some(kernel) = state.selected_rule_kernel() {
+                        lines.push(Line::from(format!(
+                            "kernel {} `{}` · source channel {}",
+                            kernel.id.0, kernel.symbol, kernel.source_channel.0,
+                        )));
+                        if let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) =
+                            &kernel.spatial
+                        {
+                            lines.push(Line::from(format!(
+                                "stencil {}×{} · anchor {},{} · {} source basis plane(s)",
+                                definition.width,
+                                definition.height,
+                                definition.anchor_x,
+                                definition.anchor_y,
+                                definition.planes.len(),
+                            )));
+                        }
+                    }
+                }
+                lines.push(Line::from("Canvas: click polygon · drag paint · right zero"));
                 lines.push(Line::from("Cell wheel ±0.05 · Shift ±0.005 · Ctrl ±0.5"));
                 lines.push(Line::from("Empty wheel zoom · middle pan · E exact value"));
                 lines.push(Line::from("A add · Del remove"));
@@ -362,6 +413,12 @@ pub fn draw_workbench(
                 )));
                 if let Some(point) = state.kernel_selection() {
                     lines.push(Line::from(format!("selected cell: {}, {}", point.x, point.y)));
+                }
+                if let Some(selection) = state.periodic_kernel_selection() {
+                    lines.push(Line::from(format!(
+                        "selected: offset [{},{}] · source basis {}",
+                        selection.offset[0], selection.offset[1], selection.source_basis.0,
+                    )));
                 }
                 if let Some(editor) = state.numeric_editor() {
                     lines.push(Line::from(format!("{} = {}▌", editor.label(), editor.buffer())));

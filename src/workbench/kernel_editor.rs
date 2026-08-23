@@ -1,10 +1,21 @@
 use crate::render::workbench_graphics::{GraphicsFrame, GraphicsScene};
+use crate::sim::basis_kernel::PeriodicKernelDefinition;
 use crate::sim::kernel::{KernelDefinition, KernelValues};
+use crate::sim::tiling::{
+    BasisId, PeriodicTilingDraft, Vec2,
+    polygon::{prototype_vertices, transform_vertices},
+};
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct KernelPoint {
     pub x: usize,
     pub y: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct KernelSelection {
+    pub offset: [i16; 2],
+    pub source_basis: BasisId,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -326,10 +337,384 @@ impl GraphicsScene for KernelScene {
     }
 }
 
+#[derive(Clone, Debug)]
+pub struct PeriodicKernelScene {
+    pub tiling: PeriodicTilingDraft,
+    pub definition: PeriodicKernelDefinition,
+    pub target_basis: BasisId,
+    pub selected: Option<KernelSelection>,
+    pub view: KernelView,
+}
+
+impl PeriodicKernelScene {
+    pub fn new(
+        tiling: PeriodicTilingDraft,
+        definition: PeriodicKernelDefinition,
+        target_basis: BasisId,
+    ) -> Self {
+        Self {
+            tiling,
+            definition,
+            target_basis,
+            selected: None,
+            view: KernelView::default(),
+        }
+    }
+
+    pub fn with_view(mut self, view: KernelView) -> Self {
+        self.view = view;
+        self
+    }
+
+    pub fn with_selected(mut self, selected: Option<KernelSelection>) -> Self {
+        self.selected = selected;
+        self
+    }
+
+    pub fn selection_at_pixel(
+        &self,
+        px: u32,
+        py: u32,
+        width: u32,
+        height: u32,
+    ) -> Option<KernelSelection> {
+        let point = self.pixel_to_world(px, py, width, height);
+        self.cells()
+            .into_iter()
+            .rev()
+            .find_map(|(selection, polygon, _, _)| {
+                point_in_polygon(point, &polygon).then_some(selection)
+            })
+    }
+
+    pub fn pixel_for_selection(
+        &self,
+        selection: KernelSelection,
+        width: u32,
+        height: u32,
+    ) -> Option<(u32, u32)> {
+        let (_, polygon, _, _) = self
+            .cells()
+            .into_iter()
+            .find(|(candidate, _, _, _)| *candidate == selection)?;
+        let center = polygon.iter().fold(Vec2::ZERO, |sum, point| sum + *point)
+            * (1.0 / polygon.len() as f64);
+        let (x, y) = self.world_to_pixel(center, width, height);
+        (x >= 0 && y >= 0 && x < width as i32 && y < height as i32)
+            .then_some((x as u32, y as u32))
+    }
+
+    pub fn zoom_at(&mut self, px: u32, py: u32, width: u32, height: u32, factor: f64) {
+        let before = self.pixel_to_world(px, py, width, height);
+        self.view.zoom = (self.view.zoom * factor).clamp(1.0, 64.0);
+        let after = self.pixel_to_world(px, py, width, height);
+        let bounds = self.world_bounds();
+        let span = [
+            (bounds.1.x - bounds.0.x).max(1e-9),
+            (bounds.1.y - bounds.0.y).max(1e-9),
+        ];
+        self.view.center[0] += (before.x - after.x) / span[0];
+        self.view.center[1] += (before.y - after.y) / span[1];
+        self.clamp_view();
+    }
+
+    pub fn pan_pixels(&mut self, dx: f64, dy: f64, width: u32, height: u32) {
+        let bounds = self.world_bounds();
+        let scale = self.pixel_scale(width, height, bounds);
+        let span = [
+            (bounds.1.x - bounds.0.x).max(1e-9),
+            (bounds.1.y - bounds.0.y).max(1e-9),
+        ];
+        self.view.center[0] -= dx / scale / span[0];
+        self.view.center[1] -= dy / scale / span[1];
+        self.clamp_view();
+    }
+
+    fn clamp_view(&mut self) {
+        for center in &mut self.view.center {
+            *center = center.clamp(0.0, 1.0);
+        }
+    }
+
+    fn cells(&self) -> Vec<(KernelSelection, Vec<Vec2>, f32, bool)> {
+        let mut cells = Vec::new();
+        for y in 0..self.definition.height {
+            for x in 0..self.definition.width {
+                let offset = [
+                    x as i16 - self.definition.anchor_x as i16,
+                    y as i16 - self.definition.anchor_y as i16,
+                ];
+                let translation = self.tiling.translation_a * f64::from(offset[0])
+                    + self.tiling.translation_b * f64::from(offset[1]);
+                let index = y * self.definition.width + x;
+                for (source_basis, plane) in &self.definition.planes {
+                    let Some(polygon) = self.basis_polygon(*source_basis, translation) else {
+                        continue;
+                    };
+                    let active = plane.mask.as_ref().is_none_or(|mask| mask[index]);
+                    cells.push((
+                        KernelSelection {
+                            offset,
+                            source_basis: *source_basis,
+                        },
+                        polygon,
+                        plane.values[index],
+                        active,
+                    ));
+                }
+            }
+        }
+        cells
+    }
+
+    fn basis_polygon(&self, basis: BasisId, translation: Vec2) -> Option<Vec<Vec2>> {
+        let instance = self.tiling.instances.iter().find(|entry| entry.id == basis)?;
+        let prototype = self
+            .tiling
+            .prototypes
+            .iter()
+            .find(|entry| entry.id == instance.prototype)?;
+        let base = prototype_vertices(&prototype.shape).ok()?;
+        Some(
+            transform_vertices(&base, instance.transform)
+                .into_iter()
+                .map(|point| point + translation)
+                .collect(),
+        )
+    }
+
+    fn world_bounds(&self) -> (Vec2, Vec2) {
+        let mut minimum = Vec2::new(f64::INFINITY, f64::INFINITY);
+        let mut maximum = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+        for (_, polygon, _, _) in self.cells() {
+            for point in polygon {
+                minimum.x = minimum.x.min(point.x);
+                minimum.y = minimum.y.min(point.y);
+                maximum.x = maximum.x.max(point.x);
+                maximum.y = maximum.y.max(point.y);
+            }
+        }
+        if !minimum.x.is_finite() {
+            return (Vec2::new(-1.0, -1.0), Vec2::new(1.0, 1.0));
+        }
+        let margin = ((maximum.x - minimum.x).max(maximum.y - minimum.y) * 0.06).max(0.05);
+        (
+            Vec2::new(minimum.x - margin, minimum.y - margin),
+            Vec2::new(maximum.x + margin, maximum.y + margin),
+        )
+    }
+
+    fn pixel_scale(&self, width: u32, height: u32, bounds: (Vec2, Vec2)) -> f64 {
+        let span_x = (bounds.1.x - bounds.0.x).max(1e-9);
+        let span_y = (bounds.1.y - bounds.0.y).max(1e-9);
+        (f64::from(width.max(1)) / span_x)
+            .min(f64::from(height.max(1)) / span_y)
+            * self.view.zoom
+    }
+
+    fn view_center(&self, bounds: (Vec2, Vec2)) -> Vec2 {
+        Vec2::new(
+            bounds.0.x + self.view.center[0] * (bounds.1.x - bounds.0.x),
+            bounds.0.y + self.view.center[1] * (bounds.1.y - bounds.0.y),
+        )
+    }
+
+    fn world_to_pixel(&self, point: Vec2, width: u32, height: u32) -> (i32, i32) {
+        let bounds = self.world_bounds();
+        let center = self.view_center(bounds);
+        let scale = self.pixel_scale(width, height, bounds);
+        (
+            (f64::from(width) * 0.5 + (point.x - center.x) * scale).round() as i32,
+            (f64::from(height) * 0.5 + (point.y - center.y) * scale).round() as i32,
+        )
+    }
+
+    fn pixel_to_world(&self, px: u32, py: u32, width: u32, height: u32) -> Vec2 {
+        let bounds = self.world_bounds();
+        let center = self.view_center(bounds);
+        let scale = self.pixel_scale(width, height, bounds);
+        Vec2::new(
+            (f64::from(px) - f64::from(width) * 0.5) / scale + center.x,
+            (f64::from(py) - f64::from(height) * 0.5) / scale + center.y,
+        )
+    }
+}
+
+impl GraphicsScene for PeriodicKernelScene {
+    fn render_rgba(&self, width: u32, height: u32) -> GraphicsFrame {
+        let width = width.max(1);
+        let height = height.max(1);
+        let mut rgba = vec![0_u8; width as usize * height as usize * 4];
+        for pixel in rgba.chunks_exact_mut(4) {
+            pixel.copy_from_slice(&[8, 8, 8, 255]);
+        }
+        let cells = self.cells();
+        let mut magnitudes = cells
+            .iter()
+            .map(|(_, _, value, _)| value.abs())
+            .filter(|value| value.is_finite() && *value > f32::EPSILON)
+            .collect::<Vec<_>>();
+        magnitudes.sort_by(f32::total_cmp);
+        let scale = magnitudes
+            .get(magnitudes.len().saturating_sub(1) * 9 / 10)
+            .copied()
+            .unwrap_or(1.0)
+            .max(f32::EPSILON);
+        for (selection, polygon, value, active) in cells {
+            let intensity = ((value.abs() / scale).min(1.0) * 230.0).round() as u8;
+            let color = if !active {
+                [26, 26, 30, 255]
+            } else if value > 0.0 {
+                [12, intensity, intensity, 255]
+            } else if value < 0.0 {
+                [intensity, 24, 12, 255]
+            } else {
+                [8, 8, 8, 255]
+            };
+            draw_world_polygon(&mut rgba, width, height, self, &polygon, color);
+            let edge = if self.selected == Some(selection) {
+                [255, 255, 255, 255]
+            } else if selection.offset == [0, 0] && selection.source_basis == self.target_basis {
+                [255, 220, 105, 255]
+            } else {
+                [70, 100, 135, 255]
+            };
+            draw_world_outline(&mut rgba, width, height, self, &polygon, edge);
+        }
+        GraphicsFrame::new(width, height, rgba, 0).expect("valid periodic kernel frame")
+    }
+}
+
+fn point_in_polygon(point: Vec2, polygon: &[Vec2]) -> bool {
+    let mut inside = false;
+    for index in 0..polygon.len() {
+        let a = polygon[index];
+        let b = polygon[(index + 1) % polygon.len()];
+        if (a.y > point.y) != (b.y > point.y)
+            && point.x < (b.x - a.x) * (point.y - a.y) / (b.y - a.y) + a.x
+        {
+            inside = !inside;
+        }
+    }
+    inside
+}
+
+fn draw_world_polygon(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    scene: &PeriodicKernelScene,
+    polygon: &[Vec2],
+    color: [u8; 4],
+) {
+    let points = polygon
+        .iter()
+        .map(|point| scene.world_to_pixel(*point, width, height))
+        .collect::<Vec<_>>();
+    let minimum_y = points.iter().map(|point| point.1).min().unwrap_or(0).max(0);
+    let maximum_y = points
+        .iter()
+        .map(|point| point.1)
+        .max()
+        .unwrap_or(-1)
+        .min(height as i32 - 1);
+    for y in minimum_y..=maximum_y {
+        let scan_y = f64::from(y) + 0.5;
+        let mut intersections = Vec::with_capacity(points.len());
+        for index in 0..points.len() {
+            let (x0, y0) = points[index];
+            let (x1, y1) = points[(index + 1) % points.len()];
+            let (y0, y1) = (f64::from(y0), f64::from(y1));
+            if (y0 <= scan_y && scan_y < y1) || (y1 <= scan_y && scan_y < y0) {
+                let ratio = (scan_y - y0) / (y1 - y0);
+                intersections.push(f64::from(x0) + ratio * f64::from(x1 - x0));
+            }
+        }
+        intersections.sort_by(f64::total_cmp);
+        for pair in intersections.chunks_exact(2) {
+            let start = pair[0].ceil().max(0.0) as i32;
+            let end = pair[1].floor().min(f64::from(width.saturating_sub(1))) as i32;
+            for x in start..=end {
+                set_pixel(rgba, width, height, x, y, color);
+            }
+        }
+    }
+}
+
+fn draw_world_outline(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    scene: &PeriodicKernelScene,
+    polygon: &[Vec2],
+    color: [u8; 4],
+) {
+    for index in 0..polygon.len() {
+        draw_pixel_line(
+            rgba,
+            width,
+            height,
+            scene.world_to_pixel(polygon[index], width, height),
+            scene.world_to_pixel(polygon[(index + 1) % polygon.len()], width, height),
+            color,
+        );
+    }
+}
+
+fn draw_pixel_line(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    start: (i32, i32),
+    end: (i32, i32),
+    color: [u8; 4],
+) {
+    let mut x = start.0;
+    let mut y = start.1;
+    let dx = (end.0 - x).abs();
+    let sx = if x < end.0 { 1 } else { -1 };
+    let dy = -(end.1 - y).abs();
+    let sy = if y < end.1 { 1 } else { -1 };
+    let mut error = dx + dy;
+    let limit = width.saturating_add(height).saturating_mul(4).max(1);
+    for _ in 0..limit {
+        set_pixel(rgba, width, height, x, y, color);
+        if x == end.0 && y == end.1 {
+            break;
+        }
+        let twice = error * 2;
+        if twice >= dy {
+            error += dy;
+            x += sx;
+        }
+        if twice <= dx {
+            error += dx;
+            y += sy;
+        }
+    }
+}
+
+fn set_pixel(
+    rgba: &mut [u8],
+    width: u32,
+    height: u32,
+    x: i32,
+    y: i32,
+    color: [u8; 4],
+) {
+    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+        return;
+    }
+    let index = (y as usize * width as usize + x as usize) * 4;
+    rgba[index..index + 4].copy_from_slice(&color);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sim::basis_kernel::{BasisWeightPlane, PeriodicKernelDefinition};
     use crate::sim::kernel::{render_definition, ring_definition};
+    use crate::sim::tiling::{BasisId, TilingPreset, build_preset};
 
     #[test]
     fn pixel_mapping_and_value_edit_work() {
@@ -514,5 +899,72 @@ mod tests {
             clearly_visible > 10_000,
             "an edited outlier must not flatten the whole preview; visible={clearly_visible}"
         );
+    }
+
+    #[test]
+    fn periodic_heatmap_uses_actual_basis_polygons_and_round_trips_hits() {
+        let tiling = build_preset(TilingPreset::OctagonSquare, 1.0);
+        let definition = PeriodicKernelDefinition {
+            width: 1,
+            height: 1,
+            anchor_x: 0,
+            anchor_y: 0,
+            planes: [
+                (
+                    BasisId(0),
+                    BasisWeightPlane {
+                        values: vec![0.75],
+                        mask: None,
+                    },
+                ),
+                (
+                    BasisId(1),
+                    BasisWeightPlane {
+                        values: vec![-0.5],
+                        mask: None,
+                    },
+                ),
+            ]
+            .into(),
+        };
+        let scene = PeriodicKernelScene::new(tiling, definition, BasisId(0));
+        let frame = scene.render_rgba(640, 480);
+
+        assert!(frame.rgba.chunks_exact(4).any(|pixel| pixel[1] > 120 && pixel[2] > 120));
+        assert!(frame.rgba.chunks_exact(4).any(|pixel| pixel[0] > 120 && pixel[1] < 100));
+        for source_basis in [BasisId(0), BasisId(1)] {
+            let selection = KernelSelection {
+                offset: [0, 0],
+                source_basis,
+            };
+            let (x, y) = scene
+                .pixel_for_selection(selection, 640, 480)
+                .expect("basis polygon must be visible");
+            assert_eq!(
+                scene.selection_at_pixel(x, y, 640, 480),
+                Some(selection),
+                "rendered basis polygon and mouse hit-test must share geometry",
+            );
+        }
+    }
+
+    #[test]
+    fn periodic_selection_addresses_lattice_offset_and_source_basis() {
+        let tiling = build_preset(TilingPreset::RegularHexagon, 1.0);
+        let mut definition = PeriodicKernelDefinition::identity(BasisId(0));
+        definition.width = 3;
+        definition.height = 3;
+        definition.anchor_x = 1;
+        definition.anchor_y = 1;
+        definition.planes.get_mut(&BasisId(0)).unwrap().values = vec![0.0; 9];
+        let scene = PeriodicKernelScene::new(tiling, definition, BasisId(0));
+        let selection = KernelSelection {
+            offset: [1, -1],
+            source_basis: BasisId(0),
+        };
+        let (x, y) = scene
+            .pixel_for_selection(selection, 720, 540)
+            .expect("non-central lattice cell must be reachable");
+        assert_eq!(scene.selection_at_pixel(x, y, 720, 540), Some(selection));
     }
 }
