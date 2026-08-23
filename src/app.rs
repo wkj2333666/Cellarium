@@ -301,13 +301,58 @@ impl App {
         }
         if layout.canvas.contains(point) {
             self.workbench.set_focus(WorkbenchFocus::Canvas);
+            let canvas_content = Rect::new(
+                layout.canvas.x.saturating_add(1),
+                layout.canvas.y.saturating_add(1),
+                layout.canvas.width.saturating_sub(2),
+                layout.canvas.height.saturating_sub(2),
+            );
+            let canvas_header = Rect::new(
+                canvas_content.x,
+                canvas_content.y,
+                canvas_content.width,
+                canvas_content.height.min(2),
+            );
+            if left_down && canvas_header.contains(point) {
+                let column = point.x.saturating_sub(canvas_header.x);
+                if let Some(action) =
+                    crate::tui::workbench::toolbar_action_at(&self.workbench, column)
+                {
+                    match action {
+                        crate::tui::workbench::ToolbarAction::Ui(command) => {
+                            if let Err(error) = self.handle_workbench_ui(command) {
+                                self.workbench_notice = Some(error);
+                            }
+                        }
+                        crate::tui::workbench::ToolbarAction::EditorKey(code) => {
+                            if !self.handle_workbench_editor_key(KeyEvent::new(
+                                code,
+                                crossterm::event::KeyModifiers::NONE,
+                            )) {
+                                self.workbench_notice =
+                                    Some("select an editable item on the canvas first".into());
+                            }
+                            self.workbench_draft_scene_generation =
+                                self.workbench_draft_scene_generation.wrapping_add(1);
+                        }
+                        crate::tui::workbench::ToolbarAction::ToggleGrowthEditor => {
+                            if self.workbench.growth_editing() {
+                                self.workbench.stop_growth_editing();
+                                self.workbench_notice =
+                                    Some("Growth source editing finished".into());
+                            } else {
+                                self.workbench.toggle_growth_editing();
+                                self.workbench_notice =
+                                    Some("Growth source editing · click/type · Esc finish".into());
+                            }
+                            self.workbench_draft_scene_generation =
+                                self.workbench_draft_scene_generation.wrapping_add(1);
+                        }
+                    }
+                    return true;
+                }
+            }
             if self.workbench.section() == WorkbenchSection::Growth {
-                let canvas_content = Rect::new(
-                    layout.canvas.x.saturating_add(1),
-                    layout.canvas.y.saturating_add(1),
-                    layout.canvas.width.saturating_sub(2),
-                    layout.canvas.height.saturating_sub(2),
-                );
                 let body = Rect::new(
                     canvas_content.x,
                     canvas_content
@@ -700,6 +745,85 @@ impl App {
             self.workbench_draft_scene_generation =
                 self.workbench_draft_scene_generation.wrapping_add(1);
             return true;
+        }
+        if self.workbench.section() == WorkbenchSection::Kernels
+            && matches!(
+                key.code,
+                KeyCode::Left | KeyCode::Right | KeyCode::Up | KeyCode::Down
+            )
+        {
+            let (dx, dy) = match key.code {
+                KeyCode::Left => (-1_i32, 0_i32),
+                KeyCode::Right => (1, 0),
+                KeyCode::Up => (0, -1),
+                KeyCode::Down => (0, 1),
+                _ => unreachable!(),
+            };
+            if let Some(kernel) = self.workbench.selected_rule_kernel()
+                && let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) =
+                    &kernel.spatial
+            {
+                let source_basis = self
+                    .workbench
+                    .periodic_kernel_selection()
+                    .map(|selection| selection.source_basis)
+                    .or_else(|| definition.planes.keys().next().copied())
+                    .unwrap_or(self.workbench.selected_basis());
+                let current = self.workbench.periodic_kernel_selection().map_or(
+                    crate::workbench::kernel_editor::KernelSelection {
+                        offset: [0, 0],
+                        source_basis,
+                    },
+                    |selection| selection,
+                );
+                let min_x = -(definition.anchor_x as i32);
+                let max_x = definition.width.saturating_sub(definition.anchor_x + 1) as i32;
+                let min_y = -(definition.anchor_y as i32);
+                let max_y = definition.height.saturating_sub(definition.anchor_y + 1) as i32;
+                let selection = crate::workbench::kernel_editor::KernelSelection {
+                    offset: [
+                        (i32::from(current.offset[0]) + dx).clamp(min_x, max_x) as i16,
+                        (i32::from(current.offset[1]) + dy).clamp(min_y, max_y) as i16,
+                    ],
+                    source_basis,
+                };
+                self.workbench.select_periodic_kernel(selection);
+                self.workbench_notice = self.periodic_kernel_value(selection).map(|value| {
+                    format!(
+                        "selected offset [{},{}] · source basis {} = {:.6} · E exact",
+                        selection.offset[0], selection.offset[1], selection.source_basis.0, value,
+                    )
+                });
+                self.workbench_draft_scene_generation =
+                    self.workbench_draft_scene_generation.wrapping_add(1);
+                return true;
+            }
+            if let Some(kernel) = self.workbench.draft().kernels.first() {
+                let current = self.workbench.kernel_selection().unwrap_or(
+                    crate::workbench::kernel_editor::KernelPoint {
+                        x: kernel.definition.anchor_x,
+                        y: kernel.definition.anchor_y,
+                    },
+                );
+                let point = crate::workbench::kernel_editor::KernelPoint {
+                    x: (current.x as i32 + dx)
+                        .clamp(0, kernel.definition.width.saturating_sub(1) as i32)
+                        as usize,
+                    y: (current.y as i32 + dy)
+                        .clamp(0, kernel.definition.height.saturating_sub(1) as i32)
+                        as usize,
+                };
+                self.workbench.select_kernel_point(point);
+                self.workbench_notice = self.kernel_cell_value(point).map(|value| {
+                    format!(
+                        "selected cell {},{} = {value:.6} · E exact",
+                        point.x, point.y
+                    )
+                });
+                self.workbench_draft_scene_generation =
+                    self.workbench_draft_scene_generation.wrapping_add(1);
+                return true;
+            }
         }
         if self.workbench.section() == WorkbenchSection::Kernels
             && matches!(key.code, KeyCode::Enter | KeyCode::Char('e'))
@@ -1676,6 +1800,10 @@ impl App {
                         value,
                     })
                     .is_ok();
+                if applied {
+                    self.workbench_draft_scene_generation =
+                        self.workbench_draft_scene_generation.wrapping_add(1);
+                }
                 if applied && std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
                     eprintln!("E2E_WORKBENCH_DRAFT=Dirty");
                 }
@@ -1694,11 +1822,24 @@ impl App {
             .min(frame_size[1].saturating_sub(1) as u32);
             match self.workbench.section() {
                 crate::workbench::WorkbenchSection::Tiling => {
-                    let Some(tiling) = self.workbench.draft().tiling.clone() else {
-                        return false;
-                    };
-                    let mut scene = crate::workbench::tiling_editor::TilingScene::new(tiling)
-                        .with_selection(self.workbench.tiling_prototype())
+                    let mut scene = self
+                        .workbench
+                        .draft()
+                        .tiling
+                        .clone()
+                        .map(crate::workbench::tiling_editor::TilingScene::new)
+                        .unwrap_or_else(|| {
+                            crate::workbench::tiling_editor::TilingScene::empty(
+                                self.workbench.tiling_camera(),
+                            )
+                        })
+                        .with_selected_basis(self.workbench.selected_basis())
+                        .with_camera(self.workbench.tiling_camera())
+                        .with_selected_vertex(
+                            self.workbench
+                                .tiling_selected_vertex()
+                                .map(|(_, vertex)| vertex),
+                        )
                         .with_construction(self.workbench.tiling_construction().to_vec());
                     if self.workbench.tiling_tool()
                         == crate::workbench::tiling_editor::TilingTool::DrawPolygon
@@ -1762,6 +1903,7 @@ impl App {
                                     vertex,
                                 },
                             );
+                            self.workbench.select_tiling_vertex(prototype, vertex);
                             self.workbench_notice = Some(format!(
                                 "selected basis {} · vertex {} · drag to move",
                                 self.workbench.selected_basis().0,
@@ -1778,6 +1920,7 @@ impl App {
                             frame_size[1] as u32,
                         ) && self.workbench.set_selected_basis(basis).is_ok()
                         {
+                            self.workbench.clear_tiling_vertex();
                             self.workbench_notice = Some(format!(
                                 "selected basis {} · Kernels/Growth now target it",
                                 basis.0,
@@ -1787,10 +1930,52 @@ impl App {
                             return true;
                         }
                     }
+                    match action {
+                        crate::input::MouseAction::Pan { dx, dy } => {
+                            scene.pan_pixels(
+                                f64::from(dx) * frame_size[0] as f64
+                                    / f64::from(viewport.width.max(1)),
+                                f64::from(dy) * frame_size[1] as f64
+                                    / f64::from(viewport.height.max(1)),
+                            );
+                            self.workbench.set_tiling_camera(scene.camera);
+                            self.workbench_draft_scene_generation =
+                                self.workbench_draft_scene_generation.wrapping_add(1);
+                            return true;
+                        }
+                        crate::input::MouseAction::Zoom { direction } => {
+                            let factor = match direction {
+                                crate::input::ZoomDirection::In => 1.4,
+                                crate::input::ZoomDirection::Out => 1.0 / 1.4,
+                            };
+                            scene.zoom_at(
+                                px,
+                                py,
+                                frame_size[0] as u32,
+                                frame_size[1] as u32,
+                                factor,
+                            );
+                            self.workbench.set_tiling_camera(scene.camera);
+                            self.workbench_draft_scene_generation =
+                                self.workbench_draft_scene_generation.wrapping_add(1);
+                            return true;
+                        }
+                        _ => {}
+                    }
                     let applied = match action {
                         crate::input::MouseAction::Inspect => false,
-                        crate::input::MouseAction::Paint => scene
-                            .hit_test_vertex(px, py, frame_size[0] as u32, frame_size[1] as u32, 12)
+                        crate::input::MouseAction::Paint => self
+                            .workbench
+                            .tiling_selected_vertex()
+                            .or_else(|| {
+                                scene.hit_test_vertex(
+                                    px,
+                                    py,
+                                    frame_size[0] as u32,
+                                    frame_size[1] as u32,
+                                    12,
+                                )
+                            })
                             .map(|(prototype, vertex)| {
                                 let to = scene.pixel_to_world(px, py, frame_size[0] as u32, frame_size[1] as u32);
                                 scene.apply_gesture(crate::workbench::tiling_editor::TilingGesture::MoveVertex { prototype, vertex, to }).is_ok()
@@ -1801,12 +1986,14 @@ impl App {
                             .map(|(prototype, vertex)| scene.apply_gesture(crate::workbench::tiling_editor::TilingGesture::RemoveVertex { prototype, vertex }).is_ok())
                             .unwrap_or(false),
                         crate::input::MouseAction::Pan { .. }
-                        | crate::input::MouseAction::Zoom { .. } => false,
+                        | crate::input::MouseAction::Zoom { .. } => unreachable!(),
                     };
                     if applied && scene.draft != *self.workbench.draft().tiling.as_ref().unwrap() {
                         let mut draft = self.workbench.draft().clone();
                         draft.tiling = Some(scene.draft);
                         let _ = self.workbench.import_draft(draft);
+                        self.workbench_draft_scene_generation =
+                            self.workbench_draft_scene_generation.wrapping_add(1);
                     }
                     return applied;
                 }
@@ -3029,6 +3216,9 @@ fn handle_remote_terminal_event<W: std::io::Write>(
     use crate::remote::{ExpressionKey, InputMessage};
     match event {
         Event::Key(key) => {
+            if !is_actionable_key_event(&key) {
+                return Ok(false);
+            }
             if app.handle_workbench_editor_key(key) {
                 return Ok(false);
             }
@@ -3156,6 +3346,10 @@ fn send_remote_input<W: std::io::Write>(
     .map_err(std::io::Error::other)?;
     *next_sequence = sequence.wrapping_add(1).max(1);
     Ok(sequence)
+}
+
+fn is_actionable_key_event(key: &KeyEvent) -> bool {
+    key.kind != crossterm::event::KeyEventKind::Release
 }
 
 fn run_app_with_save(app: App, save_path: Option<&Path>) -> std::io::Result<()> {
@@ -3450,6 +3644,9 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
         for event in events {
             match event {
                 Event::Key(key) => {
+                    if !is_actionable_key_event(&key) {
+                        continue;
+                    }
                     input_seen = true;
                     if app.handle_workbench_editor_key(key) {
                         continue;
@@ -3651,6 +3848,23 @@ pub fn rule_name(spec: &SimulationSpec) -> &'static str {
 mod tests {
     use super::*;
     use crate::sim::kernel::{KernelValues, Normalization};
+
+    #[test]
+    fn key_release_is_not_actionable_terminal_input() {
+        let release = KeyEvent::new_with_kind(
+            KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Release,
+        );
+        let press = KeyEvent::new_with_kind(
+            KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+            crossterm::event::KeyEventKind::Press,
+        );
+
+        assert!(!is_actionable_key_event(&release));
+        assert!(is_actionable_key_event(&press));
+    }
 
     #[test]
     fn async_terminal_backend_forwards_clear_to_the_terminal_writer() {
@@ -4310,6 +4524,74 @@ mod tests {
     }
 
     #[test]
+    fn workbench_world_paint_invalidates_the_graphics_scene() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.set_viewport(ratatui::layout::Rect::new(2, 2, 20, 10), [160, 160]);
+        let before = app.workbench_draft_scene_generation;
+        let mut tracker = crate::input::MouseTracker::new();
+        let event = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 8,
+            row: 5,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        assert!(app.handle_mouse(event, &mut tracker));
+        assert_ne!(app.workbench_draft_scene_generation, before);
+    }
+
+    #[test]
+    fn workbench_toolbar_click_executes_the_visible_channel_add_action() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Channels);
+        app.set_workbench_area(ratatui::layout::Rect::new(0, 0, 160, 40));
+        let layout =
+            crate::tui::workbench::workbench_layout(ratatui::layout::Rect::new(0, 0, 160, 40));
+        let before = app.workbench().draft().channels.len();
+        let click = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: layout.canvas.x + 3,
+            row: layout.canvas.y + 1,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        assert!(app.handle_workbench_panel_mouse(click));
+        assert_eq!(app.workbench().draft().channels.len(), before + 1);
+    }
+
+    #[test]
+    fn kernel_arrows_select_cells_and_exact_typing_replaces_the_old_value() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Kernels);
+        let anchor = app.workbench().draft().kernels[0].definition.anchor_x;
+
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Right,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        let point = app.workbench().kernel_selection().unwrap();
+        assert_eq!(point.x, anchor + 1);
+        assert_eq!(
+            point.y,
+            app.workbench().draft().kernels[0].definition.anchor_y
+        );
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('e'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('-'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert_eq!(app.workbench().numeric_editor().unwrap().buffer(), "-");
+    }
+
+    #[test]
     fn mouse_events_outside_the_viewport_are_rejected_before_clamping() {
         let mut app = App::new(SimulationSpec::conway(), 32, 16);
         app.set_viewport(ratatui::layout::Rect::new(2, 1, 10, 10), [20, 20]);
@@ -4374,10 +4656,17 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_tiling_pan_does_not_dirty_the_draft() {
+    fn tiling_pan_changes_its_camera_without_dirtying_the_draft() {
         let section = crate::workbench::WorkbenchSection::Tiling;
         let mut app = App::new(SimulationSpec::conway(), 32, 16);
         app.enter_workbench();
+        let mut draft = app.workbench().draft().clone();
+        draft.tiling = Some(crate::sim::tiling::build_preset(
+            crate::sim::tiling::TilingPreset::Square,
+            1.0,
+        ));
+        app.workbench_mut().import_draft(draft).unwrap();
+        let status_before = app.workbench().status();
         app.workbench_mut().select_section(section);
         app.set_viewport(ratatui::layout::Rect::new(24, 1, 60, 32), [480, 512]);
         let mut tracker = crate::input::MouseTracker::new();
@@ -4394,11 +4683,13 @@ mod tests {
             modifiers: crossterm::event::KeyModifiers::NONE,
         };
 
+        let before = app.workbench().tiling_camera();
         app.handle_mouse(down, &mut tracker);
-        assert!(!app.handle_mouse(drag, &mut tracker));
+        assert!(app.handle_mouse(drag, &mut tracker));
+        assert_ne!(app.workbench().tiling_camera(), before);
         assert_eq!(
             app.workbench().status(),
-            crate::workbench::DraftStatus::Clean,
+            status_before,
             "{section:?} pan must not create a fake edit"
         );
     }

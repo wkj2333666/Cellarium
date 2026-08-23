@@ -51,9 +51,103 @@ pub enum TilingGesture {
     FinishPolygon,
 }
 
+/// Infer a two-vector translation lattice for one edge-to-edge translational
+/// polygon. Candidate translations come only from oppositely directed equal
+/// boundary edges; the authoritative torus validator decides whether a
+/// candidate pair actually covers exactly once.
+pub fn infer_translation_lattice(vertices: &[Vec2]) -> Result<(Vec2, Vec2), String> {
+    if let Some(issue) = validate_polygon(vertices).into_iter().next() {
+        return Err(issue.message);
+    }
+    let scale = vertices
+        .iter()
+        .zip(vertices.iter().cycle().skip(1))
+        .take(vertices.len())
+        .map(|(start, end)| (*end - *start).length())
+        .fold(0.0_f64, f64::max)
+        .max(1.0);
+    let tolerance = scale * 1e-8;
+    let mut candidates = Vec::new();
+    for first in 0..vertices.len() {
+        let first_edge = vertices[(first + 1) % vertices.len()] - vertices[first];
+        for second in first + 1..vertices.len() {
+            let second_edge = vertices[(second + 1) % vertices.len()] - vertices[second];
+            if (first_edge + second_edge).length() > tolerance {
+                continue;
+            }
+            let translation = vertices[first] - vertices[(second + 1) % vertices.len()];
+            if translation.length() <= tolerance {
+                continue;
+            }
+            for candidate in [translation, translation * -1.0] {
+                if !candidates
+                    .iter()
+                    .any(|existing: &Vec2| (*existing - candidate).length() <= tolerance)
+                {
+                    candidates.push(candidate);
+                }
+            }
+        }
+    }
+    let area = vertices
+        .iter()
+        .zip(vertices.iter().cycle().skip(1))
+        .take(vertices.len())
+        .map(|(start, end)| start.cross(*end))
+        .sum::<f64>()
+        .abs()
+        * 0.5;
+    let area_tolerance = (area * 1e-7).max(tolerance * tolerance);
+    let mut validation_attempts = 0usize;
+    for left in 0..candidates.len() {
+        for right in left + 1..candidates.len() {
+            let mut a = candidates[left];
+            let mut b = candidates[right];
+            let determinant = a.cross(b);
+            if determinant.abs() <= area_tolerance
+                || (determinant.abs() - area).abs() > area_tolerance
+            {
+                continue;
+            }
+            validation_attempts += 1;
+            if validation_attempts > 128 {
+                return Err("lattice inference exceeded its candidate budget".into());
+            }
+            if determinant < 0.0 {
+                std::mem::swap(&mut a, &mut b);
+            }
+            let draft = PeriodicTilingDraft {
+                translation_a: a,
+                translation_b: b,
+                prototypes: vec![crate::sim::tiling::TilePrototype {
+                    id: PrototypeId(0),
+                    name: "inferred".into(),
+                    shape: PrototypeShape::SimplePolygon {
+                        vertices: vertices.to_vec(),
+                    },
+                }],
+                instances: vec![crate::sim::tiling::TileInstance {
+                    id: crate::sim::tiling::BasisId(0),
+                    prototype: PrototypeId(0),
+                    transform: crate::sim::tiling::RigidTransform::default(),
+                }],
+                mode: crate::sim::tiling::TilingMode::Topological,
+            };
+            if crate::sim::tiling::validate_coverage(&draft).is_ok() {
+                return Ok((a, b));
+            }
+        }
+    }
+    Err(
+        "could not infer an exact translation lattice; choose a preset or add/edit the periodic patch"
+            .into(),
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct TilingScene {
     pub draft: PeriodicTilingDraft,
+    pub selected_basis: Option<crate::sim::tiling::BasisId>,
     pub selected_prototype: Option<PrototypeId>,
     pub selected_vertex: Option<usize>,
     pub camera: TilingCamera,
@@ -61,8 +155,20 @@ pub struct TilingScene {
 }
 
 impl TilingScene {
+    pub fn empty(camera: TilingCamera) -> Self {
+        Self::new(PeriodicTilingDraft {
+            translation_a: Vec2::new(1.0, 0.0),
+            translation_b: Vec2::new(0.0, 1.0),
+            prototypes: Vec::new(),
+            instances: Vec::new(),
+            mode: crate::sim::tiling::TilingMode::Topological,
+        })
+        .with_camera(camera)
+    }
+
     pub fn new(draft: PeriodicTilingDraft) -> Self {
         Self {
+            selected_basis: draft.instances.first().map(|instance| instance.id),
             selected_prototype: draft.prototypes.first().map(|prototype| prototype.id),
             draft,
             selected_vertex: None,
@@ -73,6 +179,34 @@ impl TilingScene {
 
     pub fn with_selection(mut self, selected: Option<PrototypeId>) -> Self {
         self.selected_prototype = selected;
+        self.selected_basis = selected.and_then(|prototype| {
+            self.draft
+                .instances
+                .iter()
+                .find(|instance| instance.prototype == prototype)
+                .map(|instance| instance.id)
+        });
+        self
+    }
+
+    pub fn with_selected_basis(mut self, selected: crate::sim::tiling::BasisId) -> Self {
+        self.selected_basis = Some(selected);
+        self.selected_prototype = self
+            .draft
+            .instances
+            .iter()
+            .find(|instance| instance.id == selected)
+            .map(|instance| instance.prototype);
+        self
+    }
+
+    pub fn with_camera(mut self, camera: TilingCamera) -> Self {
+        self.camera = camera;
+        self
+    }
+
+    pub fn with_selected_vertex(mut self, selected: Option<usize>) -> Self {
+        self.selected_vertex = selected;
         self
     }
 
@@ -94,6 +228,63 @@ impl TilingScene {
             (f64::from(x) - f64::from(width) * 0.5) / self.camera.scale + self.camera.center.x,
             (f64::from(y) - f64::from(height) * 0.5) / self.camera.scale + self.camera.center.y,
         )
+    }
+
+    pub fn zoom_at(&mut self, x: u32, y: u32, width: u32, height: u32, factor: f64) {
+        let before = self.pixel_to_world(x, y, width, height);
+        self.camera.scale = (self.camera.scale * factor).clamp(4.0, 2048.0);
+        let after = self.pixel_to_world(x, y, width, height);
+        self.camera.center = self.camera.center + before - after;
+    }
+
+    pub fn pan_pixels(&mut self, dx: f64, dy: f64) {
+        self.camera.center =
+            self.camera.center - Vec2::new(dx / self.camera.scale, dy / self.camera.scale);
+    }
+
+    fn instance_polygon(&self, basis: crate::sim::tiling::BasisId) -> Option<Vec<Vec2>> {
+        let instance = self
+            .draft
+            .instances
+            .iter()
+            .find(|instance| instance.id == basis)?;
+        let prototype = self
+            .draft
+            .prototypes
+            .iter()
+            .find(|prototype| prototype.id == instance.prototype)?;
+        let base = prototype_vertices(&prototype.shape).ok()?;
+        Some(transform_vertices(&base, instance.transform))
+    }
+
+    fn neighbor_polygons(&self) -> Vec<(crate::sim::tiling::BasisId, [i32; 2], Vec<Vec2>)> {
+        let Some(selected) = self.selected_basis else {
+            return Vec::new();
+        };
+        let Ok(report) = crate::sim::tiling::validate_coverage(&self.draft) else {
+            return Vec::new();
+        };
+        let mut seen = std::collections::BTreeSet::new();
+        report
+            .neighbor_ring
+            .get(&selected)
+            .into_iter()
+            .flatten()
+            .filter_map(|neighbor| {
+                let key = (neighbor.target_basis, neighbor.lattice_offset);
+                if !seen.insert(key) {
+                    return None;
+                }
+                let shift = self.draft.translation_a * f64::from(neighbor.lattice_offset[0])
+                    + self.draft.translation_b * f64::from(neighbor.lattice_offset[1]);
+                let polygon = self
+                    .instance_polygon(neighbor.target_basis)?
+                    .into_iter()
+                    .map(|point| point + shift)
+                    .collect();
+                Some((neighbor.target_basis, neighbor.lattice_offset, polygon))
+            })
+            .collect()
     }
 
     pub fn hit_test_vertex(
@@ -292,77 +483,68 @@ impl GraphicsScene for TilingScene {
         for pixel in rgba.as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(&[5, 10, 24, 255]);
         }
-        let mut selected_handles = None;
-        let mut canonical = Vec::new();
-        for instance in &self.draft.instances {
-            let Some(prototype) = self
-                .draft
-                .prototypes
-                .iter()
-                .find(|prototype| prototype.id == instance.prototype)
-            else {
-                continue;
-            };
-            let Ok(base) = prototype_vertices(&prototype.shape) else {
-                continue;
-            };
-            canonical.push((prototype.id, transform_vertices(&base, instance.transform)));
-        }
-
-        // The editor intentionally shows one strong canonical cell and only
-        // its immediate translated neighbours. Translation vectors may be
-        // oblique, so hexagonal and mixed octagon/square tilings retain their
-        // true geometry instead of being forced into an axis-aligned grid.
-        for lattice_a in -1..=1 {
-            for lattice_b in -1..=1 {
-                if lattice_a == 0 && lattice_b == 0 {
+        let neighbors = self.neighbor_polygons();
+        if neighbors.is_empty() && crate::sim::tiling::validate_coverage(&self.draft).is_err() {
+            for instance in &self.draft.instances {
+                if Some(instance.id) == self.selected_basis {
                     continue;
                 }
-                let translation = self.draft.translation_a * f64::from(lattice_a)
-                    + self.draft.translation_b * f64::from(lattice_b);
-                for (_, polygon) in &canonical {
-                    let ghost = polygon
-                        .iter()
-                        .map(|vertex| *vertex + translation)
-                        .collect::<Vec<_>>();
-                    draw_filled_polygon(&mut rgba, width, height, self, &ghost, [28, 66, 108, 72]);
-                    draw_polygon(&mut rgba, width, height, self, &ghost, [90, 145, 205, 130]);
+                if let Some(polygon) = self.instance_polygon(instance.id) {
+                    draw_filled_polygon(&mut rgba, width, height, self, &polygon, [70, 35, 55, 90]);
+                    draw_polygon(
+                        &mut rgba,
+                        width,
+                        height,
+                        self,
+                        &polygon,
+                        [210, 95, 125, 190],
+                    );
                 }
             }
         }
-        for (prototype_id, polygon) in canonical {
-            let selected = self.selected_prototype == Some(prototype_id);
-            let valid = validate_polygon(&polygon).is_empty();
-            let (fill, edge) = if !valid {
-                ([120, 20, 35, 120], [255, 70, 80, 255])
-            } else if selected {
+        for (_, _, polygon) in neighbors {
+            draw_filled_polygon(&mut rgba, width, height, self, &polygon, [28, 66, 108, 72]);
+            draw_polygon(
+                &mut rgba,
+                width,
+                height,
+                self,
+                &polygon,
+                [90, 145, 205, 130],
+            );
+        }
+        let selected_handles = self
+            .selected_basis
+            .and_then(|basis| self.instance_polygon(basis));
+        if let Some(polygon) = &selected_handles {
+            let valid = validate_polygon(polygon).is_empty();
+            let (fill, edge) = if valid {
                 ([150, 116, 28, 150], [255, 238, 170, 255])
             } else {
-                ([24, 92, 156, 130], [100, 190, 255, 245])
+                ([120, 20, 35, 120], [255, 70, 80, 255])
             };
-            draw_filled_polygon(&mut rgba, width, height, self, &polygon, fill);
-            draw_polygon(&mut rgba, width, height, self, &polygon, edge);
-            if selected && selected_handles.is_none() {
-                selected_handles = Some(polygon);
-            }
+            draw_filled_polygon(&mut rgba, width, height, self, polygon, fill);
+            draw_polygon(&mut rgba, width, height, self, polygon, edge);
         }
-        let origin = self.world_to_pixel(Vec2::ZERO, width, height);
-        draw_line(
-            &mut rgba,
-            width,
-            height,
-            origin,
-            self.world_to_pixel(self.draft.translation_a, width, height),
-            [255, 110, 90, 230],
-        );
-        draw_line(
-            &mut rgba,
-            width,
-            height,
-            origin,
-            self.world_to_pixel(self.draft.translation_b, width, height),
-            [90, 220, 150, 230],
-        );
+        if !self.draft.instances.is_empty() {
+            let origin = self.world_to_pixel(Vec2::ZERO, width, height);
+            draw_line(
+                &mut rgba,
+                width,
+                height,
+                origin,
+                self.world_to_pixel(self.draft.translation_a, width, height),
+                [255, 110, 90, 230],
+            );
+            draw_line(
+                &mut rgba,
+                width,
+                height,
+                origin,
+                self.world_to_pixel(self.draft.translation_b, width, height),
+                [90, 220, 150, 230],
+            );
+        }
         if !self.construction.is_empty() {
             for segment in self.construction.windows(2) {
                 draw_line(
@@ -581,7 +763,9 @@ fn blend_pixel(rgba: &mut [u8], width: u32, height: u32, x: i32, y: i32, color: 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::tiling::{RigidTransform, TileId, TileInstance, TilePrototype, TilingMode};
+    use crate::sim::tiling::{
+        RigidTransform, TileId, TileInstance, TilePrototype, TilingMode, TilingPreset, build_preset,
+    };
 
     fn square() -> PeriodicTilingDraft {
         PeriodicTilingDraft {
@@ -749,6 +933,80 @@ mod tests {
         assert!(
             sampled.len() >= 2,
             "mixed tiling must expose multiple basis polygons"
+        );
+    }
+
+    #[test]
+    fn preview_uses_the_validated_topological_neighbor_ring() {
+        let square = build_preset(TilingPreset::Square, 1.0);
+        let square_scene =
+            TilingScene::new(square.clone()).with_selected_basis(square.instances[0].id);
+        assert_eq!(square_scene.neighbor_polygons().len(), 4);
+
+        let hexagon = build_preset(TilingPreset::RegularHexagon, 1.0);
+        let hexagon_scene =
+            TilingScene::new(hexagon.clone()).with_selected_basis(hexagon.instances[0].id);
+        assert_eq!(hexagon_scene.neighbor_polygons().len(), 6);
+    }
+
+    #[test]
+    fn tiling_camera_pan_and_pointer_zoom_preserve_the_world_under_pointer() {
+        let mut scene = TilingScene::new(square());
+        let before = scene.pixel_to_world(240, 120, 640, 480);
+        scene.zoom_at(240, 120, 640, 480, 1.5);
+        let after = scene.pixel_to_world(240, 120, 640, 480);
+        assert!((after.x - before.x).abs() < 1e-9);
+        assert!((after.y - before.y).abs() < 1e-9);
+
+        let center_before = scene.camera.center;
+        scene.pan_pixels(80.0, -40.0);
+        assert_ne!(scene.camera.center, center_before);
+    }
+
+    #[test]
+    fn translation_lattice_is_inferred_and_authoritatively_verified() {
+        for preset in [TilingPreset::Square, TilingPreset::RegularHexagon] {
+            let draft = build_preset(preset, 1.0);
+            let prototype = &draft.prototypes[0];
+            let vertices = prototype_vertices(&prototype.shape).unwrap();
+            let (a, b) = infer_translation_lattice(&vertices).unwrap();
+            let inferred = PeriodicTilingDraft {
+                translation_a: a,
+                translation_b: b,
+                prototypes: vec![TilePrototype {
+                    id: PrototypeId(0),
+                    name: "inferred".into(),
+                    shape: PrototypeShape::SimplePolygon { vertices },
+                }],
+                instances: vec![TileInstance {
+                    id: TileId(0),
+                    prototype: PrototypeId(0),
+                    transform: RigidTransform::default(),
+                }],
+                mode: TilingMode::Topological,
+            };
+            crate::sim::tiling::validate_coverage(&inferred).unwrap();
+        }
+    }
+
+    #[test]
+    fn lattice_inference_supports_complex_translation_tiles_and_rejects_triangles() {
+        let complex = vec![
+            Vec2::new(-2.0, -1.0),
+            Vec2::new(0.0, -1.0),
+            Vec2::new(2.0, 0.0),
+            Vec2::new(2.0, 1.0),
+            Vec2::new(0.0, 1.0),
+            Vec2::new(-2.0, 0.0),
+        ];
+        assert!(infer_translation_lattice(&complex).is_ok());
+        assert!(
+            infer_translation_lattice(&[
+                Vec2::new(0.0, 0.0),
+                Vec2::new(1.0, 0.0),
+                Vec2::new(0.0, 1.0),
+            ])
+            .is_err()
         );
     }
 

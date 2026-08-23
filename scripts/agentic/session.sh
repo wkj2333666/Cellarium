@@ -61,7 +61,7 @@ supervise() {
   cleanup_children() {
     trap - EXIT INT TERM
     local pid
-    for pid in "$kitty_pid" "$openbox_pid" "$xvfb_pid"; do
+    for pid in "${kitty_pid-}" "${openbox_pid-}" "${xvfb_pid-}"; do
       if [[ $pid =~ ^[1-9][0-9]*$ ]]; then
         kill -TERM "$pid" 2>/dev/null || true
       fi

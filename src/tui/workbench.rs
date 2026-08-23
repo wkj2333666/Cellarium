@@ -1,4 +1,5 @@
 use crate::app::App;
+use crate::input::UiCommand;
 use crate::render::display::ViewportDisplay;
 use crate::render::workbench_graphics::GraphicsScene;
 use crate::workbench::{WorkbenchFocus, WorkbenchSection};
@@ -13,6 +14,83 @@ pub struct WorkbenchLayout {
     pub outline: Rect,
     pub canvas: Rect,
     pub inspector: Option<Rect>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ToolbarAction {
+    Ui(UiCommand),
+    EditorKey(crossterm::event::KeyCode),
+    ToggleGrowthEditor,
+}
+
+fn toolbar_segments(
+    state: &crate::workbench::WorkbenchState,
+) -> Vec<(&'static str, ToolbarAction)> {
+    use crossterm::event::KeyCode;
+    match state.section() {
+        WorkbenchSection::World => Vec::new(),
+        WorkbenchSection::Tiling => vec![
+            ("[D] Shape", ToolbarAction::EditorKey(KeyCode::Char('d'))),
+            ("[A] Add basis", ToolbarAction::Ui(UiCommand::ContextAdd)),
+            ("[P] Preset", ToolbarAction::Ui(UiCommand::CyclePreset)),
+            ("[N] Next basis", ToolbarAction::Ui(UiCommand::ShapeNext)),
+            ("[+] Sides", ToolbarAction::Ui(UiCommand::ShapeIncrease)),
+            ("[-] Sides", ToolbarAction::Ui(UiCommand::ShapeDecrease)),
+        ],
+        WorkbenchSection::Channels => vec![
+            ("[A] Add", ToolbarAction::Ui(UiCommand::ContextAdd)),
+            ("[Del] Remove", ToolbarAction::Ui(UiCommand::ContextDelete)),
+            ("] Select", ToolbarAction::Ui(UiCommand::SelectNext)),
+            ("[V] View", ToolbarAction::Ui(UiCommand::CyclePresentation)),
+            ("[C] Color", ToolbarAction::Ui(UiCommand::CycleColor)),
+            (
+                "[X] Visible",
+                ToolbarAction::Ui(UiCommand::ToggleVisibility),
+            ),
+            ("[F] Freeze", ToolbarAction::Ui(UiCommand::ToggleFrozen)),
+        ],
+        WorkbenchSection::Kernels => vec![
+            ("[A] Add", ToolbarAction::Ui(UiCommand::ContextAdd)),
+            ("[Del] Remove", ToolbarAction::Ui(UiCommand::ContextDelete)),
+            (
+                "[E/Enter] Exact",
+                ToolbarAction::EditorKey(KeyCode::Char('e')),
+            ),
+        ],
+        WorkbenchSection::Growth => vec![(
+            if state.growth_editing() {
+                "[Esc] Finish source"
+            } else {
+                "[E] Edit source"
+            },
+            ToolbarAction::ToggleGrowthEditor,
+        )],
+        WorkbenchSection::Experiment => Vec::new(),
+    }
+}
+
+pub fn toolbar_text(state: &crate::workbench::WorkbenchState) -> String {
+    toolbar_segments(state)
+        .into_iter()
+        .map(|(label, _)| label)
+        .collect::<Vec<_>>()
+        .join("  ")
+}
+
+pub fn toolbar_action_at(
+    state: &crate::workbench::WorkbenchState,
+    column: u16,
+) -> Option<ToolbarAction> {
+    let mut start = 0usize;
+    let column = usize::from(column);
+    for (label, action) in toolbar_segments(state) {
+        let end = start + label.chars().count();
+        if (start..end).contains(&column) {
+            return Some(action);
+        }
+        start = end + 2;
+    }
+    None
 }
 pub fn workbench_layout(area: Rect) -> WorkbenchLayout {
     if area.width >= 120 {
@@ -255,10 +333,37 @@ pub fn draw_workbench(
         }
         WorkbenchSection::Experiment => "Review changes; Ctrl+Enter applies explicitly".into(),
     };
-    frame.render_widget(
-        Paragraph::new(header).style(Style::default().fg(Color::Rgb(150, 190, 240))),
-        canvas_header,
-    );
+    let toolbar = toolbar_text(state);
+    let header = if toolbar.is_empty() {
+        header
+    } else {
+        format!("{toolbar}    {header}")
+    };
+    let mut header_lines = vec![Line::styled(
+        header,
+        Style::default().fg(Color::Rgb(150, 190, 240)),
+    )];
+    if let Some(editor) = state.numeric_editor() {
+        header_lines.push(Line::from(vec![
+            Span::styled(
+                format!("Exact {} = ", editor.label()),
+                Style::default()
+                    .fg(Color::Rgb(255, 220, 130))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                editor.buffer().to_string(),
+                Style::default()
+                    .fg(Color::Rgb(255, 255, 255))
+                    .bg(Color::Rgb(55, 85, 145)),
+            ),
+            Span::styled(
+                "▌  Enter commit · Esc cancel",
+                Style::default().fg(Color::White),
+            ),
+        ]));
+    }
+    frame.render_widget(Paragraph::new(header_lines), canvas_header);
     if matches!(state.section(), WorkbenchSection::World) {
         let (width, height) = display.framebuffer_size(graphics_area);
         let mut graphics =
@@ -269,7 +374,16 @@ pub fn draw_workbench(
         if let Some(tiling) = &state.draft().tiling {
             let scene = crate::workbench::tiling_editor::TilingScene::new(tiling.clone());
             let scene = scene
-                .with_selection(state.tiling_prototype())
+                .with_selected_basis(state.selected_basis())
+                .with_camera(state.tiling_camera())
+                .with_selected_vertex(state.tiling_selected_vertex().map(|(_, vertex)| vertex))
+                .with_construction(state.tiling_construction().to_vec());
+            let (width, height) = display.framebuffer_size(graphics_area);
+            let mut graphics = scene.render_rgba(width as u32, height as u32);
+            graphics.generation = scene_generation;
+            display.render_graphics(frame, graphics_area, &graphics);
+        } else if state.is_drawing_new_basis() || !state.tiling_construction().is_empty() {
+            let scene = crate::workbench::tiling_editor::TilingScene::empty(state.tiling_camera())
                 .with_construction(state.tiling_construction().to_vec());
             let (width, height) = display.framebuffer_size(graphics_area);
             let mut graphics = scene.render_rgba(width as u32, height as u32);
@@ -410,10 +524,15 @@ pub fn draw_workbench(
                 ));
                 lines.push(Line::from("Select: drag vertex · right remove"));
                 lines.push(Line::from("P preset · N basis · +/- regular sides"));
+                lines.push(Line::from("Wheel zoom · middle pan"));
+                lines.push(Line::from(""));
+                lines.extend(tiling_inspector_texts(state).into_iter().map(Line::from));
             }
             WorkbenchSection::Channels => {
                 lines.push(Line::from("A add · Del remove · ] select"));
                 lines.push(Line::from("V view · C color · X visible · F freeze"));
+                lines.push(Line::from(""));
+                lines.extend(channel_inspector_texts(state).into_iter().map(Line::from));
             }
             WorkbenchSection::Kernels => {
                 if let Some(rule) = state
@@ -431,10 +550,38 @@ pub fn draw_workbench(
                         rule.shared_name.as_deref().unwrap_or("local/default"),
                         rule.kernels.len(),
                     )));
+                    let default = state
+                        .draft()
+                        .rules
+                        .defaults
+                        .get(&state.selected_channel())
+                        .is_some_and(|default| *default == rule.id);
+                    let sharing = state
+                        .draft()
+                        .rules
+                        .bindings
+                        .iter()
+                        .filter(|binding| binding.rule_set == rule.id)
+                        .count();
+                    lines.push(Line::from(format!(
+                        "sharing: {} · {} binding(s)",
+                        if default {
+                            "channel default"
+                        } else {
+                            "local override"
+                        },
+                        sharing,
+                    )));
                     if let Some(kernel) = state.selected_rule_kernel() {
+                        let source_name = state
+                            .draft()
+                            .channels
+                            .iter()
+                            .find(|channel| channel.id == kernel.source_channel)
+                            .map_or("—", |channel| channel.name.as_str());
                         lines.push(Line::from(format!(
-                            "kernel {} `{}` · source channel {}",
-                            kernel.id.0, kernel.symbol, kernel.source_channel.0,
+                            "kernel {} `{}` · source {} ({})",
+                            kernel.id.0, kernel.symbol, kernel.source_channel.0, source_name,
                         )));
                         if let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) =
                             &kernel.spatial
@@ -447,8 +594,30 @@ pub fn draw_workbench(
                                 definition.anchor_y,
                                 definition.planes.len(),
                             )));
+                            lines.push(Line::from(format!(
+                                "source bases: {}",
+                                definition
+                                    .planes
+                                    .keys()
+                                    .map(|basis| basis.0.to_string())
+                                    .collect::<Vec<_>>()
+                                    .join(", ")
+                            )));
                         }
                     }
+                } else if let Some(kernel) = state.draft().kernels.first() {
+                    lines.push(Line::from(format!(
+                        "legacy kernel {} `{}` · source ch{} → target ch{}",
+                        kernel.id.0, kernel.symbol, kernel.source.0, kernel.target.0,
+                    )));
+                    lines.push(Line::from(format!(
+                        "stencil {}×{} · anchor {},{} · {:?}",
+                        kernel.definition.width,
+                        kernel.definition.height,
+                        kernel.definition.anchor_x,
+                        kernel.definition.anchor_y,
+                        kernel.definition.normalization,
+                    )));
                 }
                 lines.push(Line::from(
                     "Canvas: click polygon · drag paint · right zero",
@@ -502,6 +671,88 @@ pub fn draw_workbench(
     }
     let (frame_width, frame_height) = display.framebuffer_size(graphics_area);
     app.set_viewport(graphics_area, [frame_width, frame_height]);
+}
+
+fn channel_inspector_texts(state: &crate::workbench::WorkbenchState) -> Vec<String> {
+    state
+        .draft()
+        .channels
+        .iter()
+        .map(|channel| {
+            let color = crate::workbench::resolved_color(state.draft(), channel.id)
+                .map(|color| format!("#{:02X}{:02X}{:02X}", color.red, color.green, color.blue))
+                .unwrap_or_else(|| "#??????".into());
+            format!(
+                "{} {}  {}  {}  {}",
+                if channel.id == state.selected_channel() {
+                    "▸"
+                } else {
+                    " "
+                },
+                channel.name,
+                color,
+                if channel.display.visible {
+                    "visible"
+                } else {
+                    "hidden"
+                },
+                if channel.frozen { "frozen" } else { "active" },
+            )
+        })
+        .collect()
+}
+
+fn tiling_inspector_texts(state: &crate::workbench::WorkbenchState) -> Vec<String> {
+    let Some(tiling) = &state.draft().tiling else {
+        return vec![
+            "No periodic tiling yet".into(),
+            "Click [P] Preset to create one".into(),
+        ];
+    };
+    let mut lines = vec![
+        format!(
+            "basis {} · prototype {}",
+            state.selected_basis().0,
+            state
+                .tiling_prototype()
+                .map_or_else(|| "—".into(), |id| id.0.to_string())
+        ),
+        format!(
+            "a=({:.3}, {:.3})",
+            tiling.translation_a.x, tiling.translation_a.y
+        ),
+        format!(
+            "b=({:.3}, {:.3})",
+            tiling.translation_b.x, tiling.translation_b.y
+        ),
+    ];
+    match crate::sim::tiling::validate_coverage(tiling) {
+        Ok(report) => {
+            let neighbors = report
+                .neighbor_ring
+                .get(&state.selected_basis())
+                .map_or(0, Vec::len);
+            lines.push("✓ exact edge-to-edge tiling".into());
+            lines.push(format!(
+                "area {:.4} · atomic edges {}",
+                report.patch_area, report.atomic_edges
+            ));
+            lines.push(format!(
+                "Euler {} · neighbor seams {}",
+                report.euler_characteristic, neighbors
+            ));
+        }
+        Err(errors) => {
+            lines.push("! not a valid periodic tiling".into());
+            lines.extend(
+                errors
+                    .into_iter()
+                    .take(4)
+                    .map(|error| format!("! {}: {}", error.code, error.message)),
+            );
+        }
+    }
+    lines
 }
 
 fn initial_field_graphics(
@@ -890,5 +1141,53 @@ mod tests {
             format!("{:?}", crate::workbench::DraftStatus::Dirty),
             "Dirty"
         );
+    }
+
+    #[test]
+    fn three_channel_inspector_explains_the_rgb_composite() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.add_channel().unwrap();
+        state.add_channel().unwrap();
+        let text = channel_inspector_texts(&state).join("\n");
+        assert!(text.contains("state  #FF0000"));
+        assert!(text.contains("channel_2  #00FF00"));
+        assert!(text.contains("channel_3  #0000FF"));
+        assert!(text.contains("visible"));
+        assert!(text.contains("active"));
+    }
+
+    #[test]
+    fn visible_toolbar_labels_have_clickable_hit_targets() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.select_section(WorkbenchSection::Channels);
+        let text = toolbar_text(&state);
+        assert!(text.starts_with("[A] Add"));
+        assert_eq!(
+            toolbar_action_at(&state, 2),
+            Some(ToolbarAction::Ui(UiCommand::ContextAdd))
+        );
+        let color = text.find("[C] Color").unwrap() as u16 + 2;
+        assert_eq!(
+            toolbar_action_at(&state, color),
+            Some(ToolbarAction::Ui(UiCommand::CycleColor))
+        );
+    }
+
+    #[test]
+    fn tiling_inspector_reports_authoritative_topology_or_diagnostics() {
+        let mut spec = crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4);
+        spec.tiling = Some(crate::sim::tiling::build_preset(
+            crate::sim::tiling::TilingPreset::RegularHexagon,
+            1.0,
+        ));
+        let state = crate::workbench::WorkbenchState::new(spec);
+        let text = tiling_inspector_texts(&state).join("\n");
+        assert!(text.contains("exact edge-to-edge tiling"));
+        assert!(text.contains("Euler 0"));
+        assert!(text.contains("neighbor seams 6"));
     }
 }

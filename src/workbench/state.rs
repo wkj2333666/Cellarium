@@ -81,6 +81,8 @@ pub struct WorkbenchState {
     kernel_paint_value: f32,
     numeric_editor: Option<NumericEditor>,
     tiling_tool: super::tiling_editor::TilingTool,
+    tiling_camera: super::tiling_editor::TilingCamera,
+    tiling_selected_vertex: Option<(PrototypeId, usize)>,
     tiling_construction: Vec<crate::sim::tiling::Vec2>,
     tiling_new_basis: bool,
 }
@@ -122,6 +124,8 @@ impl WorkbenchState {
             kernel_paint_value: 0.05,
             numeric_editor: None,
             tiling_tool: super::tiling_editor::TilingTool::Select,
+            tiling_camera: super::tiling_editor::TilingCamera::default(),
+            tiling_selected_vertex: None,
             tiling_construction: Vec::new(),
             tiling_new_basis: false,
         }
@@ -240,6 +244,21 @@ impl WorkbenchState {
     pub fn tiling_tool(&self) -> super::tiling_editor::TilingTool {
         self.tiling_tool
     }
+    pub fn tiling_camera(&self) -> super::tiling_editor::TilingCamera {
+        self.tiling_camera
+    }
+    pub fn set_tiling_camera(&mut self, camera: super::tiling_editor::TilingCamera) {
+        self.tiling_camera = camera;
+    }
+    pub fn tiling_selected_vertex(&self) -> Option<(PrototypeId, usize)> {
+        self.tiling_selected_vertex
+    }
+    pub fn select_tiling_vertex(&mut self, prototype: PrototypeId, vertex: usize) {
+        self.tiling_selected_vertex = Some((prototype, vertex));
+    }
+    pub fn clear_tiling_vertex(&mut self) {
+        self.tiling_selected_vertex = None;
+    }
     pub fn set_tiling_tool(&mut self, tool: super::tiling_editor::TilingTool) {
         self.tiling_tool = tool;
         if tool != super::tiling_editor::TilingTool::DrawPolygon {
@@ -276,10 +295,21 @@ impl WorkbenchState {
         }
         let mut next = self.draft.clone();
         if self.tiling_new_basis {
+            if next.tiling.is_none() {
+                let (translation_a, translation_b) =
+                    super::tiling_editor::infer_translation_lattice(&self.tiling_construction)?;
+                next.tiling = Some(crate::sim::tiling::PeriodicTilingDraft {
+                    translation_a,
+                    translation_b,
+                    prototypes: Vec::new(),
+                    instances: Vec::new(),
+                    mode: crate::sim::tiling::TilingMode::Topological,
+                });
+            }
             let tiling = next
                 .tiling
                 .as_mut()
-                .ok_or("create or select a tiling first")?;
+                .expect("new tiling was initialized above");
             let prototype = PrototypeId(
                 tiling
                     .prototypes
@@ -400,11 +430,6 @@ impl WorkbenchState {
     }
     pub fn stop_growth_editing(&mut self) {
         self.growth_editing = false;
-        self.selected_prototype = self
-            .draft
-            .tiling
-            .as_ref()
-            .and_then(|tiling| tiling.prototypes.first().map(|prototype| prototype.id));
     }
     pub fn sync_growth_source(&mut self) {
         let source = self.growth_editor.buffer().as_str().to_string();
@@ -511,6 +536,9 @@ impl WorkbenchState {
         self.refresh_rule_selection();
     }
     pub fn select_section(&mut self, section: WorkbenchSection) {
+        if self.section != section {
+            self.close_section_editors();
+        }
         self.section = section;
     }
     pub fn section_next(&mut self) {
@@ -518,7 +546,13 @@ impl WorkbenchState {
             .iter()
             .position(|value| *value == self.section)
             .unwrap_or(0);
+        self.close_section_editors();
         self.section = WorkbenchSection::ALL[(index + 1) % WorkbenchSection::ALL.len()];
+    }
+
+    fn close_section_editors(&mut self) {
+        self.growth_editing = false;
+        self.numeric_editor = None;
     }
     pub fn focus_next(&mut self) {
         self.focus = match self.focus {
@@ -1128,6 +1162,7 @@ impl WorkbenchState {
         let instance = &tiling.instances[(index + 1) % tiling.instances.len()];
         self.selected_basis = instance.id;
         self.selected_prototype = Some(instance.prototype);
+        self.tiling_selected_vertex = None;
         self.refresh_rule_selection();
         self.growth_editor =
             editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
@@ -1194,6 +1229,30 @@ mod tests {
         };
         spec.rules.sets[0].kernels[0].spatial = KernelSpatialDefinition::Periodic(definition);
         spec
+    }
+
+    #[test]
+    fn changing_section_closes_editors_from_the_previous_section() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        state.select_section(WorkbenchSection::Growth);
+        state.toggle_growth_editing();
+        state.begin_numeric_editor(NumericEditor::begin("weight", 0.25, -1.0..=1.0));
+
+        state.select_section(WorkbenchSection::Channels);
+
+        assert!(!state.growth_editing());
+        assert!(state.numeric_editor().is_none());
+    }
+
+    #[test]
+    fn cycling_section_closes_editors_from_the_previous_section() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        state.select_section(WorkbenchSection::Growth);
+        state.toggle_growth_editing();
+
+        state.section_next();
+
+        assert!(!state.growth_editing());
     }
 
     #[test]
@@ -1394,6 +1453,27 @@ mod tests {
             panic!("new basis needs a periodic kernel plane");
         };
         assert!(definition.planes.contains_key(&added));
+    }
+
+    #[test]
+    fn free_draw_can_create_the_first_verified_translation_tiling_without_a_preset() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        assert!(state.draft().tiling.is_none());
+        state.begin_new_basis_polygon();
+        for point in [
+            crate::sim::tiling::Vec2::new(-1.0, -1.0),
+            crate::sim::tiling::Vec2::new(1.0, -1.0),
+            crate::sim::tiling::Vec2::new(1.0, 1.0),
+            crate::sim::tiling::Vec2::new(-1.0, 1.0),
+        ] {
+            state.push_tiling_vertex(point);
+        }
+
+        state.finish_tiling_construction().unwrap();
+
+        let tiling = state.draft().tiling.as_ref().unwrap();
+        assert_eq!(tiling.instances.len(), 1);
+        crate::sim::tiling::validate_coverage(tiling).unwrap();
     }
 
     #[test]

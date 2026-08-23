@@ -4,6 +4,7 @@ pub struct NumericEditor {
     original: f64,
     buffer: String,
     range: std::ops::RangeInclusive<f64>,
+    replace_pending: bool,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -24,6 +25,7 @@ impl NumericEditor {
             original,
             buffer: format!("{original}"),
             range,
+            replace_pending: true,
         }
     }
 
@@ -39,11 +41,21 @@ impl NumericEditor {
 
     pub fn replace(&mut self, source: impl Into<String>) {
         self.buffer = source.into();
+        self.replace_pending = false;
     }
     pub fn push(&mut self, character: char) {
+        if self.replace_pending {
+            self.buffer.clear();
+            self.replace_pending = false;
+        }
         self.buffer.push(character);
     }
     pub fn backspace(&mut self) {
+        if self.replace_pending {
+            self.buffer.clear();
+            self.replace_pending = false;
+            return;
+        }
         self.buffer.pop();
     }
 
@@ -94,5 +106,16 @@ mod tests {
                 max: 1.0
             })
         );
+    }
+
+    #[test]
+    fn first_typed_character_replaces_the_selected_original_value() {
+        let mut editor = NumericEditor::begin("weight", 0.375, -1.0..=1.0);
+        editor.push('-');
+        editor.push('0');
+        editor.push('.');
+        editor.push('2');
+        assert_eq!(editor.buffer(), "-0.2");
+        assert_eq!(editor.commit(), Ok(-0.2));
     }
 }
