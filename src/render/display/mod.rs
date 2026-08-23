@@ -51,6 +51,11 @@ impl DisplayProtocol {
 
 type EncodedPixelFrame = (ratatui_image::protocol::Protocol, (u16, u16));
 
+// Some PTYs report rows and columns but leave their pixel dimensions at zero.
+// Graphics protocols still scale an image to the requested cell rectangle, so
+// missing geometry must not be interpreted as missing graphics capability.
+const DEFAULT_PIXEL_CELL_SIZE: (u16, u16) = (10, 20);
+
 pub struct PixelDisplay {
     picker: ratatui_image::picker::Picker,
     initial_cell_size: (u16, u16),
@@ -833,8 +838,11 @@ impl ViewportDisplay {
             std::env::var_os("SSH_CONNECTION").is_some() || std::env::var_os("SSH_TTY").is_some();
         let remote_graphics = std::env::var("CELLARIUM_REMOTE_GRAPHICS")
             .is_ok_and(|value| value == "1" || value.eq_ignore_ascii_case("true"));
-        let native_kitty = std::env::var_os("KITTY_WINDOW_ID").is_some()
-            || term_program.eq_ignore_ascii_case("kitty");
+        let native_kitty = is_native_kitty_terminal(
+            &term,
+            &term_program,
+            std::env::var_os("KITTY_WINDOW_ID").is_some(),
+        );
         let protocol = detect_protocol_for_connection(
             &term,
             &term_program,
@@ -870,10 +878,9 @@ impl ViewportDisplay {
             return Self::HalfBlock;
         }
 
-        let Some((width, height)) = cell_size.filter(|(width, height)| *width > 0 && *height > 0)
-        else {
-            return Self::HalfBlock;
-        };
+        let (width, height) = cell_size
+            .filter(|(width, height)| *width > 0 && *height > 0)
+            .unwrap_or(DEFAULT_PIXEL_CELL_SIZE);
 
         #[cfg(unix)]
         if should_use_kitty_shared_memory(protocol, remote, native_kitty) {
@@ -1113,6 +1120,10 @@ pub fn detect_protocol(term: &str, term_program: &str, sixel: &str) -> DisplayPr
     } else {
         DisplayProtocol::HalfBlock
     }
+}
+
+fn is_native_kitty_terminal(term: &str, term_program: &str, kitty_window_id_present: bool) -> bool {
+    kitty_window_id_present || term.contains("kitty") || term_program.eq_ignore_ascii_case("kitty")
 }
 
 pub fn detect_protocol_for_connection(
@@ -1375,6 +1386,41 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn local_kitty_keeps_graphics_when_the_pty_omits_pixel_geometry() {
+        let display = ViewportDisplay::from_protocol_and_cell_size_for_connection(
+            DisplayProtocol::Kitty,
+            None,
+            false,
+            true,
+        );
+
+        assert!(matches!(display, ViewportDisplay::KittyShared(_)));
+        assert_eq!(display.protocol(), DisplayProtocol::Kitty);
+    }
+
+    #[test]
+    fn inline_kitty_keeps_graphics_when_the_pty_omits_pixel_geometry() {
+        let display = ViewportDisplay::from_protocol_and_cell_size_for_connection(
+            DisplayProtocol::Kitty,
+            None,
+            true,
+            false,
+        );
+
+        assert!(matches!(display, ViewportDisplay::Pixel(_)));
+        assert_eq!(display.protocol(), DisplayProtocol::Kitty);
+    }
+
+    #[test]
+    fn xterm_kitty_is_native_even_without_optional_kitty_environment_variables() {
+        assert!(is_native_kitty_terminal("xterm-kitty", "", false));
+        assert!(is_native_kitty_terminal("xterm-256color", "kitty", false));
+        assert!(is_native_kitty_terminal("xterm-256color", "", true));
+        assert!(!is_native_kitty_terminal("xterm-256color", "", false));
+    }
+
     #[test]
     fn async_output_is_reserved_for_remote_graphics() {
         assert!(should_use_async_output(DisplayProtocol::Kitty, true, true));
@@ -1567,7 +1613,7 @@ mod tests {
     }
 
     #[test]
-    fn pixel_protocols_require_real_cell_dimensions() {
+    fn pixel_protocols_use_nominal_dimensions_when_the_pty_omits_them() {
         let display =
             ViewportDisplay::from_protocol_and_cell_size(DisplayProtocol::Kitty, Some((8, 16)));
         assert_eq!(display.protocol(), DisplayProtocol::Kitty);
@@ -1577,7 +1623,11 @@ mod tests {
         );
 
         let display = ViewportDisplay::from_protocol_and_cell_size(DisplayProtocol::Kitty, None);
-        assert_eq!(display.protocol(), DisplayProtocol::HalfBlock);
+        assert_eq!(display.protocol(), DisplayProtocol::Kitty);
+        assert_eq!(
+            display.framebuffer_size(ratatui::layout::Rect::new(0, 0, 10, 5)),
+            (100, 100)
+        );
     }
 
     #[test]
