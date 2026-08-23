@@ -105,6 +105,12 @@ pub struct App {
     workbench_frame_generation: u64,
 }
 
+fn graphics_pointer_hit_radius(frame_size: [usize; 2], viewport: Rect) -> i32 {
+    let cell_width = frame_size[0] as f64 / f64::from(viewport.width.max(1));
+    let cell_height = frame_size[1] as f64 / f64::from(viewport.height.max(1));
+    (((cell_width * 0.5).hypot(cell_height * 0.5)).ceil() as i32 + 3).clamp(12, 32)
+}
+
 impl App {
     pub fn new(spec: SimulationSpec, width: usize, height: usize) -> Self {
         Self::with_backend(spec.clone(), width, height, SimulationBackend::cpu(spec))
@@ -463,10 +469,14 @@ impl App {
                 .workbench
                 .toggle_selected_frozen()
                 .map_err(|error| error.to_string()),
-            UiCommand::CyclePreset => self
-                .workbench
-                .cycle_tiling_preset()
-                .map_err(|error| error.to_string()),
+            UiCommand::CyclePreset => {
+                self.workbench
+                    .cycle_tiling_preset()
+                    .map_err(|error| error.to_string())?;
+                self.workbench_notice =
+                    Some("tiling preset loaded · drag vertices · [0] fit view".into());
+                Ok(())
+            }
             UiCommand::ShapeNext => {
                 self.workbench.select_next_prototype();
                 Ok(())
@@ -638,6 +648,25 @@ impl App {
     pub fn handle_workbench_editor_key(&mut self, key: KeyEvent) -> bool {
         if self.mode != AppMode::Workbench {
             return false;
+        }
+        if key.code == KeyCode::Char('0') {
+            match self.workbench.section() {
+                WorkbenchSection::Tiling => {
+                    self.workbench.set_tiling_camera(
+                        crate::workbench::tiling_editor::TilingCamera::default(),
+                    );
+                    self.workbench_notice = Some("tiling view fitted".into());
+                }
+                WorkbenchSection::Kernels => {
+                    self.workbench
+                        .set_kernel_view(crate::workbench::kernel_editor::KernelView::default());
+                    self.workbench_notice = Some("kernel view fitted".into());
+                }
+                _ => return false,
+            }
+            self.workbench_draft_scene_generation =
+                self.workbench_draft_scene_generation.wrapping_add(1);
+            return true;
         }
         if self.workbench.section() == WorkbenchSection::Tiling {
             match key.code {
@@ -963,9 +992,13 @@ impl App {
     }
 
     pub fn display_rule_name(&self) -> &str {
-        self.remote_rule
-            .as_deref()
-            .unwrap_or_else(|| rule_name(&self.spec))
+        self.remote_rule.as_deref().unwrap_or_else(|| {
+            if self.experiment_revision > 0 {
+                "Experiment"
+            } else {
+                rule_name(&self.spec)
+            }
+        })
     }
 
     pub fn applied_input_sequence(&self) -> u64 {
@@ -1007,6 +1040,10 @@ impl App {
             channel.initial = self.world.cells().to_vec();
         }
         model
+    }
+
+    pub fn experiment_model(&self) -> &ExperimentSpec {
+        &self.experiment_model
     }
 
     pub fn tiling_draft(&self) -> Option<&PeriodicTilingDraft> {
@@ -1252,7 +1289,7 @@ impl App {
             step_samples: performance.step_samples,
             applied_input_sequence: self.applied_input_sequence,
             backend: self.backend_name().to_string(),
-            rule: rule_name(&self.spec).to_string(),
+            rule: self.display_rule_name().to_string(),
             spec: Box::new(self.spec.clone()),
             selected_kernel: Box::new(
                 self.kernel_definitions
@@ -1821,6 +1858,7 @@ impl App {
             .min(frame_size[1].saturating_sub(1) as u32);
             match self.workbench.section() {
                 crate::workbench::WorkbenchSection::Tiling => {
+                    let hit_radius = graphics_pointer_hit_radius(frame_size, viewport);
                     let mut scene = self
                         .workbench
                         .draft()
@@ -1854,7 +1892,7 @@ impl App {
                             );
                             let dx = first_x - px as i32;
                             let dy = first_y - py as i32;
-                            if dx * dx + dy * dy <= 12 * 12 {
+                            if dx * dx + dy * dy <= hit_radius * hit_radius {
                                 match self.workbench.finish_tiling_construction() {
                                     Ok(()) => self.workbench_notice = Some("polygon closed".into()),
                                     Err(error) => self.workbench_notice = Some(error),
@@ -1885,7 +1923,7 @@ impl App {
                             py,
                             frame_size[0] as u32,
                             frame_size[1] as u32,
-                            8,
+                            hit_radius,
                         ) {
                             if let Some(basis) = scene
                                 .draft
@@ -1972,7 +2010,7 @@ impl App {
                                     py,
                                     frame_size[0] as u32,
                                     frame_size[1] as u32,
-                                    12,
+                                    hit_radius,
                                 )
                             })
                             .map(|(prototype, vertex)| {
@@ -1981,7 +2019,13 @@ impl App {
                             })
                             .unwrap_or(false),
                         crate::input::MouseAction::Erase => scene
-                            .hit_test_vertex(px, py, frame_size[0] as u32, frame_size[1] as u32, 8)
+                            .hit_test_vertex(
+                                px,
+                                py,
+                                frame_size[0] as u32,
+                                frame_size[1] as u32,
+                                hit_radius,
+                            )
                             .map(|(prototype, vertex)| scene.apply_gesture(crate::workbench::tiling_editor::TilingGesture::RemoveVertex { prototype, vertex }).is_ok())
                             .unwrap_or(false),
                         crate::input::MouseAction::Pan { .. }
@@ -4523,6 +4567,16 @@ mod tests {
     }
 
     #[test]
+    fn graphics_vertex_hit_radius_covers_terminal_cell_quantization() {
+        let viewport = ratatui::layout::Rect::new(24, 2, 104, 38);
+
+        assert!(
+            graphics_pointer_hit_radius([1248, 912], viewport) >= 14,
+            "a 12×24 pixel terminal cell can report a pointer over 13 pixels from the visible handle"
+        );
+    }
+
+    #[test]
     fn workbench_world_paint_invalidates_the_graphics_scene() {
         let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
         app.enter_workbench();
@@ -4694,6 +4748,55 @@ mod tests {
     }
 
     #[test]
+    fn tiling_fit_restores_the_default_camera_without_dirtying_the_draft() {
+        let mut app = App::new(SimulationSpec::conway(), 32, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Tiling);
+        app.workbench_mut()
+            .set_tiling_camera(crate::workbench::tiling_editor::TilingCamera {
+                center: crate::sim::tiling::Vec2::new(9.0, -7.0),
+                scale: 0.05,
+            });
+        let status_before = app.workbench().status();
+
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('0'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.workbench().tiling_camera(),
+            crate::workbench::tiling_editor::TilingCamera::default()
+        );
+        assert_eq!(app.workbench().status(), status_before);
+    }
+
+    #[test]
+    fn loading_a_tiling_preset_replaces_stale_tool_feedback() {
+        let mut app = App::new(SimulationSpec::conway(), 32, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Tiling);
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('d'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Esc,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert_eq!(app.workbench_notice(), Some("polygon drawing cancelled"));
+
+        app.handle_workbench_ui(UiCommand::CyclePreset).unwrap();
+
+        assert!(
+            app.workbench_notice().is_some_and(|notice| {
+                notice.contains("preset") && !notice.contains("cancelled")
+            })
+        );
+    }
+
+    #[test]
     fn kernel_pan_changes_the_view_without_dirtying_the_draft() {
         let mut app = App::new(SimulationSpec::conway(), 32, 16);
         app.enter_workbench();
@@ -4726,6 +4829,30 @@ mod tests {
             app.workbench().status(),
             crate::workbench::DraftStatus::Clean
         );
+    }
+
+    #[test]
+    fn kernel_fit_restores_the_default_view_without_dirtying_the_draft() {
+        let mut app = App::new(SimulationSpec::conway(), 32, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Kernels);
+        app.workbench_mut()
+            .set_kernel_view(crate::workbench::kernel_editor::KernelView {
+                center: [0.4, 0.4],
+                zoom: 4.0,
+            });
+        let status_before = app.workbench().status();
+
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('0'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.workbench().kernel_view(),
+            crate::workbench::kernel_editor::KernelView::default()
+        );
+        assert_eq!(app.workbench().status(), status_before);
     }
 
     #[test]

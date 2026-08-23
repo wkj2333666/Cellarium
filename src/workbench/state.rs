@@ -289,6 +289,9 @@ impl WorkbenchState {
         if self.tiling_construction.len() < 3 {
             return Err("place at least three vertices before closing the polygon".into());
         }
+        if crate::sim::tiling::polygon::signed_area(&self.tiling_construction) < 0.0 {
+            self.tiling_construction.reverse();
+        }
         let issues = crate::sim::tiling::polygon::validate_polygon(&self.tiling_construction);
         if let Some(issue) = issues.first() {
             return Err(issue.message.clone());
@@ -1473,6 +1476,31 @@ mod tests {
 
         let tiling = state.draft().tiling.as_ref().unwrap();
         assert_eq!(tiling.instances.len(), 1);
+        crate::sim::tiling::validate_coverage(tiling).unwrap();
+    }
+
+    #[test]
+    fn free_draw_normalizes_the_opposite_screen_winding() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        state.begin_new_basis_polygon();
+        for point in [
+            crate::sim::tiling::Vec2::new(-1.0, -1.0),
+            crate::sim::tiling::Vec2::new(-1.0, 1.0),
+            crate::sim::tiling::Vec2::new(1.0, 1.0),
+            crate::sim::tiling::Vec2::new(1.0, -1.0),
+        ] {
+            state.push_tiling_vertex(point);
+        }
+
+        state.finish_tiling_construction().unwrap();
+
+        let tiling = state.draft().tiling.as_ref().unwrap();
+        let crate::sim::tiling::PrototypeShape::SimplePolygon { vertices } =
+            &tiling.prototypes[0].shape
+        else {
+            panic!("free-drawn basis must remain a simple polygon");
+        };
+        assert!(crate::sim::tiling::polygon::signed_area(vertices) > 0.0);
         crate::sim::tiling::validate_coverage(tiling).unwrap();
     }
 

@@ -400,6 +400,122 @@ fn editor_panel_lines(app: &App, max_width: usize, max_height: usize) -> Vec<Str
     let (snapshot_rate, graphics_rate) = app.remote_transport_rates();
     let performance = app.performance();
     let world = app.world();
+    if app.active_revision() > 0 {
+        let experiment = app.experiment_model();
+        let basis_count = experiment.basis_ids().len();
+        let kernel_count = experiment
+            .rules
+            .sets
+            .iter()
+            .map(|rule| rule.kernels.len())
+            .sum::<usize>();
+        let first_rule = experiment.rules.sets.first();
+        let first_kernel = first_rule.and_then(|rule| rule.kernels.first());
+        let signature = first_rule.map_or_else(
+            || "fn growth(self: Scalar) -> Rate".to_string(),
+            |rule| {
+                let inputs = rule
+                    .kernels
+                    .iter()
+                    .map(|kernel| format!("{}: Scalar", kernel.symbol))
+                    .collect::<Vec<_>>();
+                let suffix = if inputs.is_empty() {
+                    String::new()
+                } else {
+                    format!(", {}", inputs.join(", "))
+                };
+                format!("fn growth(self: Scalar{suffix}) -> Rate")
+            },
+        );
+        let lines = vec![
+            format!("{} WORLD", panel_marker(app, crate::app::Panel::Overview)),
+            format!(
+                "size {}×{} · {} channel(s)",
+                world.width(),
+                world.height(),
+                experiment.channels.len()
+            ),
+            "boundary periodic · experiment runtime".to_string(),
+            format!("{} RULE", panel_marker(app, crate::app::Panel::Rule)),
+            format!("Experiment · revision {}", app.active_revision()),
+            format!("name: {}", experiment.name),
+            format!(
+                "{} basis site(s) · {} rule set(s)",
+                basis_count,
+                experiment.rules.sets.len()
+            ),
+            signature,
+            first_rule
+                .map(|rule| format!("source: {}", rule.growth.source))
+                .unwrap_or_else(|| "source: —".into()),
+            format!("{} KERNEL", panel_marker(app, crate::app::Panel::Kernel)),
+            format!("{kernel_count} kernel(s) across basis/channel rule sets"),
+            first_kernel
+                .map(|kernel| format!("{} · {}", kernel.symbol, kernel.name))
+                .unwrap_or_else(|| "none".into()),
+            format!(
+                "{} TOPOLOGY",
+                panel_marker(app, crate::app::Panel::Topology)
+            ),
+            if experiment.tiling.is_some() {
+                format!("custom edge-to-edge tiling · {basis_count} basis site(s)")
+            } else {
+                "square raster lattice · one basis site".to_string()
+            },
+            "STATISTICS".to_string(),
+            if app.is_remote_mirror() {
+                format!("tick {} · server sim {:.1}/s", app.tick(), simulation_rate)
+            } else {
+                format!("tick {} · sim {:.1}/s", app.tick(), simulation_rate)
+            },
+            if app.is_remote_mirror() {
+                format!(
+                    "snapshot rx {:.1}/s · UI draw {:.1}/s",
+                    snapshot_rate, render_rate
+                )
+            } else {
+                format!(
+                    "render {:.1}/s · inspect {:?}",
+                    render_rate,
+                    app.inspected()
+                )
+            },
+            if app.is_remote_mirror() {
+                format!(
+                    "fresh graphics {:.1}/s · inspect {:?}",
+                    graphics_rate,
+                    app.inspected()
+                )
+            } else {
+                String::new()
+            },
+            if app.is_remote_mirror() {
+                format!(
+                    "server step {:.2}/{:.2} ms · UI draw {:.2}/{:.2} ms",
+                    performance.last_step_ms,
+                    performance.average_step_ms,
+                    performance.last_render_ms,
+                    performance.average_render_ms
+                )
+            } else {
+                format!(
+                    "step {:.2}/{:.2} ms · render {:.2}/{:.2} ms",
+                    performance.last_step_ms,
+                    performance.average_step_ms,
+                    performance.last_render_ms,
+                    performance.average_render_ms
+                )
+            },
+            format!("{} ERRORS", panel_marker(app, crate::app::Panel::Errors)),
+            app.backend_error().unwrap_or("none").to_string(),
+            "[W] Workbench · [T] next panel · mouse viewport".to_string(),
+        ];
+        return lines
+            .into_iter()
+            .flat_map(|line| wrap_chars(&line, max_width))
+            .take(max_height)
+            .collect();
+    }
     let lines = vec![
         format!("{} WORLD", panel_marker(app, crate::app::Panel::Overview)),
         format!("size {}×{} · scalar channel", world.width(), world.height()),
@@ -803,5 +919,28 @@ mod tests {
         assert!(text.contains("periodic"));
         assert!(text.contains("Lenia/Orbium"));
         assert!(lines.iter().all(|line| line.chars().count() <= 48));
+    }
+
+    #[test]
+    fn editor_panel_uses_applied_experiment_metadata_instead_of_legacy_lenia_metadata() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 8, 8);
+        let mut draft = app.active_experiment().normalize_rules().unwrap();
+        draft.name = "My basis experiment".into();
+        draft.rules.sets[0].kernels[0].symbol = "custom_input".into();
+        draft.rules.sets[0].growth.source = "custom_input - self".into();
+        app.submit_draft(crate::sim::service::ApplyRequest {
+            request_id: 9,
+            base_revision: 0,
+            draft,
+        })
+        .unwrap();
+
+        let text = editor_panel_lines(&app, 64, 40).join("\n");
+        assert!(text.contains("Experiment · revision 1"));
+        assert!(text.contains("My basis experiment"));
+        assert!(text.contains("custom_input"));
+        assert!(!text.contains("Lenia/Orbium"));
+        assert!(!text.contains("ring 27×27"));
+        assert_eq!(app.remote_snapshot().rule, "Experiment");
     }
 }

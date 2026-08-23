@@ -57,6 +57,15 @@ impl GrowthEditorState {
     pub fn signature(&self) -> &str {
         &self.signature
     }
+    pub fn plot_caption(&self) -> String {
+        match self.symbols.kernel_inputs.as_slice() {
+            [x, y, ..] => {
+                format!("plot · x={x} [0,1] · y={y} [0,1] · color=rate")
+            }
+            [x] => format!("plot · x={x} [0,1] · y=rate"),
+            [] => "plot · x=self [0,1] · y=rate".into(),
+        }
+    }
     pub fn replace_source(&mut self, source: impl Into<String>) {
         self.buffer.replace(source);
         self.generation = self.generation.wrapping_add(1);
@@ -227,6 +236,10 @@ mod tests {
             ExternalSymbols::new(&["first", "second"], &[]),
             BTreeMap::new(),
             "fn growth(self: Scalar, first: Scalar, second: Scalar) -> Rate",
+        );
+        assert_eq!(
+            editor.plot_caption(),
+            "plot · x=first [0,1] · y=second [0,1] · color=rate"
         );
         let heatmap = editor.plot().heatmap.as_ref().expect("expected 2D heatmap");
         assert_eq!((heatmap.width, heatmap.height), (96, 64));

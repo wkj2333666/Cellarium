@@ -15,7 +15,7 @@ pub fn half_block_lines(frame: &raster::Framebuffer) -> Vec<Line<'static>> {
             };
             spans.push(Span::styled(
                 "▀",
-                Style::new().fg(color(bottom)).bg(color(top)),
+                Style::new().fg(color(top)).bg(color(bottom)),
             ));
         }
         lines.push(Line::from(spans));
@@ -45,8 +45,8 @@ mod tests {
             ratatui::text::Line::from(ratatui::text::Span::styled(
                 "\u{2580}",
                 Style::new()
-                    .fg(Color::Rgb(0, 255, 0))
-                    .bg(Color::Rgb(255, 0, 0)),
+                    .fg(Color::Rgb(255, 0, 0))
+                    .bg(Color::Rgb(0, 255, 0)),
             ))
         );
     }

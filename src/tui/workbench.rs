@@ -28,7 +28,10 @@ fn toolbar_segments(
 ) -> Vec<(&'static str, ToolbarAction)> {
     use crossterm::event::KeyCode;
     match state.section() {
-        WorkbenchSection::World => Vec::new(),
+        WorkbenchSection::World => vec![
+            ("] Channel", ToolbarAction::Ui(UiCommand::SelectNext)),
+            ("[V] View", ToolbarAction::Ui(UiCommand::CyclePresentation)),
+        ],
         WorkbenchSection::Tiling => vec![
             ("[D] Shape", ToolbarAction::EditorKey(KeyCode::Char('d'))),
             ("[A] Add basis", ToolbarAction::Ui(UiCommand::ContextAdd)),
@@ -36,6 +39,7 @@ fn toolbar_segments(
             ("[N] Next basis", ToolbarAction::Ui(UiCommand::ShapeNext)),
             ("[+] Sides", ToolbarAction::Ui(UiCommand::ShapeIncrease)),
             ("[-] Sides", ToolbarAction::Ui(UiCommand::ShapeDecrease)),
+            ("[0] Fit", ToolbarAction::EditorKey(KeyCode::Char('0'))),
         ],
         WorkbenchSection::Channels => vec![
             ("[A] Add", ToolbarAction::Ui(UiCommand::ContextAdd)),
@@ -56,6 +60,7 @@ fn toolbar_segments(
                 "[E/Enter] Exact",
                 ToolbarAction::EditorKey(KeyCode::Char('e')),
             ),
+            ("[0] Fit", ToolbarAction::EditorKey(KeyCode::Char('0'))),
         ],
         WorkbenchSection::Growth => vec![(
             if state.growth_editing() {
@@ -75,6 +80,18 @@ pub fn toolbar_text(state: &crate::workbench::WorkbenchState) -> String {
         .map(|(label, _)| label)
         .collect::<Vec<_>>()
         .join("  ")
+}
+
+fn static_canvas_header_lines(
+    state: &crate::workbench::WorkbenchState,
+    context: &str,
+) -> Vec<String> {
+    let toolbar = toolbar_text(state);
+    if toolbar.is_empty() {
+        vec![context.to_string()]
+    } else {
+        vec![toolbar, context.to_string()]
+    }
 }
 
 pub fn toolbar_action_at(
@@ -123,6 +140,13 @@ pub fn workbench_layout(area: Rect) -> WorkbenchLayout {
             inspector: None,
         }
     }
+}
+
+fn inspector_kernel_count(state: &crate::workbench::WorkbenchState) -> usize {
+    state
+        .selected_rule_set()
+        .and_then(|id| state.draft().rules.get(id))
+        .map_or_else(|| state.draft().kernels.len(), |rule| rule.kernels.len())
 }
 
 pub fn draw_workbench(
@@ -234,7 +258,7 @@ pub fn draw_workbench(
                     Err(errors) => lines.push(format!("! seams: {}", errors.join("; "))),
                 }
             } else {
-                lines.push("no polygon draft · [P] create square preset".into());
+                lines.push("no polygon draft · [A] draw basis · [P] preset".into());
             }
             lines
         }
@@ -333,17 +357,12 @@ pub fn draw_workbench(
         }
         WorkbenchSection::Experiment => "Review changes; Ctrl+Enter applies explicitly".into(),
     };
-    let toolbar = toolbar_text(state);
-    let header = if toolbar.is_empty() {
-        header
-    } else {
-        format!("{toolbar}    {header}")
-    };
-    let mut header_lines = vec![Line::styled(
-        header,
-        Style::default().fg(Color::Rgb(150, 190, 240)),
-    )];
+    let mut header_lines = static_canvas_header_lines(state, &header)
+        .into_iter()
+        .map(|line| Line::styled(line, Style::default().fg(Color::Rgb(150, 190, 240))))
+        .collect::<Vec<_>>();
     if let Some(editor) = state.numeric_editor() {
+        header_lines.truncate(1);
         header_lines.push(Line::from(vec![
             Span::styled(
                 format!("Exact {} = ", editor.label()),
@@ -448,6 +467,10 @@ pub fn draw_workbench(
                     .fg(Color::Rgb(255, 220, 130))
                     .add_modifier(Modifier::BOLD),
             ),
+            Line::styled(
+                editor.plot_caption(),
+                Style::default().fg(Color::Rgb(145, 195, 235)),
+            ),
         ];
         source_lines.extend(growth_source_preview(editor));
         if !editor.diagnostics().is_empty() {
@@ -498,7 +521,7 @@ pub fn draw_workbench(
             Line::from(format!("section: {}", state.section().label())),
             Line::from(format!("draft: {:?}", state.status())),
             Line::from(format!("channels: {}", state.draft().channels.len())),
-            Line::from(format!("kernels: {}", state.draft().kernels.len())),
+            Line::from(format!("kernels: {}", inspector_kernel_count(state))),
             Line::from(format!(
                 "selected: {}",
                 selected.map_or("—", |c| c.name.as_str())
@@ -706,7 +729,7 @@ fn tiling_inspector_texts(state: &crate::workbench::WorkbenchState) -> Vec<Strin
     let Some(tiling) = &state.draft().tiling else {
         return vec![
             "No periodic tiling yet".into(),
-            "Click [P] Preset to create one".into(),
+            "Click [A] to draw a basis or [P] for a preset".into(),
         ];
     };
     let mut lines = vec![
@@ -775,6 +798,7 @@ fn initial_field_graphics(
                 .unwrap_or(crate::render::channels::Rgb8::new(255, 255, 255))
         })
         .collect::<Vec<_>>();
+    let selected = state.selected_channel();
     let mut rgba = vec![0_u8; width as usize * height as usize * 4];
     for y in 0..height {
         for x in 0..width {
@@ -789,7 +813,10 @@ fn initial_field_graphics(
             let mut values = Vec::new();
             let mut active_colors = Vec::new();
             for (index, channel) in state.draft().channels.iter().enumerate() {
-                if channel.display.visible {
+                if channel.display.visible
+                    && (state.channel_view() == crate::workbench::ChannelView::Composite
+                        || channel.id == selected)
+                {
                     values.push(channel.initial.get(tile).copied().unwrap_or(0.0));
                     active_colors.push(colors[index]);
                 }
@@ -1159,6 +1186,42 @@ mod tests {
     }
 
     #[test]
+    fn inspector_kernel_count_uses_the_selected_normalized_rule_set() {
+        let spec = crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4)
+            .normalize_rules()
+            .unwrap();
+        let state = crate::workbench::WorkbenchState::new(spec);
+
+        assert_eq!(inspector_kernel_count(&state), 1);
+    }
+
+    #[test]
+    fn world_graphics_respects_the_selected_solo_channel_color() {
+        let mut spec = crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(1, 1);
+        spec.channels[0].initial[0] = 1.0;
+        spec.add_channel("green", false);
+        let blue = spec.add_channel("blue", false);
+        spec.channels
+            .iter_mut()
+            .find(|channel| channel.id == blue)
+            .unwrap()
+            .initial[0] = 1.0;
+        let mut state = crate::workbench::WorkbenchState::new(spec);
+        state.select_next_channel();
+        state.select_next_channel();
+        state.set_channel_view(crate::workbench::ChannelView::Solo);
+
+        let frame = initial_field_graphics(
+            &state,
+            crate::render::camera::Camera::new([0.5, 0.5], 1.0),
+            1,
+            1,
+        );
+
+        assert_eq!(&frame.rgba[..4], &[0, 0, 255, 255]);
+    }
+
+    #[test]
     fn visible_toolbar_labels_have_clickable_hit_targets() {
         let mut state = crate::workbench::WorkbenchState::new(
             crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
@@ -1178,6 +1241,34 @@ mod tests {
     }
 
     #[test]
+    fn world_toolbar_exposes_channel_selection_and_view() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.select_section(WorkbenchSection::World);
+        let text = toolbar_text(&state);
+        assert!(text.contains("] Channel"));
+        assert!(text.contains("[V] View"));
+        assert_eq!(
+            toolbar_action_at(&state, 2),
+            Some(ToolbarAction::Ui(UiCommand::SelectNext))
+        );
+    }
+
+    #[test]
+    fn canvas_header_separates_actions_from_context_without_duplication() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.select_section(WorkbenchSection::Tiling);
+        let lines = static_canvas_header_lines(&state, "Drag a vertex · wheel zoom");
+        assert_eq!(lines.len(), 2);
+        assert_eq!(lines[0], toolbar_text(&state));
+        assert_eq!(lines[1], "Drag a vertex · wheel zoom");
+        assert_eq!(lines.join("\n").matches("[A] Add basis").count(), 1);
+    }
+
+    #[test]
     fn tiling_inspector_reports_authoritative_topology_or_diagnostics() {
         let mut spec = crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4);
         spec.tiling = Some(crate::sim::tiling::build_preset(
@@ -1189,5 +1280,35 @@ mod tests {
         assert!(text.contains("exact edge-to-edge tiling"));
         assert!(text.contains("Euler 0"));
         assert!(text.contains("neighbor seams 6"));
+    }
+
+    #[test]
+    fn empty_tiling_guidance_mentions_free_drawing_and_presets() {
+        let state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        let text = tiling_inspector_texts(&state).join("\n");
+        assert!(text.contains("[A]"));
+        assert!(text.contains("draw"));
+        assert!(text.contains("[P]"));
+    }
+
+    #[test]
+    fn spatial_editors_expose_a_fit_view_action() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        for section in [WorkbenchSection::Tiling, WorkbenchSection::Kernels] {
+            state.select_section(section);
+            let text = toolbar_text(&state);
+            assert!(text.contains("[0] Fit"), "{section:?} toolbar was {text:?}");
+            let column = text.find("[0] Fit").unwrap() as u16 + 2;
+            assert_eq!(
+                toolbar_action_at(&state, column),
+                Some(ToolbarAction::EditorKey(crossterm::event::KeyCode::Char(
+                    '0'
+                )))
+            );
+        }
     }
 }
