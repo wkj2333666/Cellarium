@@ -118,7 +118,8 @@ test_lifecycle_contract() (
 )
 
 test_lifecycle_smoke() (
-  local case_dir run_id manifest display
+  local case_dir run_id manifest display window_id geometry
+  local window_x window_y window_width window_height screen_width screen_height
   case_dir=$(mktemp -d)
   trap 'rm -rf -- "$case_dir"' EXIT
   AGENTIC_TARGET_DIR="$case_dir/state"
@@ -139,6 +140,17 @@ test_lifecycle_smoke() (
     fail 'Kitty window id was not recorded'
   test -n "$(agentic_manifest_get "$manifest" CLIENT_PID)" || \
     fail 'client pid was not recorded'
+  window_id=$(agentic_manifest_get "$manifest" KITTY_WINDOW_ID)
+  geometry=$(DISPLAY="$display" xdotool getwindowgeometry --shell "$window_id")
+  window_x=$(awk -F= '$1 == "X" { print $2 }' <<<"$geometry")
+  window_y=$(awk -F= '$1 == "Y" { print $2 }' <<<"$geometry")
+  window_width=$(awk -F= '$1 == "WIDTH" { print $2 }' <<<"$geometry")
+  window_height=$(awk -F= '$1 == "HEIGHT" { print $2 }' <<<"$geometry")
+  screen_width=$(agentic_manifest_get "$manifest" SCREEN_WIDTH)
+  screen_height=$(agentic_manifest_get "$manifest" SCREEN_HEIGHT)
+  test "$window_x,$window_y,$window_width,$window_height" = \
+    "0,0,$screen_width,$screen_height" || \
+    fail "Kitty is not a 1:1 fullscreen viewport: $window_x,$window_y ${window_width}x$window_height"
 
   "$repo_root/scripts/agentic/session.sh" stop "$run_id"
   if "$repo_root/scripts/agentic/session.sh" status "$run_id"; then
