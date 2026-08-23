@@ -123,6 +123,89 @@ fn terminal_screen_visual_hash_includes_ansi_colors() {
     assert_ne!(red, green);
 }
 
+#[cfg(feature = "cuda")]
+#[test]
+#[ignore = "requires tinker's NVIDIA driver and NVRTC"]
+fn basis_cpu_cuda_parity() {
+    use cellarium::sim::cpu::CpuExperimentBackend;
+    use cellarium::sim::cuda::CudaExperimentBackend;
+    use cellarium::sim::experiment_model::ExperimentSpec;
+    use cellarium::sim::runtime::compile_experiment;
+    use cellarium::sim::tiling::{TilingPreset, build_preset};
+    use cellarium::sim::world::ChannelWorld;
+    use cellarium::workbench::WorkbenchState;
+
+    fn worlds(spec: &ExperimentSpec) -> (ChannelWorld, ChannelWorld) {
+        let cell_count = spec.geometry.tile_count().unwrap();
+        let bases = spec.basis_ids().len();
+        let channels = spec
+            .channels
+            .iter()
+            .map(|channel| {
+                if channel.initial.len() == cell_count * bases {
+                    channel.initial.clone()
+                } else {
+                    channel
+                        .initial
+                        .iter()
+                        .flat_map(|value| std::iter::repeat_n(*value, bases))
+                        .collect()
+                }
+            })
+            .collect::<Vec<_>>();
+        let width = match spec.geometry {
+            cellarium::sim::experiment_model::GeometrySpec::RasterGrid(ref grid) => {
+                grid.width as usize
+            }
+        };
+        let height = cell_count / width;
+        (
+            ChannelWorld::from_basis_channels(width, height, bases, &channels).unwrap(),
+            ChannelWorld::from_basis_channels(width, height, bases, &channels).unwrap(),
+        )
+    }
+
+    fn assert_parity(spec: ExperimentSpec, label: &str) {
+        let compiled = compile_experiment(&spec).unwrap();
+        let mut cpu = CpuExperimentBackend::new(compiled.clone());
+        let mut gpu = CudaExperimentBackend::new(compiled)
+            .unwrap_or_else(|error| panic!("{label}: tinker CUDA unavailable: {error}"));
+        let (mut cpu_world, mut gpu_world) = worlds(&spec);
+        for _ in 0..3 {
+            cpu.step(&mut cpu_world).unwrap();
+            gpu.step(&mut gpu_world).unwrap();
+        }
+        for (index, (lhs, rhs)) in cpu_world.cells().iter().zip(gpu_world.cells()).enumerate() {
+            assert!((lhs - rhs).abs() < 1e-5, "{label}[{index}]: {lhs} != {rhs}");
+        }
+    }
+
+    for preset in [
+        TilingPreset::Square,
+        TilingPreset::EquilateralTriangles,
+        TilingPreset::RegularHexagon,
+        TilingPreset::OctagonSquare,
+    ] {
+        let mut spec = ExperimentSpec::single_channel_lenia(4, 3);
+        spec.tiling = Some(build_preset(preset, 1.0));
+        assert_parity(spec.normalize_rules().unwrap(), &format!("{preset:?}"));
+    }
+
+    let mut spec = ExperimentSpec::single_channel_lenia(4, 3);
+    spec.tiling = Some(build_preset(TilingPreset::OctagonSquare, 1.0));
+    let mut workbench = WorkbenchState::new(spec.normalize_rules().unwrap());
+    workbench.add_channel().unwrap();
+    workbench.add_channel().unwrap();
+    workbench.add_kernel_for_selected().unwrap();
+    assert_eq!(workbench.draft().channels.len(), 3);
+    let selected = workbench.selected_rule_set().unwrap();
+    assert_eq!(
+        workbench.draft().rules.get(selected).unwrap().kernels.len(),
+        2
+    );
+    assert_parity(workbench.draft().clone(), "three-channel two-kernel");
+}
+
 #[test]
 #[ignore = "requires a configured SSH alias and the installed tinker server"]
 fn tinker_protocol_observes_gpu_rates_and_input_latency() {
