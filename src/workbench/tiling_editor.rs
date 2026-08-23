@@ -289,7 +289,7 @@ impl GraphicsScene for TilingScene {
         let width = width.max(1);
         let height = height.max(1);
         let mut rgba = vec![0_u8; width as usize * height as usize * 4];
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(&[5, 10, 24, 255]);
         }
         let mut selected_handles = None;
@@ -444,7 +444,7 @@ fn draw_filled_polygon(
             }
         }
         intersections.sort_by(|a, b| a.total_cmp(b));
-        for pair in intersections.chunks_exact(2) {
+        for pair in intersections.as_chunks::<2>().0 {
             let start = pair[0].ceil().max(0.0) as i32;
             let end = pair[1].floor().min(f64::from(width.saturating_sub(1))) as i32;
             for x in start..=end {
@@ -659,7 +659,9 @@ mod tests {
         assert!(
             frame
                 .rgba
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|pixel| pixel[0] > 0 || pixel[1] > 0 || pixel[2] > 0)
         );
     }
@@ -676,7 +678,11 @@ mod tests {
             [255, 255, 255, 255],
         );
         assert_eq!(
-            rgba.chunks_exact(4).filter(|pixel| pixel[0] == 255).count(),
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|pixel| pixel[0] == 255)
+                .count(),
             64
         );
     }

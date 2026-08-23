@@ -287,7 +287,7 @@ impl GraphicsScene for KernelScene {
         let mut rgba = vec![8_u8; width.max(1) as usize * height.max(1) as usize * 4];
         let width = width.max(1);
         let height = height.max(1);
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             pixel[3] = 255;
         }
         let (_, _, values) = self.values();
@@ -546,7 +546,7 @@ impl GraphicsScene for PeriodicKernelScene {
         let width = width.max(1);
         let height = height.max(1);
         let mut rgba = vec![0_u8; width as usize * height as usize * 4];
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(&[8, 8, 8, 255]);
         }
         let cells = self.cells();
@@ -632,7 +632,7 @@ fn draw_world_polygon(
             }
         }
         intersections.sort_by(f64::total_cmp);
-        for pair in intersections.chunks_exact(2) {
+        for pair in intersections.as_chunks::<2>().0 {
             let start = pair[0].ceil().max(0.0) as i32;
             let end = pair[1].floor().min(f64::from(width.saturating_sub(1))) as i32;
             for x in start..=end {
@@ -754,7 +754,9 @@ mod tests {
         assert!(
             frame
                 .rgba
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|p| p[0] != 8 || p[1] != 8 || p[2] != 8)
         );
     }
@@ -788,7 +790,9 @@ mod tests {
         let frame = scene.render_rgba(192, 192);
         let colors = frame
             .rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|pixel| [pixel[0], pixel[1], pixel[2]])
             .collect::<std::collections::HashSet<_>>();
         assert!(
@@ -886,7 +890,9 @@ mod tests {
         let frame = scene.render_rgba(464, 512);
         let clearly_visible = frame
             .rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .filter(|pixel| pixel[1] > 64 || pixel[0] > 64)
             .count();
         assert!(
@@ -927,13 +933,17 @@ mod tests {
         assert!(
             frame
                 .rgba
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|pixel| pixel[1] > 120 && pixel[2] > 120)
         );
         assert!(
             frame
                 .rgba
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .any(|pixel| pixel[0] > 120 && pixel[1] < 100)
         );
         for source_basis in [BasisId(0), BasisId(1)] {

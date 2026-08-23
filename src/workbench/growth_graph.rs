@@ -54,7 +54,7 @@ impl GraphicsScene for GrowthScene {
         let width = width.max(1);
         let height = height.max(1);
         let mut rgba = vec![10_u8; width as usize * height as usize * 4];
-        for p in rgba.chunks_exact_mut(4) {
+        for p in rgba.as_chunks_mut::<4>().0 {
             p[3] = 255;
         }
         let axis = [48_u8, 58, 76, 255];
@@ -251,7 +251,7 @@ mod tests {
         );
         let scene = GrowthScene::from_editor(&editor);
         let frame = scene.render_rgba(200, 120);
-        assert!(frame.rgba.chunks_exact(4).any(|p| p[1] > 100));
+        assert!(frame.rgba.as_chunks::<4>().0.iter().any(|p| p[1] > 100));
     }
     #[test]
     fn graph_pixels_change_after_valid_source_edit() {
@@ -297,7 +297,9 @@ mod tests {
         let frame = scene.render_rgba(320, 220);
         let colors = frame
             .rgba
-            .chunks_exact(4)
+            .as_chunks::<4>()
+            .0
+            .iter()
             .map(|pixel| [pixel[0], pixel[1], pixel[2]])
             .collect::<std::collections::BTreeSet<_>>();
         assert!(
@@ -307,7 +309,9 @@ mod tests {
         assert!(
             frame
                 .rgba
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|pixel| pixel[0] > 30 || pixel[1] > 30)
                 .count()
                 > 20_000
