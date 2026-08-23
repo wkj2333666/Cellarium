@@ -253,9 +253,7 @@ impl ExperimentSpec {
             return Err(vec![ExperimentModelError::AmbiguousRuleRepresentations]);
         }
         if !has_normalized {
-            if let Err(errors) = validate_structure(&self) {
-                return Err(errors);
-            }
+            validate_structure(&self)?;
             let basis_ids = self.basis_ids();
             let active_channels = self
                 .channels

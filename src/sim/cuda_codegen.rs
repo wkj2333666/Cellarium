@@ -2,6 +2,13 @@ use std::collections::BTreeSet;
 
 use crate::sim::expression::{BinaryOp, ExpressionVariable, Function, KernelExpression, UnaryOp};
 use crate::sim::program::{InputSource, RuleProgram};
+use crate::sim::{
+    basis_runtime::CompiledBasisExperiment,
+    growth::{
+        ast::{BinaryOp as GrowthBinaryOp, UnaryOp as GrowthUnaryOp},
+        types::{TypedBinding, TypedExpr, TypedExprKind, TypedProgram, ValueType},
+    },
+};
 
 const MAX_CODEGEN_DEPTH: usize = 256;
 const ENTRY_POINT: &str = "cellarium_step";
@@ -131,6 +138,391 @@ pub struct ProgramKernelData {
     pub anchor_y: Vec<i32>,
     pub channels: Vec<i32>,
 }
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct BasisKernelData {
+    pub offsets: Vec<i32>,
+    pub dx: Vec<i32>,
+    pub dy: Vec<i32>,
+    pub source_bases: Vec<i32>,
+    pub weights: Vec<f32>,
+    pub source_channels: Vec<i32>,
+    pub boundary_constants: Vec<f32>,
+}
+
+pub fn basis_kernel_data(
+    compiled: &CompiledBasisExperiment,
+) -> Result<BasisKernelData, CodegenError> {
+    let kernel_count = compiled
+        .rules
+        .iter()
+        .map(|rule| rule.kernels.len())
+        .sum::<usize>();
+    let mut data = BasisKernelData {
+        offsets: Vec::with_capacity(kernel_count + 1),
+        dx: Vec::new(),
+        dy: Vec::new(),
+        source_bases: Vec::new(),
+        weights: Vec::new(),
+        source_channels: Vec::with_capacity(kernel_count),
+        boundary_constants: Vec::with_capacity(kernel_count),
+    };
+    data.offsets.push(0);
+    for rule in &compiled.rules {
+        for kernel in &rule.kernels {
+            data.source_channels.push(
+                i32::try_from(kernel.source_channel)
+                    .map_err(|_| CodegenError::InvalidKernelLayout)?,
+            );
+            data.boundary_constants.push(kernel.boundary_constant);
+            for weight in &kernel.weights {
+                data.dx.push(i32::from(weight.dx));
+                data.dy.push(i32::from(weight.dy));
+                data.source_bases.push(
+                    i32::try_from(weight.source_basis)
+                        .map_err(|_| CodegenError::InvalidKernelLayout)?,
+                );
+                data.weights.push(weight.weight);
+            }
+            data.offsets.push(
+                i32::try_from(data.weights.len()).map_err(|_| CodegenError::InvalidKernelLayout)?,
+            );
+        }
+    }
+    if data.weights.is_empty() {
+        data.dx.push(0);
+        data.dy.push(0);
+        data.source_bases.push(0);
+        data.weights.push(0.0);
+    }
+    if data.source_channels.is_empty() {
+        data.source_channels.push(0);
+        data.boundary_constants.push(0.0);
+    }
+    Ok(data)
+}
+
+pub fn generate_basis_cuda_source(
+    compiled: &CompiledBasisExperiment,
+) -> Result<GeneratedCudaSource, CodegenError> {
+    let mut source = String::from(BASIS_CUDA_HEADER);
+    let mut kernel_index = 0usize;
+    for (rule_index, rule) in compiled.rules.iter().enumerate() {
+        source.push_str(&format!("case {rule_index}: {{\n"));
+        if rule.frozen {
+            source.push_str("next[linear] = current[linear]; break; }\n");
+            continue;
+        }
+        for (input_index, _) in rule.kernels.iter().enumerate() {
+            source.push_str(&format!(
+                "float kernel_input_{input_index} = cellarium_basis_convolve(current, kernel_offsets, weight_dx, weight_dy, weight_source_bases, weight_values, kernel_sources, kernel_constants, width, height, basis_count, boundary_mode, site, {kernel_index});\n"
+            ));
+            source.push_str(&format!(
+                "if (!isfinite(kernel_input_{input_index})) {{ atomicExch(error_flag, 1); return; }}\n"
+            ));
+            kernel_index += 1;
+        }
+        let program = rule
+            .program
+            .as_ref()
+            .ok_or(CodegenError::InvalidKernelLayout)?;
+        let mut symbols = Vec::with_capacity(program.externals.ordered().len());
+        for input_index in 0..program.externals.kernel_inputs.len() {
+            symbols.push(format!("kernel_input_{input_index}"));
+        }
+        symbols.push("self_value".to_string());
+        let mut parameters = program.externals.parameters.clone();
+        parameters.sort();
+        for parameter in parameters {
+            let value = rule
+                .parameters
+                .get(&parameter)
+                .ok_or_else(|| CodegenError::UnknownSymbol(parameter.clone()))?;
+            symbols.push(cuda_float(*value)?);
+        }
+        let body = generate_typed_program(program, &symbols)?;
+        source.push_str(&body.statements);
+        let result = match rule.mode {
+            crate::sim::experiment_model::UpdateMode::GrowthRate => {
+                format!(
+                    "fminf(1.0f, fmaxf(0.0f, self_value + dt * ({})))",
+                    body.expression
+                )
+            }
+            crate::sim::experiment_model::UpdateMode::DirectUpdate => {
+                format!("fminf(1.0f, fmaxf(0.0f, {}))", body.expression)
+            }
+        };
+        source.push_str(&format!(
+            "float result = {result};\nif (!isfinite(result)) {{ atomicExch(error_flag, 1); return; }}\nnext[linear] = result;\nbreak; }}\n"
+        ));
+    }
+    source.push_str("default: atomicExch(error_flag, 1); return;\n}\n}\n");
+    Ok(GeneratedCudaSource {
+        source,
+        entry_point: "cellarium_basis_step",
+    })
+}
+
+struct TypedCuda {
+    statements: String,
+    expression: String,
+}
+
+fn generate_typed_program(
+    program: &TypedProgram,
+    externals: &[String],
+) -> Result<TypedCuda, CodegenError> {
+    if externals.len() != program.externals.ordered().len() {
+        return Err(CodegenError::InvalidKernelLayout);
+    }
+    let symbols = externals.to_vec();
+    let mut statements = String::new();
+    let mut temporary = program.symbol_count;
+    for binding in &program.bindings {
+        emit_typed_binding(binding, &symbols, &mut temporary, &mut statements)?;
+    }
+    let result = emit_typed_expr(&program.result, &symbols, &mut temporary)?;
+    statements.push_str(&result.statements);
+    Ok(TypedCuda {
+        statements,
+        expression: result.expression,
+    })
+}
+
+fn emit_typed_binding(
+    binding: &TypedBinding,
+    symbols: &[String],
+    temporary: &mut usize,
+    output: &mut String,
+) -> Result<(), CodegenError> {
+    let value = emit_typed_expr(&binding.value, symbols, temporary)?;
+    output.push_str(&value.statements);
+    output.push_str(match binding.value.ty {
+        ValueType::Scalar => "float ",
+        ValueType::Bool => "bool ",
+    });
+    output.push_str(&format!("s{} = {};\n", binding.id.0, value.expression));
+    Ok(())
+}
+
+fn emit_typed_expr(
+    expression: &TypedExpr,
+    symbols: &[String],
+    temporary: &mut usize,
+) -> Result<TypedCuda, CodegenError> {
+    let plain = |expression| TypedCuda {
+        statements: String::new(),
+        expression,
+    };
+    match &expression.kind {
+        TypedExprKind::Constant(value) => Ok(plain(cuda_float(*value)?)),
+        TypedExprKind::Bool(value) => Ok(plain(value.to_string())),
+        TypedExprKind::Symbol(id) => Ok(plain(
+            symbols
+                .get(id.0 as usize)
+                .cloned()
+                .unwrap_or_else(|| format!("s{}", id.0)),
+        )),
+        TypedExprKind::Unary { op, operand } => {
+            let operand = emit_typed_expr(operand, symbols, temporary)?;
+            let op = match op {
+                GrowthUnaryOp::Neg => "-",
+                GrowthUnaryOp::Not => "!",
+            };
+            Ok(TypedCuda {
+                statements: operand.statements,
+                expression: checked_typed(format!("({op}({}))", operand.expression), expression.ty),
+            })
+        }
+        TypedExprKind::Binary { op, lhs, rhs } => {
+            let lhs = emit_typed_expr(lhs, symbols, temporary)?;
+            let rhs = emit_typed_expr(rhs, symbols, temporary)?;
+            let operator = match op {
+                GrowthBinaryOp::Add => "+",
+                GrowthBinaryOp::Subtract => "-",
+                GrowthBinaryOp::Multiply => "*",
+                GrowthBinaryOp::Divide => "/",
+                GrowthBinaryOp::Equal => "==",
+                GrowthBinaryOp::NotEqual => "!=",
+                GrowthBinaryOp::Less => "<",
+                GrowthBinaryOp::LessEqual => "<=",
+                GrowthBinaryOp::Greater => ">",
+                GrowthBinaryOp::GreaterEqual => ">=",
+                GrowthBinaryOp::And => "&&",
+                GrowthBinaryOp::Or => "||",
+                GrowthBinaryOp::Power => {
+                    return Ok(TypedCuda {
+                        statements: lhs.statements + &rhs.statements,
+                        expression: checked_typed(
+                            format!("powf({}, {})", lhs.expression, rhs.expression),
+                            expression.ty,
+                        ),
+                    });
+                }
+            };
+            Ok(TypedCuda {
+                statements: lhs.statements + &rhs.statements,
+                expression: checked_typed(
+                    format!("({} {operator} {})", lhs.expression, rhs.expression),
+                    expression.ty,
+                ),
+            })
+        }
+        TypedExprKind::Call { name, arguments } => {
+            let mut statements = String::new();
+            let mut values = Vec::with_capacity(arguments.len());
+            for argument in arguments {
+                let argument = emit_typed_expr(argument, symbols, temporary)?;
+                statements.push_str(&argument.statements);
+                values.push(argument.expression);
+            }
+            Ok(TypedCuda {
+                statements,
+                expression: checked_typed(typed_call(name, &values)?, expression.ty),
+            })
+        }
+        TypedExprKind::If {
+            condition,
+            then_branch,
+            then_result,
+            else_branch,
+            else_result,
+        } => {
+            let condition = emit_typed_expr(condition, symbols, temporary)?;
+            let name = format!("tmp_{}", *temporary);
+            *temporary += 1;
+            let mut statements = condition.statements;
+            statements.push_str(match expression.ty {
+                ValueType::Scalar => "float ",
+                ValueType::Bool => "bool ",
+            });
+            statements.push_str(&format!("{name};\nif ({}) {{\n", condition.expression));
+            for binding in then_branch {
+                emit_typed_binding(binding, symbols, temporary, &mut statements)?;
+            }
+            let then_result = emit_typed_expr(then_result, symbols, temporary)?;
+            statements.push_str(&then_result.statements);
+            statements.push_str(&format!(
+                "{name} = {};\n}} else {{\n",
+                then_result.expression
+            ));
+            for binding in else_branch {
+                emit_typed_binding(binding, symbols, temporary, &mut statements)?;
+            }
+            let else_result = emit_typed_expr(else_result, symbols, temporary)?;
+            statements.push_str(&else_result.statements);
+            statements.push_str(&format!("{name} = {};\n}}\n", else_result.expression));
+            Ok(TypedCuda {
+                statements,
+                expression: checked_typed(name, expression.ty),
+            })
+        }
+    }
+}
+
+fn checked_typed(expression: String, ty: ValueType) -> String {
+    match ty {
+        ValueType::Scalar => format!("cellarium_checked({expression}, error_flag)"),
+        ValueType::Bool => expression,
+    }
+}
+
+fn typed_call(name: &str, values: &[String]) -> Result<String, CodegenError> {
+    let one = |function: &str| (values.len() == 1).then(|| format!("{function}({})", values[0]));
+    let result = match name {
+        "sqrt" => one("sqrtf"),
+        "abs" => one("fabsf"),
+        "exp" => one("expf"),
+        "log" => one("logf"),
+        "sin" => one("sinf"),
+        "cos" => one("cosf"),
+        "tanh" => one("tanhf"),
+        "floor" => one("floorf"),
+        "ceil" => one("ceilf"),
+        "round" => one("roundf"),
+        "sign" => one("cellarium_sign"),
+        "min" if values.len() == 2 => Some(format!("fminf({}, {})", values[0], values[1])),
+        "max" if values.len() == 2 => Some(format!("fmaxf({}, {})", values[0], values[1])),
+        "step" if values.len() == 2 => {
+            Some(format!("(({}) < ({}) ? 0.0f : 1.0f)", values[1], values[0]))
+        }
+        "clamp" if values.len() == 3 => Some(format!(
+            "fminf({}, fmaxf({}, {}))",
+            values[2], values[1], values[0]
+        )),
+        "smoothstep" if values.len() == 3 => Some(format!(
+            "cellarium_smoothstep({}, {}, {})",
+            values[0], values[1], values[2]
+        )),
+        "mix" if values.len() == 3 => Some(format!(
+            "(({}) + (({}) - ({})) * ({}))",
+            values[0], values[1], values[0], values[2]
+        )),
+        "gauss" if values.len() == 3 => Some(format!(
+            "expf(-0.5f * powf((({}) - ({})) / ({}), 2.0f))",
+            values[0], values[1], values[2]
+        )),
+        _ => None,
+    };
+    result.ok_or(CodegenError::InvalidFunctionArity)
+}
+
+const BASIS_CUDA_HEADER: &str = r#"
+extern "C" __device__ int cellarium_basis_index(int value, int size, int mode, int* valid) {
+    if (value >= 0 && value < size) { *valid = 1; return value; }
+    if (mode == 0 || mode == 1) { *valid = 0; return 0; }
+    if (mode == 2) { int wrapped = value % size; return wrapped < 0 ? wrapped + size : wrapped; }
+    if (mode == 3) { return value < 0 ? 0 : (value >= size ? size - 1 : value); }
+    int span = size - 1; if (span == 0) return 0; int period = span * 2;
+    int folded = value % period; if (folded < 0) folded += period;
+    return folded <= span ? folded : period - folded;
+}
+extern "C" __device__ float cellarium_sign(float x) { return (x > 0.0f) - (x < 0.0f); }
+extern "C" __device__ float cellarium_checked(float x, int* error_flag) {
+    if (!isfinite(x)) atomicExch(error_flag, 1);
+    return x;
+}
+extern "C" __device__ float cellarium_smoothstep(float a, float b, float x) {
+    float t = fminf(1.0f, fmaxf(0.0f, (x - a) / (b - a)));
+    return t * t * (3.0f - 2.0f * t);
+}
+extern "C" __device__ float cellarium_basis_convolve(
+    const float* current, const int* kernel_offsets, const int* weight_dx,
+    const int* weight_dy, const int* weight_source_bases, const float* weight_values,
+    const int* kernel_sources, const float* kernel_constants, int width, int height,
+    int basis_count, int boundary_mode, int site, int kernel) {
+    int x = site % width; int y = site / width; float sum = 0.0f;
+    for (int weight = kernel_offsets[kernel]; weight < kernel_offsets[kernel + 1]; ++weight) {
+        int valid_x = 1; int valid_y = 1;
+        int nx = cellarium_basis_index(x + weight_dx[weight], width, boundary_mode, &valid_x);
+        int ny = cellarium_basis_index(y + weight_dy[weight], height, boundary_mode, &valid_y);
+        int source_basis = weight_source_bases[weight];
+        int source_site = ny * width + nx;
+        float sample = (valid_x && valid_y)
+            ? current[kernel_sources[kernel] * width * height * basis_count + source_site * basis_count + source_basis]
+            : (boundary_mode == 1 ? kernel_constants[kernel] : 0.0f);
+        sum += weight_values[weight] * sample;
+    }
+    return sum;
+}
+extern "C" __global__ void cellarium_basis_step(
+    float* next, const float* current, const int* kernel_offsets,
+    const int* weight_dx, const int* weight_dy, const int* weight_source_bases,
+    const float* weight_values, const int* kernel_sources, const float* kernel_constants,
+    int* error_flag, int width, int height, int basis_count, int channel_count,
+    int boundary_mode, float dt) {
+    int linear = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    int site_count = width * height; int total = site_count * basis_count * channel_count;
+    if (linear >= total) return;
+    int within_channel = linear % (site_count * basis_count);
+    int site = within_channel / basis_count;
+    int target_basis = within_channel % basis_count;
+    int target_channel = linear / (site_count * basis_count);
+    int rule_index = target_channel * basis_count + target_basis;
+    float self_value = current[linear];
+    switch (rule_index) {
+"#;
 
 pub fn program_kernel_data(program: &RuleProgram) -> Result<ProgramKernelData, CodegenError> {
     let mut data = ProgramKernelData {
@@ -469,6 +861,7 @@ mod tests {
     use crate::sim::kernel::{KernelDefinition, KernelValues, Normalization};
     use crate::sim::parser::parse_and_validate;
     use crate::sim::program::{RuleInput, RuleProgram};
+    use crate::sim::tiling::{TilingPreset, build_preset};
 
     fn growth(source: &str) -> KernelExpression {
         let symbols = BTreeSet::from([
@@ -535,5 +928,26 @@ mod tests {
         assert_eq!(metadata.heights, vec![0, 1]);
         assert_eq!(metadata.values, vec![1.0]);
         assert_eq!(metadata.masks, vec![1]);
+    }
+
+    #[test]
+    fn basis_sparse_codegen_uses_basis_contiguous_state_and_guards_results() {
+        let mut spec = crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(2, 2);
+        spec.tiling = Some(build_preset(TilingPreset::EquilateralTriangles, 1.0));
+        let spec = spec.normalize_rules().unwrap();
+        let compiled = crate::sim::basis_runtime::compile_basis_experiment(&spec).unwrap();
+
+        let generated = generate_basis_cuda_source(&compiled).unwrap();
+
+        assert_eq!(generated.entry_point, "cellarium_basis_step");
+        assert!(
+            generated
+                .source
+                .contains("site * basis_count + source_basis")
+        );
+        assert!(generated.source.contains("kernel_offsets[kernel + 1]"));
+        assert!(generated.source.contains("atomicExch(error_flag, 1)"));
+        assert!(generated.source.contains("switch (rule_index)"));
+        assert!(generated.source.contains("float kernel_input_0 ="));
     }
 }

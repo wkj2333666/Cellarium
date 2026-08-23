@@ -165,14 +165,14 @@ impl GraphicsScene for GrowthScene {
                 previous = Some(point);
             }
         }
-        if let Some(cursor) = self.cursor {
-            if !self.plot.is_empty() {
-                let x = 24
-                    + (cursor.sample * width.saturating_sub(33) as usize
-                        / self.plot.len().saturating_sub(1).max(1)) as i32;
-                for y in 8..height.saturating_sub(24) {
-                    blend(&mut rgba, width, height, x, y as i32, [255, 220, 100, 255]);
-                }
+        if let Some(cursor) = self.cursor
+            && !self.plot.is_empty()
+        {
+            let x = 24
+                + (cursor.sample * width.saturating_sub(33) as usize
+                    / self.plot.len().saturating_sub(1).max(1)) as i32;
+            for y in 8..height.saturating_sub(24) {
+                blend(&mut rgba, width, height, x, y as i32, [255, 220, 100, 255]);
             }
         }
         if self.stale {

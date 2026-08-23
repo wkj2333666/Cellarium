@@ -255,10 +255,10 @@ impl PeriodicArrangement {
         for (index, fragment) in fragments.iter().enumerate() {
             let mut candidates = Vec::new();
             for (other_index, other) in fragments.iter().enumerate() {
-                if let Some(offset) = reversed_lattice_match(*fragment, *other, draft) {
-                    if index != other_index || offset != [0, 0] {
-                        candidates.push((other_index, offset));
-                    }
+                if let Some(offset) = reversed_lattice_match(*fragment, *other, draft)
+                    && (index != other_index || offset != [0, 0])
+                {
+                    candidates.push((other_index, offset));
                 }
             }
             candidates.sort_unstable();

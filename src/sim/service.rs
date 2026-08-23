@@ -147,13 +147,84 @@ mod tests {
         assert!((service.world().get_basis(0, 0, 0, 0) - 0.2).abs() < 1e-6);
         assert!((service.world().get_basis(0, 0, 0, 1) - 0.2).abs() < 1e-6);
     }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn service_prefers_cuda_for_normalized_experiments_when_available() {
+        let spec = ExperimentSpec::single_channel_lenia(2, 2)
+            .normalize_rules()
+            .unwrap();
+        let compiled = crate::sim::runtime::compile_experiment(&spec).unwrap();
+        if crate::sim::cuda::CudaExperimentBackend::new(compiled).is_err() {
+            return;
+        }
+
+        let service = ExperimentService::new(spec).unwrap();
+
+        assert_eq!(
+            service.backend_kind(),
+            crate::sim::backend::BackendKind::Cuda
+        );
+        assert_ne!(service.backend_name(), "CPU experiment");
+    }
 }
+use crate::sim::backend::BackendKind;
 use crate::sim::experiment_model::{ExperimentSpec, validate_structure};
 use crate::sim::ruleset::RuleSetError;
 use crate::sim::runtime::{
     CompiledExperiment, CpuExperimentBackend, RuntimeError, compile_experiment,
 };
 use crate::sim::world::{ChannelWorld, ChannelWorldError};
+
+enum ExperimentBackend {
+    Cpu(CpuExperimentBackend),
+    #[cfg(feature = "cuda")]
+    Cuda(Box<crate::sim::cuda::CudaExperimentBackend>),
+}
+
+impl ExperimentBackend {
+    fn preferred(compiled: CompiledExperiment) -> Self {
+        #[cfg(feature = "cuda")]
+        if let Ok(backend) = crate::sim::cuda::CudaExperimentBackend::new(compiled.clone()) {
+            return Self::Cuda(Box::new(backend));
+        }
+        Self::Cpu(CpuExperimentBackend::new(compiled))
+    }
+
+    fn step(&mut self, world: &mut ChannelWorld) -> Result<(), RuntimeError> {
+        match self {
+            Self::Cpu(backend) => backend.step(world),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(backend) => backend
+                .step(world)
+                .map_err(|error| RuntimeError::Model(error.to_string())),
+        }
+    }
+
+    fn tick(&self) -> u64 {
+        match self {
+            Self::Cpu(backend) => backend.tick(),
+            #[cfg(feature = "cuda")]
+            Self::Cuda(backend) => backend.tick(),
+        }
+    }
+
+    fn kind(&self) -> BackendKind {
+        match self {
+            Self::Cpu(_) => BackendKind::Cpu,
+            #[cfg(feature = "cuda")]
+            Self::Cuda(_) => BackendKind::Cuda,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            Self::Cpu(_) => "CPU experiment",
+            #[cfg(feature = "cuda")]
+            Self::Cuda(backend) => backend.device_name(),
+        }
+    }
+}
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DiagnosticPath(pub Vec<String>);
@@ -206,7 +277,7 @@ pub struct PreparedExperiment {
 pub struct ActiveExperiment {
     spec: ExperimentSpec,
     world: ChannelWorld,
-    backend: CpuExperimentBackend,
+    backend: ExperimentBackend,
 }
 
 pub struct ExperimentService {
@@ -230,7 +301,7 @@ impl ExperimentService {
             active: ActiveExperiment {
                 spec,
                 world,
-                backend: CpuExperimentBackend::new(compiled),
+                backend: ExperimentBackend::preferred(compiled),
             },
             revision: 0,
         })
@@ -274,6 +345,14 @@ impl ExperimentService {
     }
     pub fn tick(&self) -> u64 {
         self.active.backend.tick()
+    }
+
+    pub fn backend_kind(&self) -> BackendKind {
+        self.active.backend.kind()
+    }
+
+    pub fn backend_name(&self) -> &str {
+        self.active.backend.name()
     }
 
     pub fn audit_snapshot(&self) -> AuditSnapshot {
@@ -326,7 +405,7 @@ impl ExperimentService {
             .revision
             .checked_add(1)
             .ok_or_else(|| reject(prepared.request_id, "experiment revision overflow"))?;
-        let backend = CpuExperimentBackend::new(prepared.compiled);
+        let backend = ExperimentBackend::preferred(prepared.compiled);
         self.active = ActiveExperiment {
             spec: prepared.spec.clone(),
             world: prepared.world,

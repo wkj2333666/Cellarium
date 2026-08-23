@@ -820,20 +820,17 @@ impl App {
     }
 
     pub fn backend_kind(&self) -> BackendKind {
-        if self.experiment_service.is_some() {
-            BackendKind::Cpu
-        } else {
-            self.backend.kind()
-        }
+        self.experiment_service
+            .as_ref()
+            .map_or_else(|| self.backend.kind(), ExperimentService::backend_kind)
     }
 
     pub fn backend_name(&self) -> &str {
         self.remote_backend.as_deref().unwrap_or_else(|| {
-            if self.experiment_service.is_some() {
-                "CPU experiment"
-            } else {
-                self.backend.device_name()
-            }
+            self.experiment_service.as_ref().map_or_else(
+                || self.backend.device_name(),
+                ExperimentService::backend_name,
+            )
         })
     }
 
@@ -1778,16 +1775,15 @@ impl App {
                             py,
                             frame_size[0] as u32,
                             frame_size[1] as u32,
-                        ) {
-                            if self.workbench.set_selected_basis(basis).is_ok() {
-                                self.workbench_notice = Some(format!(
-                                    "selected basis {} · Kernels/Growth now target it",
-                                    basis.0,
-                                ));
-                                self.workbench_draft_scene_generation =
-                                    self.workbench_draft_scene_generation.wrapping_add(1);
-                                return true;
-                            }
+                        ) && self.workbench.set_selected_basis(basis).is_ok()
+                        {
+                            self.workbench_notice = Some(format!(
+                                "selected basis {} · Kernels/Growth now target it",
+                                basis.0,
+                            ));
+                            self.workbench_draft_scene_generation =
+                                self.workbench_draft_scene_generation.wrapping_add(1);
+                            return true;
                         }
                     }
                     let applied = match action {

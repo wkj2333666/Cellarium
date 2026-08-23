@@ -10,8 +10,8 @@ use cudarc::nvrtc::{Ptx, compile_ptx};
 
 pub use crate::sim::backend_error::BackendError;
 use crate::sim::cuda_codegen::{
-    generate_cuda_expression, generate_cuda_source, generate_program_cuda_source,
-    generate_topology_cuda_source, program_kernel_data,
+    basis_kernel_data, generate_basis_cuda_source, generate_cuda_expression, generate_cuda_source,
+    generate_program_cuda_source, generate_topology_cuda_source, program_kernel_data,
 };
 use crate::sim::experiment_model::UpdateMode;
 use crate::sim::expression::KernelExpression;
@@ -60,6 +60,15 @@ pub struct CudaBackend {
 }
 
 pub struct CudaExperimentBackend {
+    inner: CudaExperimentKind,
+}
+
+enum CudaExperimentKind {
+    Raster(RasterCudaExperimentBackend),
+    Basis(CudaBasisExperimentBackend),
+}
+
+struct RasterCudaExperimentBackend {
     stream: Arc<CudaStream>,
     functions: Vec<CudaFunction>,
     kernel_values: CudaSlice<f32>,
@@ -79,6 +88,29 @@ pub struct CudaExperimentBackend {
     boundary_mode: i32,
     dt: f32,
     rules: Vec<CudaTargetRule>,
+    tick: u64,
+    device_name: String,
+}
+
+struct CudaBasisExperimentBackend {
+    stream: Arc<CudaStream>,
+    function: CudaFunction,
+    kernel_offsets: CudaSlice<i32>,
+    weight_dx: CudaSlice<i32>,
+    weight_dy: CudaSlice<i32>,
+    weight_source_bases: CudaSlice<i32>,
+    weight_values: CudaSlice<f32>,
+    kernel_sources: CudaSlice<i32>,
+    kernel_constants: CudaSlice<f32>,
+    error_flag: CudaSlice<i32>,
+    current: CudaSlice<f32>,
+    next: CudaSlice<f32>,
+    width: usize,
+    height: usize,
+    bases: usize,
+    channels: usize,
+    boundary_mode: i32,
+    dt: f32,
     tick: u64,
     device_name: String,
 }
@@ -468,7 +500,7 @@ impl CudaBackend {
     }
 }
 
-impl CudaExperimentBackend {
+impl RasterCudaExperimentBackend {
     pub fn new(compiled: CompiledExperiment) -> Result<Self, BackendError> {
         if compiled.width == 0
             || compiled.height == 0
@@ -629,6 +661,134 @@ impl CudaExperimentBackend {
     }
 }
 
+impl CudaBasisExperimentBackend {
+    fn new(
+        compiled: &crate::sim::basis_runtime::CompiledBasisExperiment,
+    ) -> Result<Self, BackendError> {
+        let context = shared_context()?;
+        let stream = context.default_stream();
+        let device_name = context.name()?;
+        let generated = generate_basis_cuda_source(compiled)?;
+        let module = load_cached_module(&context, &generated.source)?;
+        let function = module.load_function(generated.entry_point)?;
+        let data = basis_kernel_data(compiled)?;
+        let total = compiled
+            .layout
+            .width
+            .checked_mul(compiled.layout.height)
+            .and_then(|value| value.checked_mul(compiled.layout.bases.len()))
+            .and_then(|value| value.checked_mul(compiled.layout.channels))
+            .filter(|value| *value <= u32::MAX as usize)
+            .ok_or(BackendError::InvalidWorld)?;
+        Ok(Self {
+            kernel_offsets: stream.clone_htod(&data.offsets)?,
+            weight_dx: stream.clone_htod(&data.dx)?,
+            weight_dy: stream.clone_htod(&data.dy)?,
+            weight_source_bases: stream.clone_htod(&data.source_bases)?,
+            weight_values: stream.clone_htod(&data.weights)?,
+            kernel_sources: stream.clone_htod(&data.source_channels)?,
+            kernel_constants: stream.clone_htod(&data.boundary_constants)?,
+            error_flag: stream.clone_htod(&[0_i32])?,
+            current: stream.alloc_zeros(total)?,
+            next: stream.alloc_zeros(total)?,
+            stream,
+            function,
+            width: compiled.layout.width,
+            height: compiled.layout.height,
+            bases: compiled.layout.bases.len(),
+            channels: compiled.layout.channels,
+            boundary_mode: boundary_mode(compiled.boundary),
+            dt: compiled.simulation_dt,
+            tick: 0,
+            device_name,
+        })
+    }
+
+    fn step(&mut self, world: &mut ChannelWorld) -> Result<(), BackendError> {
+        if world.width() != self.width
+            || world.height() != self.height
+            || world.bases() != self.bases
+            || world.channels() != self.channels
+        {
+            return Err(BackendError::InvalidWorld);
+        }
+        self.stream.memcpy_htod(world.cells(), &mut self.current)?;
+        self.stream.memcpy_htod(world.cells(), &mut self.next)?;
+        self.stream.memcpy_htod(&[0_i32], &mut self.error_flag)?;
+        let width = self.width as i32;
+        let height = self.height as i32;
+        let bases = self.bases as i32;
+        let channels = self.channels as i32;
+        let boundary = self.boundary_mode;
+        let total = (self.width * self.height * self.bases * self.channels) as u32;
+        unsafe {
+            self.stream
+                .launch_builder(&self.function)
+                .arg(&mut self.next)
+                .arg(&self.current)
+                .arg(&self.kernel_offsets)
+                .arg(&self.weight_dx)
+                .arg(&self.weight_dy)
+                .arg(&self.weight_source_bases)
+                .arg(&self.weight_values)
+                .arg(&self.kernel_sources)
+                .arg(&self.kernel_constants)
+                .arg(&mut self.error_flag)
+                .arg(&width)
+                .arg(&height)
+                .arg(&bases)
+                .arg(&channels)
+                .arg(&boundary)
+                .arg(&self.dt)
+                .launch(LaunchConfig::for_num_elems(total))
+        }?;
+        let updated = self.stream.clone_dtoh(&self.next)?;
+        let error = self.stream.clone_dtoh(&self.error_flag)?;
+        self.stream.synchronize()?;
+        if error.first().copied().unwrap_or(1) != 0 {
+            return Err(BackendError::Runtime(RuntimeError::NonFiniteState));
+        }
+        world
+            .replace_all(&updated)
+            .map_err(|error| BackendError::Runtime(RuntimeError::World(error)))?;
+        std::mem::swap(&mut self.current, &mut self.next);
+        self.tick += 1;
+        Ok(())
+    }
+}
+
+impl CudaExperimentBackend {
+    pub fn new(compiled: CompiledExperiment) -> Result<Self, BackendError> {
+        let inner = if let Some(basis) = &compiled.basis {
+            CudaExperimentKind::Basis(CudaBasisExperimentBackend::new(basis)?)
+        } else {
+            CudaExperimentKind::Raster(RasterCudaExperimentBackend::new(compiled)?)
+        };
+        Ok(Self { inner })
+    }
+
+    pub fn tick(&self) -> u64 {
+        match &self.inner {
+            CudaExperimentKind::Raster(backend) => backend.tick(),
+            CudaExperimentKind::Basis(backend) => backend.tick,
+        }
+    }
+
+    pub fn device_name(&self) -> &str {
+        match &self.inner {
+            CudaExperimentKind::Raster(backend) => backend.device_name(),
+            CudaExperimentKind::Basis(backend) => &backend.device_name,
+        }
+    }
+
+    pub fn step(&mut self, world: &mut ChannelWorld) -> Result<(), BackendError> {
+        match &mut self.inner {
+            CudaExperimentKind::Raster(backend) => backend.step(world),
+            CudaExperimentKind::Basis(backend) => backend.step(world),
+        }
+    }
+}
+
 fn boundary_mode(boundary: crate::sim::runtime::CompiledBoundary) -> i32 {
     match boundary {
         crate::sim::runtime::CompiledBoundary::Open => 0,
@@ -778,6 +938,104 @@ mod tests {
         for (lhs, rhs) in cpu_world.cells().iter().zip(gpu_world.cells()) {
             assert!((lhs - rhs).abs() < 1e-5, "{lhs} != {rhs}");
         }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn two_basis_cuda_matches_cpu_with_independent_rules_and_typed_growth() {
+        use crate::sim::basis_kernel::{BasisWeightPlane, PeriodicKernelDefinition};
+        use crate::sim::experiment_model::{ChannelId, UpdateMode};
+        use crate::sim::ruleset::{BindingKey, KernelSpatialDefinition};
+        use crate::sim::tiling::{BasisId, TilingPreset, build_preset};
+
+        let mut spec = ExperimentSpec::single_channel_lenia(2, 1);
+        spec.tiling = Some(build_preset(TilingPreset::EquilateralTriangles, 1.0));
+        let mut spec = spec.normalize_rules().unwrap();
+        spec.channels[0].initial = vec![0.25, 0.75, 0.9, 0.1];
+        let output = ChannelId(0);
+        let shared = spec.rules.defaults[&output];
+        let rule = spec.rules.get_mut(shared).unwrap();
+        rule.growth.mode = UpdateMode::DirectUpdate;
+        rule.growth.source = "if potential > 0.5 { potential } else { potential * 0.5 }".into();
+        rule.kernels[0].spatial = KernelSpatialDefinition::Periodic(PeriodicKernelDefinition {
+            width: 1,
+            height: 1,
+            anchor_x: 0,
+            anchor_y: 0,
+            planes: [
+                (
+                    BasisId(0),
+                    BasisWeightPlane {
+                        values: vec![0.0],
+                        mask: None,
+                    },
+                ),
+                (
+                    BasisId(1),
+                    BasisWeightPlane {
+                        values: vec![1.0],
+                        mask: None,
+                    },
+                ),
+            ]
+            .into(),
+        });
+        let detached = spec
+            .rules
+            .detach(BindingKey {
+                basis: BasisId(1),
+                output,
+            })
+            .unwrap();
+        let rule = spec.rules.get_mut(detached).unwrap();
+        rule.growth.source = "potential * 0.25".into();
+        let KernelSpatialDefinition::Periodic(kernel) = &mut rule.kernels[0].spatial else {
+            unreachable!();
+        };
+        kernel.planes.get_mut(&BasisId(0)).unwrap().values[0] = 1.0;
+        kernel.planes.get_mut(&BasisId(1)).unwrap().values[0] = 0.0;
+
+        let compiled = crate::sim::runtime::compile_experiment(&spec).unwrap();
+        let Ok(mut gpu) = CudaExperimentBackend::new(compiled.clone()) else {
+            return;
+        };
+        let initial = [spec.channels[0].initial.clone()];
+        let mut cpu_world = ChannelWorld::from_basis_channels(2, 1, 2, &initial).unwrap();
+        let mut gpu_world = ChannelWorld::from_basis_channels(2, 1, 2, &initial).unwrap();
+        CpuExperimentBackend::new(compiled)
+            .step(&mut cpu_world)
+            .unwrap();
+        gpu.step(&mut gpu_world).unwrap();
+
+        for (lhs, rhs) in cpu_world.cells().iter().zip(gpu_world.cells()) {
+            assert!((lhs - rhs).abs() < 1e-5, "{lhs} != {rhs}");
+        }
+    }
+
+    #[cfg(feature = "cuda")]
+    #[test]
+    fn basis_cuda_rejects_non_finite_intermediates_without_committing_state() {
+        let mut spec = ExperimentSpec::single_channel_lenia(1, 1)
+            .normalize_rules()
+            .unwrap();
+        let output = spec.channels[0].id;
+        let rule = spec.rules.get_mut(spec.rules.defaults[&output]).unwrap();
+        rule.growth.mode = UpdateMode::DirectUpdate;
+        rule.growth.source = "let invalid = 1.0 / 0.0; 0.25".into();
+        let compiled = crate::sim::runtime::compile_experiment(&spec).unwrap();
+        let Ok(mut gpu) = CudaExperimentBackend::new(compiled) else {
+            return;
+        };
+        let mut world = ChannelWorld::from_basis_channels(1, 1, 1, &[vec![0.75]]).unwrap();
+
+        let error = gpu.step(&mut world).unwrap_err();
+
+        assert!(matches!(
+            error,
+            BackendError::Runtime(RuntimeError::NonFiniteState)
+        ));
+        assert_eq!(world.cells(), &[0.75]);
+        assert_eq!(gpu.tick(), 0);
     }
 
     fn kernel_spec(definition: KernelDefinition) -> SimulationSpec {
