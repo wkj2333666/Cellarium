@@ -83,10 +83,60 @@ test_release() (
     fail "unexpected SHA256: ${SHA256-}"
 )
 
+test_lifecycle_contract() (
+  local case_dir run_id
+  case_dir=$(mktemp -d)
+  trap 'rm -rf -- "$case_dir"' EXIT
+  AGENTIC_TARGET_DIR="$case_dir/state"
+  export AGENTIC_TARGET_DIR
+
+  test -x "$repo_root/scripts/agentic/session.sh" || \
+    fail 'session runner is not executable'
+
+  if "$repo_root/scripts/agentic/session.sh" status does-not-exist; then
+    fail 'missing session reported as running'
+  fi
+  if "$repo_root/scripts/agentic/session.sh" start bad-columns nope 40 -- /usr/bin/true; then
+    fail 'invalid terminal dimensions were accepted'
+  fi
+)
+
+test_lifecycle_smoke() (
+  local case_dir run_id manifest display
+  case_dir=$(mktemp -d)
+  trap 'rm -rf -- "$case_dir"' EXIT
+  AGENTIC_TARGET_DIR="$case_dir/state"
+  export AGENTIC_TARGET_DIR
+  run_id="lifecycle-$$-$RANDOM"
+
+  "$repo_root/scripts/agentic/session.sh" start "$run_id" 100 40 -- \
+    /usr/bin/sh -c 'printf "agentic-ready\\n"; exec sleep 300'
+  "$repo_root/scripts/agentic/session.sh" status "$run_id"
+  manifest="$AGENTIC_TARGET_DIR/$run_id/manifest.env"
+  # shellcheck source=../scripts/agentic/lib.sh
+  source "$repo_root/scripts/agentic/lib.sh"
+  display=$(agentic_manifest_get "$manifest" DISPLAY)
+  test -S "/tmp/.X11-unix/X${display#:}" || fail 'recorded X socket is missing'
+  test -n "$(agentic_manifest_get "$manifest" PROCESS_GROUP)" || \
+    fail 'process group was not recorded'
+  test -n "$(agentic_manifest_get "$manifest" KITTY_WINDOW_ID)" || \
+    fail 'Kitty window id was not recorded'
+  test -n "$(agentic_manifest_get "$manifest" CLIENT_PID)" || \
+    fail 'client pid was not recorded'
+
+  "$repo_root/scripts/agentic/session.sh" stop "$run_id"
+  if "$repo_root/scripts/agentic/session.sh" status "$run_id"; then
+    fail 'stopped session still reports as running'
+  fi
+  test ! -S "/tmp/.X11-unix/X${display#:}" || fail 'X socket leaked after stop'
+)
+
 case "${1:-contract}" in
   release) test_release ;;
   lib) test_lib ;;
-  contract) test_lib; test_release ;;
+  lifecycle-contract) test_lifecycle_contract ;;
+  lifecycle-smoke) test_lifecycle_smoke ;;
+  contract) test_lib; test_release; test_lifecycle_contract ;;
   *) fail "unknown suite: ${1-}" ;;
 esac
 
