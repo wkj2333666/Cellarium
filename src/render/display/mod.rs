@@ -444,7 +444,6 @@ impl KittySharedDisplay {
         if let Some(previous_id) = state.displayed_id {
             command.push_str(&kitty_delete_image_command(previous_id));
         }
-        command.push_str("\x1b[u");
         frame.render_widget(
             GraphicsCommandWidget {
                 command: Some(&command),
@@ -518,7 +517,12 @@ impl ratatui::widgets::Widget for GraphicsCommandWidget<'_> {
             }
         }
         if let (Some(command), Some(cell)) = (self.command, buffer.cell_mut(area.as_position())) {
-            cell.set_symbol(command)
+            let command = format!(
+                "\x1b[{};{}H{command}",
+                area.y.saturating_add(1),
+                area.x.saturating_add(1)
+            );
+            cell.set_symbol(&command)
                 .set_diff_option(CellDiffOption::ForcedWidth(
                     NonZeroU16::new(1).expect("one is non-zero"),
                 ));
@@ -711,7 +715,7 @@ impl KittySharedFrame {
         let name = create_shared_memory(rgba)?;
         let encoded_name = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
         let command = format!(
-            "\x1b[s\x1b_Ga=T,f=32,t=s,s={width},v={height},S={},i={image_id},p=1,c={columns},r={rows},q=1;{encoded_name}\x1b\\",
+            "\x1b_Ga=T,f=32,t=s,s={width},v={height},S={},i={image_id},p=1,c={columns},r={rows},C=1,q=1;{encoded_name}\x1b\\",
             rgba.len()
         );
         Ok(Self {
@@ -1352,6 +1356,29 @@ mod tests {
         assert_eq!(display.state.lock().unwrap().displayed_id, Some(41));
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn shared_display_anchors_every_placement_and_never_moves_the_cursor() {
+        let display = KittySharedDisplay::new((8, 16));
+        let pixels = [1_u8, 2, 3, 255];
+        let ready = KittySharedFrame::new(&pixels, 1, 1, 3, 2, 41).unwrap();
+        display.state.lock().unwrap().ready = Some(ready);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(8, 5)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                display.render(frame, ratatui::layout::Rect::new(2, 1, 3, 2));
+            })
+            .unwrap();
+
+        let symbol = terminal.backend().buffer().cell((2, 1)).unwrap().symbol();
+        assert!(symbol.starts_with("\x1b[2;3H\x1b_G"));
+        assert!(symbol.contains(",C=1,"));
+        assert!(!symbol.contains("\x1b[s"));
+        assert!(!symbol.contains("\x1b[u"));
+    }
+
     #[test]
     fn detects_pixel_protocols_and_falls_back_to_half_blocks() {
         assert_eq!(
@@ -1454,6 +1481,7 @@ mod tests {
         assert!(frame.command.contains("s=2,v=1"));
         assert!(frame.command.contains("c=12,r=4"));
         assert!(frame.command.contains("i=41,p=1"));
+        assert!(frame.command.contains("C=1"));
         assert!(frame.command.contains("q=1"));
         assert!(!frame.command.contains("q=2"));
         assert!(!frame.command.contains("a=d,d=I"));

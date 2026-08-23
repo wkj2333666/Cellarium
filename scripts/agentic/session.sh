@@ -76,10 +76,10 @@ supervise() {
   export XDG_CACHE_HOME=$cache_dir
   export XDG_CONFIG_HOME=$config_dir
   export HOME="$run_dir/home"
-  # The test runner may opt out of colored output. A real Kitty user session
-  # does not inherit that preference, and half-block rendering uses terminal
-  # colors to encode its two vertical pixels.
-  unset NO_COLOR
+  # The test runner may itself be reached over SSH and opt out of colored
+  # output. The journey starts a local terminal client which then connects to
+  # its server, so those runner-only variables must not leak into the client.
+  unset NO_COLOR SSH_CONNECTION SSH_TTY
 
   Xvfb "$display" -screen 0 "${screen_w}x${screen_h}x24" -nolisten tcp -ac \
     >"$logs_dir/xvfb.log" 2>&1 &
