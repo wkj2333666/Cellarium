@@ -440,6 +440,18 @@ fn local_kitty_connect_keeps_control_responsive_with_shared_memory_frames() {
         !contains(&output, b"t=d"),
         "C/S viewer embedded Kitty pixels in the PTY"
     );
+    let steady_checkpoint = output.len();
+    thread::sleep(Duration::from_millis(750));
+    read_available(master, &mut output);
+    let steady_output = &output[steady_checkpoint.min(output.len())..];
+    assert_eq!(
+        steady_output
+            .windows(b"\x1b[2J".len())
+            .filter(|window| *window == b"\x1b[2J")
+            .count(),
+        0,
+        "steady C/S graphics repeatedly cleared the physical terminal"
+    );
 
     let pressed = Instant::now();
     assert_eq!(unsafe { libc::write(master, b" ".as_ptr().cast(), 1) }, 1);

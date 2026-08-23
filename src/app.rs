@@ -2838,9 +2838,7 @@ where
     if display.uses_async_output() {
         let redraw_required = Arc::new(AtomicBool::new(false));
         let backend = AsyncTerminalBackend {
-            inner: ratatui::backend::CrosstermBackend::new(AsyncTerminalWriter::new(Arc::clone(
-                &redraw_required,
-            ))),
+            inner: ratatui::backend::CrosstermBackend::new(AsyncTerminalWriter::new()),
             shadow: BTreeMap::new(),
         };
         let mut terminal = ratatui::Terminal::new(backend)?;
@@ -3178,9 +3176,7 @@ fn run_app_with_save(app: App, save_path: Option<&Path>) -> std::io::Result<()> 
     if display.uses_async_output() {
         let redraw_required = Arc::new(AtomicBool::new(false));
         let backend = AsyncTerminalBackend {
-            inner: ratatui::backend::CrosstermBackend::new(AsyncTerminalWriter::new(Arc::clone(
-                &redraw_required,
-            ))),
+            inner: ratatui::backend::CrosstermBackend::new(AsyncTerminalWriter::new()),
             shadow: BTreeMap::new(),
         };
         let mut terminal = ratatui::Terminal::new(backend)?;
@@ -3223,7 +3219,6 @@ impl LatestFrameState {
 struct AsyncTerminalWriter {
     state: Arc<(Mutex<LatestFrameState>, Condvar)>,
     pending: Vec<u8>,
-    redraw_required: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
 }
 
@@ -3293,7 +3288,7 @@ impl ratatui::backend::Backend for AsyncTerminalBackend {
 }
 
 impl AsyncTerminalWriter {
-    fn new(redraw_required: Arc<AtomicBool>) -> Self {
+    fn new() -> Self {
         let state = Arc::new((
             Mutex::new(LatestFrameState {
                 clear_prefix: Vec::new(),
@@ -3335,7 +3330,6 @@ impl AsyncTerminalWriter {
         Self {
             state,
             pending: Vec::new(),
-            redraw_required,
             worker: Some(worker),
         }
     }
@@ -3364,13 +3358,8 @@ impl Write for AsyncTerminalWriter {
         } else {
             let previous_is_kitty = state.frame.as_deref().is_some_and(contains_kitty_transmit);
             if contains_kitty_transmit(&next) || !previous_is_kitty {
-                if state.frame.is_some() {
-                    self.redraw_required.store(true, Ordering::Release);
-                }
                 state.frame = Some(next);
                 wake.notify_one();
-            } else {
-                self.redraw_required.store(true, Ordering::Release);
             }
         }
         Ok(())
@@ -3665,7 +3654,6 @@ mod tests {
 
     #[test]
     fn async_terminal_backend_forwards_clear_to_the_terminal_writer() {
-        let redraw_required = Arc::new(AtomicBool::new(false));
         let state = Arc::new((
             Mutex::new(LatestFrameState {
                 clear_prefix: Vec::new(),
@@ -3677,7 +3665,6 @@ mod tests {
         let writer = AsyncTerminalWriter {
             state: Arc::clone(&state),
             pending: Vec::new(),
-            redraw_required,
             worker: None,
         };
         let mut backend = AsyncTerminalBackend {
@@ -3699,7 +3686,6 @@ mod tests {
 
     #[test]
     fn async_terminal_backend_replays_static_cells_in_later_frames() {
-        let redraw_required = Arc::new(AtomicBool::new(false));
         let state = Arc::new((
             Mutex::new(LatestFrameState {
                 clear_prefix: Vec::new(),
@@ -3711,7 +3697,6 @@ mod tests {
         let writer = AsyncTerminalWriter {
             state: Arc::clone(&state),
             pending: Vec::new(),
-            redraw_required,
             worker: None,
         };
         let mut backend = AsyncTerminalBackend {
@@ -3734,7 +3719,6 @@ mod tests {
 
     #[test]
     fn async_terminal_backend_forgets_static_cells_after_clear() {
-        let redraw_required = Arc::new(AtomicBool::new(false));
         let state = Arc::new((
             Mutex::new(LatestFrameState {
                 clear_prefix: Vec::new(),
@@ -3746,7 +3730,6 @@ mod tests {
         let writer = AsyncTerminalWriter {
             state: Arc::clone(&state),
             pending: Vec::new(),
-            redraw_required,
             worker: None,
         };
         let mut backend = AsyncTerminalBackend {
@@ -3770,7 +3753,6 @@ mod tests {
 
     #[test]
     fn async_terminal_writer_does_not_drop_a_pending_kitty_transmission() {
-        let redraw_required = Arc::new(AtomicBool::new(false));
         let state = Arc::new((
             Mutex::new(LatestFrameState {
                 clear_prefix: Vec::new(),
@@ -3782,7 +3764,6 @@ mod tests {
         let mut writer = AsyncTerminalWriter {
             state: Arc::clone(&state),
             pending: Vec::new(),
-            redraw_required: Arc::clone(&redraw_required),
             worker: None,
         };
 
@@ -3798,7 +3779,6 @@ mod tests {
         let emitted = state.0.lock().unwrap().take_output().unwrap_or_default();
         assert!(contains_terminal_clear(&emitted));
         assert!(contains_kitty_transmit(&emitted));
-        assert!(redraw_required.load(Ordering::Acquire));
         assert!(
             !emitted
                 .windows(b"ordinary-later-frame".len())
