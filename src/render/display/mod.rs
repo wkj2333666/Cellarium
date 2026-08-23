@@ -49,12 +49,15 @@ impl DisplayProtocol {
     }
 }
 
+type EncodedPixelFrame = (ratatui_image::protocol::Protocol, (u16, u16));
+
 pub struct PixelDisplay {
     picker: ratatui_image::picker::Picker,
-    protocol: Arc<Mutex<Option<ratatui_image::protocol::Protocol>>>,
+    initial_cell_size: (u16, u16),
+    protocol: Arc<Mutex<Option<EncodedPixelFrame>>>,
     ready_sequence: Arc<AtomicU64>,
     displayed_sequence: AtomicU64,
-    queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size)>,
+    queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size, (u16, u16))>,
     last_graphics_request: Mutex<Option<GraphicsRequestKey>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -106,6 +109,7 @@ struct GraphicsRequestKey {
     width: u32,
     height: u32,
     terminal_size: ratatui::layout::Size,
+    cell_size: (u16, u16),
 }
 
 fn should_submit_graphics(previous: Option<GraphicsRequestKey>, next: GraphicsRequestKey) -> bool {
@@ -519,26 +523,42 @@ impl ratatui::widgets::Widget for GraphicsCommandWidget<'_> {
 
 impl PixelDisplay {
     fn new(picker: ratatui_image::picker::Picker) -> Self {
-        let queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size)> = LatestWorkQueue::new();
+        let font_size = picker.font_size();
+        let initial_cell_size = (font_size.width, font_size.height);
+        let queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size, (u16, u16))> =
+            LatestWorkQueue::new();
         let protocol = Arc::new(Mutex::new(None));
         let ready_sequence = Arc::new(AtomicU64::new(0));
         let worker_protocol = Arc::clone(&protocol);
         let worker_ready_sequence = Arc::clone(&ready_sequence);
-        let worker_picker = picker.clone();
+        let picker_protocol = picker.protocol_type();
+        let mut worker_picker = picker.clone();
+        let mut worker_cell_size = initial_cell_size;
         let worker_queue = queue.clone();
         let worker = std::thread::spawn(move || {
-            while let Some((image, size)) = worker_queue.recv() {
+            while let Some((image, size, cell_size)) = worker_queue.recv() {
+                if cell_size != worker_cell_size {
+                    worker_picker = picker_for_cell_size(picker_protocol, cell_size);
+                    worker_cell_size = cell_size;
+                }
                 if let Ok(encoded) =
                     worker_picker.new_protocol(image, size, ratatui_image::Resize::Fit(None))
                     && let Ok(mut slot) = worker_protocol.lock()
                 {
-                    *slot = Some(encoded);
+                    *slot = Some((encoded, cell_size));
                     worker_ready_sequence.fetch_add(1, Ordering::Release);
+                    if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
+                        eprintln!(
+                            "E2E_PIXEL_READY columns={} rows={} cell_size={cell_size:?}",
+                            size.width, size.height
+                        );
+                    }
                 }
             }
         });
         Self {
             picker,
+            initial_cell_size,
             protocol,
             ready_sequence,
             displayed_sequence: AtomicU64::new(0),
@@ -548,8 +568,12 @@ impl PixelDisplay {
         }
     }
 
-    fn submit(&self, image: DynamicImage, size: ratatui::layout::Size) {
-        self.queue.submit((image, size));
+    fn submit(&self, image: DynamicImage, size: ratatui::layout::Size, cell_size: (u16, u16)) {
+        self.queue.submit((image, size, cell_size));
+    }
+
+    fn current_cell_size(&self) -> (u16, u16) {
+        cell_size_from_environment().unwrap_or(self.initial_cell_size)
     }
 
     fn should_submit_graphics(&self, key: GraphicsRequestKey) -> bool {
@@ -570,18 +594,33 @@ impl PixelDisplay {
                 fresh: false,
             };
         };
-        let Some(protocol) = protocol.as_ref() else {
+        let Some((protocol, encoded_cell_size)) = protocol.as_ref() else {
             return RenderStatus {
                 rendered: false,
                 fresh: false,
             };
         };
+        if *encoded_cell_size != self.current_cell_size() {
+            if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
+                eprintln!(
+                    "E2E_PIXEL_STALE encoded={encoded_cell_size:?} current={:?}",
+                    self.current_cell_size()
+                );
+            }
+            return RenderStatus {
+                rendered: false,
+                fresh: false,
+            };
+        }
         frame.render_widget(
             ratatui_image::Image::new(protocol).allow_clipping(true),
             area,
         );
         let ready = self.ready_sequence.load(Ordering::Acquire);
         let displayed = self.displayed_sequence.swap(ready, Ordering::AcqRel);
+        if ready != displayed && std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
+            eprintln!("E2E_PIXEL_PRESENT sequence={ready} cell_size={encoded_cell_size:?}");
+        }
         RenderStatus {
             rendered: true,
             fresh: ready != displayed,
@@ -596,6 +635,19 @@ fn kitty_delete_image_command(image_id: u32) -> String {
 
 fn kitty_delete_all_images_command() -> &'static str {
     "\x1b_Ga=d,d=A,q=1\x1b\\"
+}
+
+fn picker_for_cell_size(
+    protocol: ratatui_image::picker::ProtocolType,
+    cell_size: (u16, u16),
+) -> ratatui_image::picker::Picker {
+    #[allow(deprecated)]
+    let mut picker = ratatui_image::picker::Picker::from_fontsize(ratatui_image::FontSize::new(
+        cell_size.0,
+        cell_size.1,
+    ));
+    picker.set_protocol_type(protocol);
+    picker
 }
 
 impl Drop for PixelDisplay {
@@ -789,12 +841,13 @@ impl ViewportDisplay {
             &sixel,
             remote && !remote_graphics,
         );
-        Self::from_protocol_and_cell_size_for_connection(
-            protocol,
-            cell_size_from_environment(),
-            remote,
-            native_kitty,
-        )
+        let cell_size = cell_size_from_environment();
+        if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
+            eprintln!(
+                "E2E_DISPLAY protocol={protocol:?} remote={remote} remote_graphics={remote_graphics} cell_size={cell_size:?}"
+            );
+        }
+        Self::from_protocol_and_cell_size_for_connection(protocol, cell_size, remote, native_kitty)
     }
 
     pub fn from_protocol_and_cell_size(
@@ -833,29 +886,39 @@ impl ViewportDisplay {
             DisplayProtocol::Iterm2 => ratatui_image::picker::ProtocolType::Iterm2,
             DisplayProtocol::HalfBlock => ratatui_image::picker::ProtocolType::Halfblocks,
         };
-        #[allow(deprecated)]
-        let mut picker = ratatui_image::picker::Picker::from_fontsize(
-            ratatui_image::FontSize::new(width, height),
-        );
-        picker.set_protocol_type(picker_protocol);
+        let picker = picker_for_cell_size(picker_protocol, (width, height));
         Self::Pixel(PixelDisplay::new(picker))
+    }
+
+    fn current_cell_size(&self) -> Option<(u16, u16)> {
+        match self {
+            Self::HalfBlock => None,
+            Self::Pixel(pixel) => Some(pixel.current_cell_size()),
+            #[cfg(unix)]
+            Self::KittyShared(display) => {
+                Some(cell_size_from_environment().unwrap_or(display.font_size))
+            }
+        }
     }
 
     pub fn framebuffer_size(&self, area: ratatui::layout::Rect) -> (usize, usize) {
         match self {
             Self::HalfBlock => (area.width as usize, area.height as usize * 2),
             Self::Pixel(pixel) => {
-                let font = pixel.picker.font_size();
+                let (width, height) = pixel.current_cell_size();
                 (
-                    area.width as usize * font.width as usize,
-                    area.height as usize * font.height as usize,
+                    area.width as usize * width as usize,
+                    area.height as usize * height as usize,
                 )
             }
             #[cfg(unix)]
-            Self::KittyShared(display) => (
-                area.width as usize * display.font_size.0 as usize,
-                area.height as usize * display.font_size.1 as usize,
-            ),
+            Self::KittyShared(display) => {
+                let (width, height) = cell_size_from_environment().unwrap_or(display.font_size);
+                (
+                    area.width as usize * width as usize,
+                    area.height as usize * height as usize,
+                )
+            }
         }
     }
 
@@ -890,7 +953,7 @@ impl ViewportDisplay {
         if let Self::Pixel(pixel) = self {
             let image = framebuffer_to_dynamic_image(framebuffer);
             let size = ratatui::layout::Size::new(area.width, area.height);
-            pixel.submit(image, size);
+            pixel.submit(image, size, pixel.current_cell_size());
             let status = pixel.render(frame, area);
             if status.rendered {
                 return status.fresh;
@@ -927,6 +990,7 @@ impl ViewportDisplay {
             width: graphics.width,
             height: graphics.height,
             terminal_size: size,
+            cell_size: self.current_cell_size().unwrap_or((1, 2)),
         };
         let submit = match self {
             Self::HalfBlock => true,
@@ -940,7 +1004,9 @@ impl ViewportDisplay {
                     .map(DynamicImage::ImageRgba8);
             if let Some(image) = image {
                 match self {
-                    Self::Pixel(display) => display.submit(image, size),
+                    Self::Pixel(display) => {
+                        display.submit(image, size, display.current_cell_size())
+                    }
                     #[cfg(unix)]
                     Self::KittyShared(display) => display.submit(image, size),
                     Self::HalfBlock => {}
@@ -1014,7 +1080,7 @@ impl ViewportDisplay {
             && ready_generation_is_current(frame_priority, generation.priority)
         {
             match self {
-                Self::Pixel(display) => display.submit(image, size),
+                Self::Pixel(display) => display.submit(image, size, display.current_cell_size()),
                 #[cfg(unix)]
                 Self::KittyShared(display) => display.submit(image, size),
                 Self::HalfBlock => return false,
@@ -1150,6 +1216,7 @@ mod tests {
             width: 64,
             height: 32,
             terminal_size: ratatui::layout::Size::new(8, 4),
+            cell_size: (10, 20),
         };
 
         assert!(!should_submit_graphics(Some(request), request));
@@ -1164,6 +1231,13 @@ mod tests {
             Some(request),
             GraphicsRequestKey {
                 terminal_size: ratatui::layout::Size::new(9, 4),
+                ..request
+            }
+        ));
+        assert!(should_submit_graphics(
+            Some(request),
+            GraphicsRequestKey {
+                cell_size: (11, 23),
                 ..request
             }
         ));

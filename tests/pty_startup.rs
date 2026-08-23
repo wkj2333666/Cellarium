@@ -90,6 +90,51 @@ fn spawn_graphics_on_pty(slave: i32) -> std::process::Child {
         .expect("spawn cellarium graphics")
 }
 
+fn spawn_dynamic_graphics_on_pty(slave: i32) -> std::process::Child {
+    use std::os::unix::process::CommandExt;
+
+    let stdin = unsafe { Stdio::from_raw_fd(libc::dup(slave)) };
+    let stdout = unsafe { Stdio::from_raw_fd(libc::dup(slave)) };
+    let stderr = unsafe { Stdio::from_raw_fd(libc::dup(slave)) };
+    let mut command = Command::new(env!("CARGO_BIN_EXE_cellarium"));
+    command
+        .stdin(stdin)
+        .stdout(stdout)
+        .stderr(stderr)
+        .env("TERM", "xterm-kitty")
+        .env("SSH_CONNECTION", "127.0.0.1 22 127.0.0.1 50000")
+        .env("CELLARIUM_REMOTE_GRAPHICS", "1")
+        .env("CELLARIUM_E2E_TRACE", "1")
+        .env_remove("TERM_PROGRAM")
+        .env_remove("KITTY_WINDOW_ID")
+        .env_remove("CELLARIUM_CELL_WIDTH")
+        .env_remove("CELLARIUM_CELL_HEIGHT");
+    unsafe {
+        command.pre_exec(move || {
+            if libc::setsid() < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if libc::ioctl(slave, libc::TIOCSCTTY, 0) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    command
+        .spawn()
+        .expect("spawn dynamically sized graphics cellarium")
+}
+
+fn set_pty_size(fd: i32, columns: u16, rows: u16, pixel_width: u16, pixel_height: u16) {
+    let winsize = libc::winsize {
+        ws_row: rows,
+        ws_col: columns,
+        ws_xpixel: pixel_width,
+        ws_ypixel: pixel_height,
+    };
+    assert_eq!(unsafe { libc::ioctl(fd, libc::TIOCSWINSZ, &winsize) }, 0);
+}
+
 fn connector_fixture() -> (PathBuf, PathBuf) {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -208,6 +253,26 @@ fn read_available(master: i32, output: &mut Vec<u8>) {
 
 fn contains(output: &[u8], needle: &[u8]) -> bool {
     output.windows(needle.len()).any(|window| window == needle)
+}
+
+fn kitty_transmit_sizes(output: &[u8]) -> Vec<(u32, u32)> {
+    let text = String::from_utf8_lossy(output);
+    text.split("\x1b_Gq=2,")
+        .filter_map(|chunk| {
+            let header = chunk.split(';').next()?;
+            let width = header
+                .split(',')
+                .find_map(|part| part.strip_prefix("s="))?
+                .parse()
+                .ok()?;
+            let height = header
+                .split(',')
+                .find_map(|part| part.strip_prefix("v="))?
+                .parse()
+                .ok()?;
+            Some((width, height))
+        })
+        .collect()
 }
 
 fn pump_until(
@@ -593,6 +658,75 @@ fn local_pty_user_journey_survives_a_burst_of_input() {
         panic!("direct viewer froze after a burst of keyboard/mouse input");
     };
     assert!(status.success(), "direct viewer exited with {status}");
+}
+
+#[test]
+fn remote_kitty_graphics_reencode_after_terminal_cell_size_changes() {
+    let (master, slave) = open_pty();
+    set_pty_size(slave, 80, 24, 800, 384);
+    set_nonblocking(master);
+    let mut child = spawn_dynamic_graphics_on_pty(slave);
+    unsafe { libc::close(slave) };
+    assert_eq!(unsafe { libc::write(master, b" ".as_ptr().cast(), 1) }, 1);
+
+    let mut output = Vec::new();
+    let initial_frame = pump_until(
+        &mut child,
+        master,
+        &mut output,
+        Instant::now() + Duration::from_secs(8),
+        |output| {
+            kitty_transmit_sizes(output)
+                .iter()
+                .any(|(width, height)| width % 10 == 0 && height % 16 == 0)
+        },
+    );
+    if !initial_frame {
+        child
+            .kill()
+            .expect("kill viewer without initial Kitty frame");
+        child
+            .wait()
+            .expect("wait for viewer without initial Kitty frame");
+        unsafe { libc::close(master) };
+        panic!(
+            "no 10x16-cell Kitty frame; display_trace={:?}, sizes={:?}, bytes={}, tail={:?}",
+            String::from_utf8_lossy(&output)
+                .lines()
+                .filter(|line| line.contains("E2E_"))
+                .collect::<Vec<_>>(),
+            kitty_transmit_sizes(&output),
+            output.len(),
+            String::from_utf8_lossy(&output[output.len().saturating_sub(800)..])
+        );
+    }
+
+    read_available(master, &mut output);
+    let resize_checkpoint = output.len();
+
+    set_pty_size(master, 100, 30, 1100, 690);
+    let resized = pump_until(
+        &mut child,
+        master,
+        &mut output,
+        Instant::now() + Duration::from_secs(8),
+        |output| {
+            let resized_output = &output[resize_checkpoint.min(output.len())..];
+            contains(resized_output, b"\x1b[2J")
+                && kitty_transmit_sizes(resized_output)
+                    .iter()
+                    .any(|(width, height)| width % 11 == 0 && height % 23 == 0)
+        },
+    );
+
+    child.kill().expect("stop dynamically resized viewer");
+    child.wait().expect("wait for dynamically resized viewer");
+    unsafe { libc::close(master) };
+
+    assert!(
+        resized,
+        "no cleared 11x23-cell Kitty frame after PTY resize"
+    );
 }
 
 #[test]

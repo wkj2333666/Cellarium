@@ -3172,8 +3172,23 @@ fn run_app_with_save(app: App, save_path: Option<&Path>) -> std::io::Result<()> 
 struct TerminalGuard;
 
 struct LatestFrameState {
+    clear_prefix: Vec<u8>,
     frame: Option<Vec<u8>>,
     closed: bool,
+}
+
+impl LatestFrameState {
+    fn take_output(&mut self) -> Option<Vec<u8>> {
+        let frame = self.frame.take();
+        if self.clear_prefix.is_empty() {
+            return frame;
+        }
+        let mut output = std::mem::take(&mut self.clear_prefix);
+        if let Some(mut frame) = frame {
+            output.append(&mut frame);
+        }
+        Some(output)
+    }
 }
 
 struct AsyncTerminalWriter {
@@ -3220,14 +3235,11 @@ impl ratatui::backend::Backend for AsyncTerminalBackend {
     }
 
     fn clear(&mut self) -> Result<(), Self::Error> {
-        Ok(())
+        self.inner.clear()
     }
 
-    fn clear_region(
-        &mut self,
-        _clear_type: ratatui::backend::ClearType,
-    ) -> Result<(), Self::Error> {
-        Ok(())
+    fn clear_region(&mut self, clear_type: ratatui::backend::ClearType) -> Result<(), Self::Error> {
+        self.inner.clear_region(clear_type)
     }
 
     fn size(&self) -> Result<ratatui::layout::Size, Self::Error> {
@@ -3247,6 +3259,7 @@ impl AsyncTerminalWriter {
     fn new() -> Self {
         let state = Arc::new((
             Mutex::new(LatestFrameState {
+                clear_prefix: Vec::new(),
                 frame: None,
                 closed: false,
             }),
@@ -3259,12 +3272,12 @@ impl AsyncTerminalWriter {
                 let frame = {
                     let (lock, wake) = &*worker_state;
                     let mut state = lock.lock().expect("async terminal writer mutex poisoned");
-                    while state.frame.is_none() && !state.closed {
+                    while state.frame.is_none() && state.clear_prefix.is_empty() && !state.closed {
                         state = wake
                             .wait(state)
                             .expect("async terminal writer mutex poisoned");
                     }
-                    match state.frame.take() {
+                    match state.take_output() {
                         Some(frame) => Some(frame),
                         None if state.closed => None,
                         None => continue,
@@ -3304,19 +3317,33 @@ impl Write for AsyncTerminalWriter {
         let mut state = lock
             .lock()
             .map_err(|_| std::io::Error::other("async terminal writer mutex poisoned"))?;
-        state.frame = Some(std::mem::take(&mut self.pending));
+        let next = std::mem::take(&mut self.pending);
+        if contains_terminal_clear(&next) {
+            state.clear_prefix = next;
+            state.frame = None;
+        } else if contains_kitty_transmit(&next)
+            || !state.frame.as_deref().is_some_and(contains_kitty_transmit)
+        {
+            state.frame = Some(next);
+        }
         wake.notify_one();
         Ok(())
     }
 }
 
+fn contains_terminal_clear(bytes: &[u8]) -> bool {
+    bytes.windows(4).any(|window| window == b"\x1b[2J")
+}
+
+fn contains_kitty_transmit(bytes: &[u8]) -> bool {
+    bytes.windows(8).any(|window| window == b"_Gq=2,i=")
+}
+
 impl Drop for AsyncTerminalWriter {
     fn drop(&mut self) {
+        let _ = self.flush();
         let (lock, wake) = &*self.state;
         if let Ok(mut state) = lock.lock() {
-            if !self.pending.is_empty() {
-                state.frame = Some(std::mem::take(&mut self.pending));
-            }
             state.closed = true;
             wake.notify_one();
         }
@@ -3582,6 +3609,69 @@ pub fn rule_name(spec: &SimulationSpec) -> &'static str {
 mod tests {
     use super::*;
     use crate::sim::kernel::{KernelValues, Normalization};
+
+    #[test]
+    fn async_terminal_backend_forwards_clear_to_the_terminal_writer() {
+        let state = Arc::new((
+            Mutex::new(LatestFrameState {
+                clear_prefix: Vec::new(),
+                frame: None,
+                closed: true,
+            }),
+            Condvar::new(),
+        ));
+        let writer = AsyncTerminalWriter {
+            state: Arc::clone(&state),
+            pending: Vec::new(),
+            worker: None,
+        };
+        let mut backend = AsyncTerminalBackend {
+            inner: ratatui::backend::CrosstermBackend::new(writer),
+        };
+
+        ratatui::backend::Backend::clear(&mut backend).unwrap();
+        ratatui::backend::Backend::set_cursor_position(
+            &mut backend,
+            ratatui::layout::Position::new(3, 4),
+        )
+        .unwrap();
+
+        let emitted = state.0.lock().unwrap().take_output().unwrap_or_default();
+        assert!(emitted.windows(4).any(|bytes| bytes == b"\x1b[2J"));
+        assert!(emitted.windows(6).any(|bytes| bytes == b"\x1b[5;4H"));
+    }
+
+    #[test]
+    fn async_terminal_writer_does_not_drop_a_pending_kitty_transmission() {
+        let state = Arc::new((
+            Mutex::new(LatestFrameState {
+                clear_prefix: Vec::new(),
+                frame: None,
+                closed: true,
+            }),
+            Condvar::new(),
+        ));
+        let mut writer = AsyncTerminalWriter {
+            state: Arc::clone(&state),
+            pending: Vec::new(),
+            worker: None,
+        };
+
+        writer
+            .write_all(b"\x1b_Gq=2,i=41,a=T;pixels\x1b\\")
+            .unwrap();
+        writer.flush().unwrap();
+        writer.write_all(b"ordinary-later-frame").unwrap();
+        writer.flush().unwrap();
+
+        let emitted = state.0.lock().unwrap().take_output().unwrap_or_default();
+        assert!(contains_kitty_transmit(&emitted));
+        assert!(
+            !emitted
+                .windows(b"ordinary-later-frame".len())
+                .any(|bytes| bytes == b"ordinary-later-frame")
+        );
+    }
 
     #[cfg(feature = "cuda")]
     fn cuda_available() -> bool {
