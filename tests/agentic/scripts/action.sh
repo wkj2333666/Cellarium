@@ -60,7 +60,11 @@ require_button() {
 }
 
 activate_window() {
-  xdotool windowactivate --sync "$window_id"
+  local active_window
+  active_window=$(xdotool getactivewindow 2>/dev/null || true)
+  if [[ $active_window != "$window_id" ]]; then
+    xdotool windowactivate --sync "$window_id"
+  fi
 }
 
 case "$action" in
@@ -82,7 +86,7 @@ case "$action" in
     require_point_in_window "$1" "$2"
     require_button "$3"
     activate_window
-    xdotool mousemove --sync "$1" "$2"
+    xdotool mousemove "$1" "$2"
     if [[ $action == click ]]; then
       xdotool click "$3"
     else
@@ -93,7 +97,7 @@ case "$action" in
     [[ $# == 2 ]] || usage
     require_point_in_window "$1" "$2"
     activate_window
-    xdotool mousemove --sync "$1" "$2"
+    xdotool mousemove "$1" "$2"
     ;;
   drag)
     [[ $# == 6 ]] || usage
@@ -103,7 +107,7 @@ case "$action" in
     [[ $6 =~ ^[1-9][0-9]*$ ]] || agentic_die 'drag duration must be positive milliseconds'
     (( $6 <= 10000 )) || agentic_die 'drag duration exceeds 10000 ms'
     activate_window
-    xdotool mousemove --sync "$1" "$2"
+    xdotool mousemove "$1" "$2"
     xdotool mousedown "$5"
     start_x=$1; start_y=$2; end_x=$3; end_y=$4; button=$5; duration=$6
     steps=12
@@ -112,7 +116,7 @@ case "$action" in
     for ((step = 1; step <= steps; step++)); do
       next_x=$((start_x + (end_x - start_x) * step / steps))
       next_y=$((start_y + (end_y - start_y) * step / steps))
-      xdotool mousemove --sync "$next_x" "$next_y"
+      xdotool mousemove "$next_x" "$next_y"
       sleep "$step_delay"
     done
     xdotool mouseup "$button"
@@ -124,7 +128,7 @@ case "$action" in
     [[ $4 =~ ^[1-9][0-9]*$ ]] || agentic_die 'wheel count must be positive'
     (( $4 <= 100 )) || agentic_die 'wheel count exceeds 100'
     activate_window
-    xdotool mousemove --sync "$1" "$2"
+    xdotool mousemove "$1" "$2"
     if [[ $3 == up ]]; then button=4; else button=5; fi
     xdotool click --repeat "$4" --delay 25 "$button"
     ;;
