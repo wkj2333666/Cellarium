@@ -751,13 +751,25 @@ fn tiling_inspector_texts(state: &crate::workbench::WorkbenchState) -> Vec<Strin
             "Click [A] to draw a basis or [P] for a preset".into(),
         ];
     };
+    let selected_prototype = state.tiling_prototype();
+    let selected_name = selected_prototype
+        .and_then(|id| {
+            tiling
+                .prototypes
+                .iter()
+                .find(|prototype| prototype.id == id)
+        })
+        .map_or("unnamed", |prototype| prototype.name.as_str());
     let mut lines = vec![
         format!(
-            "basis {} · prototype {}",
+            "cell: {} polygons · {} shapes",
+            tiling.instances.len(),
+            tiling.prototypes.len(),
+        ),
+        format!(
+            "selected: basis {} · prototype {} ({selected_name})",
             state.selected_basis().0,
-            state
-                .tiling_prototype()
-                .map_or_else(|| "—".into(), |id| id.0.to_string())
+            selected_prototype.map_or_else(|| "—".into(), |id| id.0.to_string())
         ),
         format!(
             "a=({:.3}, {:.3})",

@@ -5210,6 +5210,84 @@ mod tests {
     }
 
     #[test]
+    fn transformed_tiling_vertex_follows_a_real_down_drag_up_sequence() {
+        let mut app = App::new(SimulationSpec::conway(), 32, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Tiling);
+        let tiling =
+            crate::sim::tiling::build_preset(crate::sim::tiling::TilingPreset::OctagonSquare, 1.0);
+        let mut draft = app.workbench().draft().clone();
+        draft.tiling = Some(tiling.clone());
+        app.workbench_mut().import_draft(draft).unwrap();
+        app.workbench_mut()
+            .set_selected_basis(tiling.instances[1].id)
+            .unwrap();
+        app.set_viewport(ratatui::layout::Rect::new(0, 0, 400, 400), [400, 400]);
+
+        let instance = tiling.instances[1].clone();
+        let prototype = tiling
+            .prototypes
+            .iter()
+            .find(|prototype| prototype.id == instance.prototype)
+            .unwrap();
+        let vertices = crate::sim::tiling::polygon::prototype_vertices(&prototype.shape).unwrap();
+        let world =
+            crate::sim::tiling::polygon::transform_vertices(&vertices, instance.transform)[0];
+        let scene = crate::workbench::tiling_editor::TilingScene::new(tiling.clone())
+            .with_selected_basis(instance.id);
+        let (x, y) = scene.world_to_pixel(world, 400, 400);
+        let event = |kind, column: i32, row: i32| crossterm::event::MouseEvent {
+            kind,
+            column: column as u16,
+            row: row as u16,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let mut tracker = crate::input::MouseTracker::new();
+
+        assert!(app.handle_mouse(
+            event(
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left,),
+                x,
+                y,
+            ),
+            &mut tracker,
+        ));
+        assert!(app.handle_mouse(
+            event(
+                crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left,),
+                x + 8,
+                y + 4,
+            ),
+            &mut tracker,
+        ));
+        assert!(app.handle_mouse(
+            event(
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left,),
+                x + 8,
+                y + 4,
+            ),
+            &mut tracker,
+        ));
+
+        let moved_draft = app.workbench().draft().tiling.as_ref().unwrap();
+        let moved_prototype = moved_draft
+            .prototypes
+            .iter()
+            .find(|prototype| prototype.id == instance.prototype)
+            .unwrap();
+        let moved_local =
+            crate::sim::tiling::polygon::prototype_vertices(&moved_prototype.shape).unwrap();
+        let moved_world =
+            crate::sim::tiling::polygon::transform_vertices(&moved_local, instance.transform)[0];
+        let expected = scene.pixel_to_world((x + 8) as u32, (y + 4) as u32, 400, 400);
+        assert!(
+            (moved_world - expected).length() < 0.03,
+            "transformed vertex must land under the pointer: actual={moved_world:?}, expected={expected:?}"
+        );
+    }
+
+    #[test]
     fn tiling_fit_restores_the_default_camera_without_dirtying_the_draft() {
         let mut app = App::new(SimulationSpec::conway(), 32, 16);
         app.enter_workbench();
