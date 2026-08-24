@@ -87,6 +87,7 @@ pub struct WorkbenchState {
     tiling_selected_vertex: Option<(PrototypeId, usize)>,
     tiling_construction: Vec<crate::sim::tiling::Vec2>,
     tiling_new_basis: bool,
+    tiling_drag_active: bool,
 }
 impl WorkbenchState {
     pub fn new(spec: ExperimentSpec) -> Self {
@@ -99,7 +100,13 @@ impl WorkbenchState {
         let selected_kernel = selected_rule_set
             .and_then(|rule_set| spec.rules.get(rule_set))
             .and_then(|rule| rule.kernels.first())
-            .map(|kernel| kernel.id);
+            .map(|kernel| kernel.id)
+            .or_else(|| {
+                spec.kernels
+                    .iter()
+                    .find(|kernel| kernel.target == selected_channel)
+                    .map(|kernel| kernel.id)
+            });
         let growth_editor = editor_for_basis(&spec, selected_basis, selected_channel);
         let selected_prototype = spec
             .tiling
@@ -132,6 +139,7 @@ impl WorkbenchState {
             tiling_selected_vertex: None,
             tiling_construction: Vec::new(),
             tiling_new_basis: false,
+            tiling_drag_active: false,
         }
     }
     pub fn draft(&self) -> &ExperimentSpec {
@@ -283,6 +291,13 @@ impl WorkbenchState {
         };
         self.color_editor_replace_on_input = false;
         buffer.pop().is_some()
+    }
+    pub fn color_editor_select_all(&mut self) -> bool {
+        if self.color_editor.is_none() {
+            return false;
+        }
+        self.color_editor_replace_on_input = true;
+        true
     }
     pub fn commit_color_editor(&mut self) -> Result<RgbColor, String> {
         let source = self
@@ -553,7 +568,11 @@ impl WorkbenchState {
         Ok(())
     }
     pub fn undo(&mut self) -> Result<(), HistoryError> {
+        self.finish_tiling_drag();
         self.history.undo(&mut self.draft)?;
+        self.refresh_rule_selection();
+        self.growth_editor =
+            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
         self.status = if self.draft == self.authoritative {
             DraftStatus::Clean
         } else {
@@ -562,11 +581,16 @@ impl WorkbenchState {
         Ok(())
     }
     pub fn redo(&mut self) -> Result<(), HistoryError> {
+        self.finish_tiling_drag();
         self.history.redo(&mut self.draft)?;
+        self.refresh_rule_selection();
+        self.growth_editor =
+            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
         self.status = DraftStatus::Dirty;
         Ok(())
     }
     pub fn revert(&mut self) {
+        self.finish_tiling_drag();
         self.draft = self.authoritative.clone();
         self.growth_editor =
             editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
@@ -587,6 +611,7 @@ impl WorkbenchState {
         self.refresh_rule_selection();
     }
     pub fn accept(&mut self, normalized: ExperimentSpec) {
+        self.finish_tiling_drag();
         self.authoritative = normalized.clone();
         self.draft = normalized;
         self.selected_channel = self.draft.channels.first().map_or(ChannelId(0), |c| c.id);
@@ -619,6 +644,7 @@ impl WorkbenchState {
     }
 
     fn close_section_editors(&mut self) {
+        self.finish_tiling_drag();
         self.growth_editing = false;
         self.numeric_editor = None;
         self.cancel_color_editor();
@@ -655,11 +681,76 @@ impl WorkbenchState {
             .rules
             .binding(self.selected_basis, self.selected_channel)
             .map(|binding| binding.rule_set);
-        self.selected_kernel = self
+        let available = self
             .selected_rule_set
             .and_then(|rule_set| self.draft.rules.get(rule_set))
-            .and_then(|rule| rule.kernels.first())
-            .map(|kernel| kernel.id);
+            .map(|rule| {
+                rule.kernels
+                    .iter()
+                    .map(|kernel| kernel.id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                self.draft
+                    .kernels
+                    .iter()
+                    .filter(|kernel| kernel.target == self.selected_channel)
+                    .map(|kernel| kernel.id)
+                    .collect()
+            });
+        if !self
+            .selected_kernel
+            .is_some_and(|selected| available.contains(&selected))
+        {
+            self.selected_kernel = available.first().copied();
+        }
+        self.kernel_selection = None;
+        self.periodic_kernel_selection = None;
+    }
+
+    pub fn selected_legacy_kernel(&self) -> Option<&KernelSlot> {
+        self.selected_kernel
+            .and_then(|selected| {
+                self.draft
+                    .kernels
+                    .iter()
+                    .find(|kernel| kernel.id == selected)
+            })
+            .or_else(|| {
+                self.draft
+                    .kernels
+                    .iter()
+                    .find(|kernel| kernel.target == self.selected_channel)
+            })
+    }
+
+    pub fn select_next_kernel(&mut self) {
+        let available = self
+            .selected_rule_set
+            .and_then(|rule_set| self.draft.rules.get(rule_set))
+            .map(|rule| {
+                rule.kernels
+                    .iter()
+                    .map(|kernel| kernel.id)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_else(|| {
+                self.draft
+                    .kernels
+                    .iter()
+                    .filter(|kernel| kernel.target == self.selected_channel)
+                    .map(|kernel| kernel.id)
+                    .collect()
+            });
+        if available.is_empty() {
+            self.selected_kernel = None;
+            return;
+        }
+        let current = self
+            .selected_kernel
+            .and_then(|selected| available.iter().position(|kernel| *kernel == selected))
+            .unwrap_or(available.len() - 1);
+        self.selected_kernel = Some(available[(current + 1) % available.len()]);
         self.kernel_selection = None;
         self.periodic_kernel_selection = None;
     }
@@ -1031,7 +1122,11 @@ impl WorkbenchState {
             growth.kernel_inputs.push(id);
             growth.kernel_inputs.sort_unstable();
         }
-        self.replace_draft(next)
+        self.replace_draft(next)?;
+        self.selected_kernel = Some(id);
+        self.growth_editor =
+            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+        Ok(())
     }
 
     pub fn remove_last_kernel_for_selected(&mut self) -> Result<(), String> {
@@ -1068,13 +1163,25 @@ impl WorkbenchState {
         }
         let target = self.selected_channel;
         let mut next = self.draft.clone();
-        let Some(position) = next
+        let candidates = next
             .kernels
             .iter()
-            .rposition(|kernel| kernel.target == target)
-        else {
-            return Err("selected channel has no kernel".into());
-        };
+            .enumerate()
+            .filter(|(_, kernel)| kernel.target == target)
+            .map(|(position, kernel)| (position, kernel.id))
+            .collect::<Vec<_>>();
+        if candidates.len() <= 1 {
+            return Err("a channel must retain at least one kernel".into());
+        }
+        let position = self
+            .selected_kernel
+            .and_then(|selected| {
+                candidates
+                    .iter()
+                    .find(|(_, kernel)| *kernel == selected)
+                    .map(|(position, _)| *position)
+            })
+            .unwrap_or_else(|| candidates.last().unwrap().0);
         let removed = next.kernels.remove(position).id;
         if let Some(growth) = next
             .growth
@@ -1083,7 +1190,12 @@ impl WorkbenchState {
         {
             growth.kernel_inputs.retain(|id| *id != removed);
         }
-        self.replace_draft(next).map_err(|error| error.to_string())
+        self.replace_draft(next)
+            .map_err(|error| error.to_string())?;
+        self.refresh_rule_selection();
+        self.growth_editor =
+            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+        Ok(())
     }
 
     pub fn cycle_tiling_preset(&mut self) -> Result<(), HistoryError> {
@@ -1260,6 +1372,24 @@ impl WorkbenchState {
     pub fn import_draft(&mut self, draft: ExperimentSpec) -> Result<(), HistoryError> {
         self.replace_draft(draft)
     }
+
+    pub fn import_tiling_drag_draft(&mut self, draft: ExperimentSpec) -> Result<(), HistoryError> {
+        let command = DraftCommand::ReplaceDraft(Box::new(draft));
+        if self.tiling_drag_active {
+            self.history.coalesce_execute(&mut self.draft, command)?;
+        } else {
+            self.history.execute(&mut self.draft, command)?;
+            self.tiling_drag_active = true;
+        }
+        self.status = DraftStatus::Dirty;
+        self.growth_editor =
+            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+        Ok(())
+    }
+
+    pub fn finish_tiling_drag(&mut self) {
+        self.tiling_drag_active = false;
+    }
 }
 
 #[cfg(test)]
@@ -1330,9 +1460,50 @@ mod tests {
         state.add_kernel_for_selected().unwrap();
         assert_eq!(state.draft().kernels.len(), 2);
         assert_eq!(state.draft().growth[0].kernel_inputs.len(), 2);
+        assert_eq!(
+            state.growth_editor().signature(),
+            "fn growth(self: Scalar, potential: Scalar, k1: Scalar) -> Rate"
+        );
+        assert_eq!(state.selected_kernel(), Some(KernelId(1)));
+        state.select_next_kernel();
+        assert_eq!(state.selected_kernel(), Some(KernelId(0)));
         crate::sim::experiment_model::validate_structure(state.draft()).unwrap();
         state.undo().unwrap();
         assert_eq!(state.draft().kernels.len(), 1);
+    }
+
+    #[test]
+    fn tiling_pointer_drag_is_one_undo_unit() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        state.cycle_tiling_preset().unwrap();
+        let before_drag = state.draft().clone();
+
+        let mut first_motion = before_drag.clone();
+        let PrototypeShape::SimplePolygon { vertices } =
+            &mut first_motion.tiling.as_mut().unwrap().prototypes[0].shape
+        else {
+            panic!("square preset should be represented as an editable polygon");
+        };
+        vertices[0].x += 0.1;
+        state.import_tiling_drag_draft(first_motion).unwrap();
+
+        let mut final_motion = state.draft().clone();
+        let PrototypeShape::SimplePolygon { vertices } =
+            &mut final_motion.tiling.as_mut().unwrap().prototypes[0].shape
+        else {
+            panic!("square preset should be represented as an editable polygon");
+        };
+        vertices[0].x += 0.2;
+        state
+            .import_tiling_drag_draft(final_motion.clone())
+            .unwrap();
+        state.finish_tiling_drag();
+
+        assert_eq!(state.draft(), &final_motion);
+        state.undo().unwrap();
+        assert_eq!(state.draft(), &before_drag);
+        state.redo().unwrap();
+        assert_eq!(state.draft(), &final_motion);
     }
 
     #[test]

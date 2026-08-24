@@ -60,6 +60,7 @@ fn toolbar_segments(
         WorkbenchSection::Kernels => vec![
             ("[A] Add", ToolbarAction::Ui(UiCommand::ContextAdd)),
             ("[Del] Remove", ToolbarAction::Ui(UiCommand::ContextDelete)),
+            ("] Kernel", ToolbarAction::Ui(UiCommand::SelectNext)),
             (
                 "[E/Enter] Exact",
                 ToolbarAction::EditorKey(KeyCode::Char('e')),
@@ -443,7 +444,7 @@ pub fn draw_workbench(
             let mut graphics = scene.render_rgba(width as u32, height as u32);
             graphics.generation = scene_generation;
             display.render_graphics(frame, graphics_area, &graphics);
-        } else if let Some(kernel) = state.draft().kernels.first() {
+        } else if let Some(kernel) = state.selected_legacy_kernel() {
             let scene =
                 crate::workbench::kernel_editor::KernelScene::new(kernel.definition.clone())
                     .with_view(state.kernel_view())
@@ -644,7 +645,7 @@ pub fn draw_workbench(
                             )));
                         }
                     }
-                } else if let Some(kernel) = state.draft().kernels.first() {
+                } else if let Some(kernel) = state.selected_legacy_kernel() {
                     lines.push(Line::from(format!(
                         "legacy kernel {} `{}` · source ch{} → target ch{}",
                         kernel.id.0, kernel.symbol, kernel.source.0, kernel.target.0,
@@ -663,7 +664,7 @@ pub fn draw_workbench(
                 ));
                 lines.push(Line::from("Cell wheel ±0.05 · Shift ±0.005 · Ctrl ±0.5"));
                 lines.push(Line::from("Empty wheel zoom · middle pan · E exact value"));
-                lines.push(Line::from("A add · Del remove"));
+                lines.push(Line::from("A add · Del remove · ] next kernel"));
                 lines.push(Line::from(format!(
                     "paint value: {:.4}",
                     state.kernel_paint_value()
@@ -783,12 +784,17 @@ fn tiling_inspector_texts(state: &crate::workbench::WorkbenchState) -> Vec<Strin
         }
         Err(errors) => {
             lines.push("! not a valid periodic tiling".into());
-            lines.extend(
-                errors
-                    .into_iter()
-                    .take(4)
-                    .map(|error| format!("! {}", tiling_diagnostic_guidance(error.code))),
-            );
+            let mut guidance = Vec::new();
+            for error in errors {
+                let message = tiling_diagnostic_guidance(error.code);
+                if !guidance.contains(&message) {
+                    guidance.push(message);
+                }
+                if guidance.len() == 4 {
+                    break;
+                }
+            }
+            lines.extend(guidance.into_iter().map(|message| format!("! {message}")));
         }
     }
     lines
@@ -1405,5 +1411,16 @@ mod tests {
                 )))
             );
         }
+    }
+
+    #[test]
+    fn kernel_toolbar_exposes_independent_kernel_selection() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.add_kernel_for_selected().unwrap();
+        state.select_section(WorkbenchSection::Kernels);
+        let text = toolbar_text(&state);
+        assert!(text.contains("] Kernel"), "kernel toolbar was {text:?}");
     }
 }

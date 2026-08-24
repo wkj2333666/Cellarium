@@ -39,6 +39,21 @@ impl History {
         self.redo.clear();
         Ok(())
     }
+
+    pub fn coalesce_execute(
+        &mut self,
+        draft: &mut ExperimentSpec,
+        forward: DraftCommand,
+    ) -> Result<(), HistoryError> {
+        let inverse = forward.apply(draft).map_err(HistoryError::Edit)?;
+        if let Some(entry) = self.undo.last_mut() {
+            entry.forward = forward;
+        } else {
+            self.undo.push(Entry { forward, inverse });
+        }
+        self.redo.clear();
+        Ok(())
+    }
     pub fn undo(&mut self, draft: &mut ExperimentSpec) -> Result<(), HistoryError> {
         let entry = self.undo.pop().ok_or(HistoryError::NothingToUndo)?;
         let redo = entry.inverse.apply(draft).map_err(HistoryError::Edit)?;
@@ -92,5 +107,30 @@ mod tests {
         assert_eq!(draft, before);
         history.redo(&mut draft).unwrap();
         assert_eq!(draft.channels[0].initial[3], 1.0);
+    }
+
+    #[test]
+    fn coalesced_replace_commands_undo_as_one_pointer_drag() {
+        let mut draft = ExperimentSpec::single_channel_lenia(2, 2);
+        let before = draft.clone();
+        let mut history = History::default();
+        let mut first = draft.clone();
+        first.channels[0].initial[0] = 0.25;
+        history
+            .execute(&mut draft, DraftCommand::ReplaceDraft(Box::new(first)))
+            .unwrap();
+        let mut last = draft.clone();
+        last.channels[0].initial[0] = 0.75;
+        history
+            .coalesce_execute(
+                &mut draft,
+                DraftCommand::ReplaceDraft(Box::new(last.clone())),
+            )
+            .unwrap();
+
+        history.undo(&mut draft).unwrap();
+        assert_eq!(draft, before);
+        history.redo(&mut draft).unwrap();
+        assert_eq!(draft, last);
     }
 }

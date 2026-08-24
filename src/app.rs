@@ -450,7 +450,15 @@ impl App {
                 _ => Err("Delete is available in Channels and Kernels".into()),
             },
             UiCommand::SelectNext => {
-                self.workbench.select_next_channel();
+                match self.workbench.section() {
+                    crate::workbench::WorkbenchSection::Kernels => {
+                        self.workbench.select_next_kernel()
+                    }
+                    crate::workbench::WorkbenchSection::Tiling => {
+                        self.workbench.select_next_prototype()
+                    }
+                    _ => self.workbench.select_next_channel(),
+                }
                 Ok(())
             }
             UiCommand::CyclePresentation => {
@@ -676,6 +684,13 @@ impl App {
                 KeyCode::Backspace => {
                     self.workbench.color_editor_backspace();
                 }
+                KeyCode::Char('a')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    self.workbench.color_editor_select_all();
+                }
                 KeyCode::Char(character) => {
                     if !self.workbench.color_editor_insert(character) {
                         self.workbench_notice =
@@ -696,7 +711,7 @@ impl App {
                 self.workbench_draft_scene_generation.wrapping_add(1);
             return true;
         }
-        if key.code == KeyCode::Char('0') {
+        if key.code == KeyCode::Char('0') && key.modifiers.is_empty() {
             match self.workbench.section() {
                 WorkbenchSection::Tiling => {
                     self.workbench.set_tiling_camera(
@@ -873,7 +888,7 @@ impl App {
                     self.workbench_draft_scene_generation.wrapping_add(1);
                 return true;
             }
-            if let Some(kernel) = self.workbench.draft().kernels.first() {
+            if let Some(kernel) = self.workbench.selected_legacy_kernel() {
                 let current = self.workbench.kernel_selection().unwrap_or(
                     crate::workbench::kernel_editor::KernelPoint {
                         x: kernel.definition.anchor_x,
@@ -966,7 +981,7 @@ impl App {
         &self,
         point: crate::workbench::kernel_editor::KernelPoint,
     ) -> Option<f32> {
-        let kernel = self.workbench.draft().kernels.first()?;
+        let kernel = self.workbench.selected_legacy_kernel()?;
         if point.x >= kernel.definition.width || point.y >= kernel.definition.height {
             return None;
         }
@@ -984,7 +999,7 @@ impl App {
         point: crate::workbench::kernel_editor::KernelPoint,
         value: f32,
     ) -> Result<(), String> {
-        let Some(kernel) = self.workbench.draft().kernels.first().cloned() else {
+        let Some(kernel) = self.workbench.selected_legacy_kernel().cloned() else {
             return Err("no selected kernel".into());
         };
         let mut scene = crate::workbench::kernel_editor::KernelScene::new(kernel.definition)
@@ -995,7 +1010,10 @@ impl App {
             value,
         })?;
         let mut draft = self.workbench.draft().clone();
-        draft.kernels[0].definition = scene.definition;
+        let Some(target) = draft.kernels.iter_mut().find(|entry| entry.id == kernel.id) else {
+            return Err("selected kernel disappeared".into());
+        };
+        target.definition = scene.definition;
         self.workbench
             .import_draft(draft)
             .map_err(|error| error.to_string())?;
@@ -1860,7 +1878,18 @@ impl App {
         let mut local = event;
         local.column = event.column.saturating_sub(viewport.x);
         local.row = event.row.saturating_sub(viewport.y);
-        let Some(mut action) = tracker.update(&local, viewport.width, viewport.height) else {
+        let tracked = tracker.update(&local, viewport.width, viewport.height);
+        if self.mode == AppMode::Workbench
+            && self.workbench.section() == crate::workbench::WorkbenchSection::Tiling
+            && matches!(
+                local.kind,
+                crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
+            )
+        {
+            self.workbench.finish_tiling_drag();
+            return true;
+        }
+        let Some(mut action) = tracked else {
             return false;
         };
         if self.mode == AppMode::Simulation
@@ -2128,7 +2157,11 @@ impl App {
                     if applied && scene.draft != *self.workbench.draft().tiling.as_ref().unwrap() {
                         let mut draft = self.workbench.draft().clone();
                         draft.tiling = Some(scene.draft);
-                        let _ = self.workbench.import_draft(draft);
+                        let _ = if matches!(action, crate::input::MouseAction::Paint) {
+                            self.workbench.import_tiling_drag_draft(draft)
+                        } else {
+                            self.workbench.import_draft(draft)
+                        };
                         self.workbench_draft_scene_generation =
                             self.workbench_draft_scene_generation.wrapping_add(1);
                     }
@@ -2254,7 +2287,7 @@ impl App {
                             | crate::input::MouseAction::Zoom { .. } => unreachable!(),
                         }
                     }
-                    let Some(kernel) = self.workbench.draft().kernels.first().cloned() else {
+                    let Some(kernel) = self.workbench.selected_legacy_kernel().cloned() else {
                         return false;
                     };
                     let mut scene =
@@ -2359,8 +2392,10 @@ impl App {
                     };
                     if result.is_ok() {
                         let mut draft = self.workbench.draft().clone();
-                        if let Some(kernel) = draft.kernels.first_mut() {
-                            kernel.definition = scene.definition;
+                        if let Some(target) =
+                            draft.kernels.iter_mut().find(|entry| entry.id == kernel.id)
+                        {
+                            target.definition = scene.definition;
                         }
                         let _ = self.workbench.import_draft(draft);
                         self.workbench.select_kernel_point(point);
@@ -4912,6 +4947,35 @@ mod tests {
     }
 
     #[test]
+    fn editing_the_selected_second_kernel_does_not_mutate_the_first_kernel() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Kernels);
+        app.workbench_mut().add_kernel_for_selected().unwrap();
+        let selected = app.workbench().selected_kernel().unwrap();
+        let first = app.workbench().draft().kernels[0].clone();
+        let second = app
+            .workbench()
+            .draft()
+            .kernels
+            .iter()
+            .find(|kernel| kernel.id == selected)
+            .unwrap()
+            .clone();
+        let point = crate::workbench::kernel_editor::KernelPoint {
+            x: second.definition.anchor_x,
+            y: second.definition.anchor_y,
+        };
+
+        app.set_kernel_cell_value(point, 0.1234).unwrap();
+
+        assert_eq!(app.workbench().draft().kernels[0], first);
+        assert_eq!(app.workbench().selected_kernel(), Some(selected));
+        assert!((app.kernel_cell_value(point).unwrap() - 0.1234).abs() < 1.0e-6);
+    }
+
+    #[test]
     fn growth_ctrl_a_then_typing_replaces_the_complete_source() {
         let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
         app.enter_workbench();
@@ -4943,7 +5007,7 @@ mod tests {
     }
 
     #[test]
-    fn channels_exact_color_editor_commits_a_hex_rgb_value() {
+    fn channels_exact_color_editor_supports_ctrl_a_and_hash_prefixed_rgb() {
         let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
         app.enter_workbench();
         app.workbench_mut()
@@ -4953,7 +5017,11 @@ mod tests {
             KeyCode::Char('e'),
             crossterm::event::KeyModifiers::NONE,
         )));
-        for character in "3366CC".chars() {
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )));
+        for character in "#3366CC".chars() {
             assert!(app.handle_workbench_editor_key(KeyEvent::new(
                 KeyCode::Char(character),
                 crossterm::event::KeyModifiers::NONE,
