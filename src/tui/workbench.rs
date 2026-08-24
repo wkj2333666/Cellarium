@@ -407,14 +407,16 @@ pub fn draw_workbench(
                 .with_selected_basis(state.selected_basis())
                 .with_camera(state.tiling_camera())
                 .with_selected_vertex(state.tiling_selected_vertex().map(|(_, vertex)| vertex))
-                .with_construction(state.tiling_construction().to_vec());
+                .with_construction(state.tiling_construction().to_vec())
+                .with_pointer(state.tiling_pointer());
             let (width, height) = display.framebuffer_size(graphics_area);
             let mut graphics = scene.render_rgba(width as u32, height as u32);
             graphics.generation = scene_generation;
             display.render_graphics(frame, graphics_area, &graphics);
         } else if state.is_drawing_new_basis() || !state.tiling_construction().is_empty() {
             let scene = crate::workbench::tiling_editor::TilingScene::empty(state.tiling_camera())
-                .with_construction(state.tiling_construction().to_vec());
+                .with_construction(state.tiling_construction().to_vec())
+                .with_pointer(state.tiling_pointer());
             let (width, height) = display.framebuffer_size(graphics_area);
             let mut graphics = scene.render_rgba(width as u32, height as u32);
             graphics.generation = scene_generation;

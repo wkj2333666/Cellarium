@@ -1881,6 +1881,43 @@ impl App {
         let tracked = tracker.update(&local, viewport.width, viewport.height);
         if self.mode == AppMode::Workbench
             && self.workbench.section() == crate::workbench::WorkbenchSection::Tiling
+            && self.workbench.tiling_tool()
+                == crate::workbench::tiling_editor::TilingTool::DrawPolygon
+            && matches!(local.kind, crossterm::event::MouseEventKind::Moved)
+        {
+            let frame_size = self
+                .frame_size
+                .unwrap_or([viewport.width as usize, viewport.height as usize * 2]);
+            let scene = self
+                .workbench
+                .draft()
+                .tiling
+                .clone()
+                .map(crate::workbench::tiling_editor::TilingScene::new)
+                .unwrap_or_else(|| {
+                    crate::workbench::tiling_editor::TilingScene::empty(
+                        self.workbench.tiling_camera(),
+                    )
+                })
+                .with_camera(self.workbench.tiling_camera());
+            let px = (u32::from(local.column) * frame_size[0] as u32
+                / u32::from(viewport.width.max(1)))
+            .min(frame_size[0].saturating_sub(1) as u32);
+            let py = (u32::from(local.row) * frame_size[1] as u32
+                / u32::from(viewport.height.max(1)))
+            .min(frame_size[1].saturating_sub(1) as u32);
+            self.workbench.set_tiling_pointer(Some(scene.pixel_to_world(
+                px,
+                py,
+                frame_size[0] as u32,
+                frame_size[1] as u32,
+            )));
+            self.workbench_draft_scene_generation =
+                self.workbench_draft_scene_generation.wrapping_add(1);
+            return true;
+        }
+        if self.mode == AppMode::Workbench
+            && self.workbench.section() == crate::workbench::WorkbenchSection::Tiling
             && matches!(
                 local.kind,
                 crossterm::event::MouseEventKind::Up(crossterm::event::MouseButton::Left)
@@ -4812,6 +4849,31 @@ mod tests {
         };
 
         assert!(app.handle_mouse(event, &mut tracker));
+        assert_ne!(app.workbench_draft_scene_generation, before);
+    }
+
+    #[test]
+    fn moving_pointer_while_drawing_updates_tiling_preview_without_adding_a_vertex() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Tiling);
+        app.workbench_mut().begin_new_basis_polygon();
+        app.workbench_mut()
+            .push_tiling_vertex(crate::sim::tiling::Vec2::new(0.0, 0.0));
+        app.set_viewport(ratatui::layout::Rect::new(2, 2, 20, 10), [200, 100]);
+        let mut tracker = crate::input::MouseTracker::new();
+        let before = app.workbench_draft_scene_generation;
+        let moved = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 17,
+            row: 7,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        assert!(app.handle_mouse(moved, &mut tracker));
+        assert_eq!(app.workbench().tiling_construction().len(), 1);
+        assert!(app.workbench().tiling_pointer().is_some());
         assert_ne!(app.workbench_draft_scene_generation, before);
     }
 

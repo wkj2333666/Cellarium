@@ -152,6 +152,7 @@ pub struct TilingScene {
     pub selected_vertex: Option<usize>,
     pub camera: TilingCamera,
     pub construction: Vec<Vec2>,
+    pub pointer: Option<Vec2>,
 }
 
 impl TilingScene {
@@ -174,6 +175,7 @@ impl TilingScene {
             selected_vertex: None,
             camera: TilingCamera::default(),
             construction: Vec::new(),
+            pointer: None,
         }
     }
 
@@ -212,6 +214,11 @@ impl TilingScene {
 
     pub fn with_construction(mut self, construction: Vec<Vec2>) -> Self {
         self.construction = construction;
+        self
+    }
+
+    pub fn with_pointer(mut self, pointer: Option<Vec2>) -> Self {
+        self.pointer = pointer;
         self
     }
 
@@ -566,6 +573,35 @@ impl GraphicsScene for TilingScene {
                     [255, 245, 190, 255],
                 );
             }
+            if let Some(pointer) = self.pointer {
+                let pointer_pixel = self.world_to_pixel(pointer, width, height);
+                draw_line(
+                    &mut rgba,
+                    width,
+                    height,
+                    self.world_to_pixel(*self.construction.last().unwrap(), width, height),
+                    pointer_pixel,
+                    [255, 190, 70, 230],
+                );
+                if self.construction.len() >= 2 {
+                    draw_line(
+                        &mut rgba,
+                        width,
+                        height,
+                        pointer_pixel,
+                        self.world_to_pixel(self.construction[0], width, height),
+                        [255, 190, 70, 95],
+                    );
+                }
+                draw_disc(
+                    &mut rgba,
+                    width,
+                    height,
+                    pointer_pixel,
+                    3,
+                    [255, 225, 140, 255],
+                );
+            }
         }
         if let Some(vertices) = selected_handles {
             for (index, vertex) in vertices.iter().enumerate() {
@@ -800,6 +836,21 @@ mod tests {
         let mapped = scene.pixel_to_world(x as u32, y as u32, 320, 240);
         assert!((mapped.x - point.x).abs() < 0.02);
         assert!((mapped.y - point.y).abs() < 0.02);
+    }
+
+    #[test]
+    fn construction_preview_draws_from_last_vertex_to_live_pointer() {
+        let scene = TilingScene::empty(TilingCamera::default())
+            .with_construction(vec![Vec2::new(-1.0, 0.0), Vec2::new(0.0, 0.0)])
+            .with_pointer(Some(Vec2::new(1.0, 0.0)));
+        let frame = scene.render_rgba(320, 240);
+        let (x, y) = scene.world_to_pixel(Vec2::new(0.5, 0.0), 320, 240);
+        let index = (y as usize * 320 + x as usize) * 4;
+        assert_ne!(
+            &frame.rgba[index..index + 4],
+            &[5, 10, 24, 255],
+            "the uncommitted edge must be visible at the pointer midpoint"
+        );
     }
 
     #[test]

@@ -86,6 +86,7 @@ pub struct WorkbenchState {
     tiling_camera: super::tiling_editor::TilingCamera,
     tiling_selected_vertex: Option<(PrototypeId, usize)>,
     tiling_construction: Vec<crate::sim::tiling::Vec2>,
+    tiling_pointer: Option<crate::sim::tiling::Vec2>,
     tiling_new_basis: bool,
     tiling_drag_active: bool,
 }
@@ -138,6 +139,7 @@ impl WorkbenchState {
             tiling_camera: super::tiling_editor::TilingCamera::default(),
             tiling_selected_vertex: None,
             tiling_construction: Vec::new(),
+            tiling_pointer: None,
             tiling_new_basis: false,
             tiling_drag_active: false,
         }
@@ -339,16 +341,24 @@ impl WorkbenchState {
     pub fn clear_tiling_vertex(&mut self) {
         self.tiling_selected_vertex = None;
     }
+    pub fn tiling_pointer(&self) -> Option<crate::sim::tiling::Vec2> {
+        self.tiling_pointer
+    }
+    pub fn set_tiling_pointer(&mut self, pointer: Option<crate::sim::tiling::Vec2>) {
+        self.tiling_pointer = pointer;
+    }
     pub fn set_tiling_tool(&mut self, tool: super::tiling_editor::TilingTool) {
         self.tiling_tool = tool;
         if tool != super::tiling_editor::TilingTool::DrawPolygon {
             self.tiling_construction.clear();
+            self.tiling_pointer = None;
             self.tiling_new_basis = false;
         }
     }
     pub fn begin_new_basis_polygon(&mut self) {
         self.tiling_tool = super::tiling_editor::TilingTool::DrawPolygon;
         self.tiling_construction.clear();
+        self.tiling_pointer = None;
         self.tiling_new_basis = true;
     }
     pub fn is_drawing_new_basis(&self) -> bool {
@@ -362,6 +372,7 @@ impl WorkbenchState {
     }
     pub fn cancel_tiling_construction(&mut self) {
         self.tiling_construction.clear();
+        self.tiling_pointer = None;
         self.tiling_tool = super::tiling_editor::TilingTool::Select;
         self.tiling_new_basis = false;
     }
@@ -492,6 +503,7 @@ impl WorkbenchState {
         self.replace_draft(next)
             .map_err(|error| error.to_string())?;
         self.tiling_construction.clear();
+        self.tiling_pointer = None;
         self.tiling_tool = super::tiling_editor::TilingTool::Select;
         self.tiling_new_basis = false;
         self.refresh_rule_selection();
@@ -602,6 +614,10 @@ impl WorkbenchState {
             .and_then(|tiling| tiling.prototypes.first().map(|prototype| prototype.id));
         self.history.clear();
         self.status = DraftStatus::Clean;
+        self.tiling_construction.clear();
+        self.tiling_pointer = None;
+        self.tiling_tool = super::tiling_editor::TilingTool::Select;
+        self.tiling_new_basis = false;
         self.selected_basis = self
             .draft
             .basis_ids()
