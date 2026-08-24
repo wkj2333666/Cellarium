@@ -346,6 +346,25 @@ pub struct PeriodicKernelScene {
     pub view: KernelView,
 }
 
+type PeriodicKernelCell = (KernelSelection, Vec<Vec2>, f32, bool);
+
+#[derive(Clone, Copy, Debug)]
+struct PeriodicPixelTransform {
+    width: f64,
+    height: f64,
+    center: Vec2,
+    scale: f64,
+}
+
+impl PeriodicPixelTransform {
+    fn world_to_pixel(self, point: Vec2) -> (i32, i32) {
+        (
+            (self.width * 0.5 + (point.x - self.center.x) * self.scale).round() as i32,
+            (self.height * 0.5 + (point.y - self.center.y) * self.scale).round() as i32,
+        )
+    }
+}
+
 impl PeriodicKernelScene {
     pub fn new(
         tiling: PeriodicTilingDraft,
@@ -435,7 +454,7 @@ impl PeriodicKernelScene {
         }
     }
 
-    fn cells(&self) -> Vec<(KernelSelection, Vec<Vec2>, f32, bool)> {
+    fn cells(&self) -> Vec<PeriodicKernelCell> {
         let mut cells = Vec::new();
         for y in 0..self.definition.height {
             for x in 0..self.definition.width {
@@ -487,24 +506,8 @@ impl PeriodicKernelScene {
     }
 
     fn world_bounds(&self) -> (Vec2, Vec2) {
-        let mut minimum = Vec2::new(f64::INFINITY, f64::INFINITY);
-        let mut maximum = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
-        for (_, polygon, _, _) in self.cells() {
-            for point in polygon {
-                minimum.x = minimum.x.min(point.x);
-                minimum.y = minimum.y.min(point.y);
-                maximum.x = maximum.x.max(point.x);
-                maximum.y = maximum.y.max(point.y);
-            }
-        }
-        if !minimum.x.is_finite() {
-            return (Vec2::new(-1.0, -1.0), Vec2::new(1.0, 1.0));
-        }
-        let margin = ((maximum.x - minimum.x).max(maximum.y - minimum.y) * 0.06).max(0.05);
-        (
-            Vec2::new(minimum.x - margin, minimum.y - margin),
-            Vec2::new(maximum.x + margin, maximum.y + margin),
-        )
+        let cells = self.cells();
+        world_bounds_for_cells(&cells)
     }
 
     fn pixel_scale(&self, width: u32, height: u32, bounds: (Vec2, Vec2)) -> f64 {
@@ -520,25 +523,54 @@ impl PeriodicKernelScene {
         )
     }
 
+    fn pixel_transform(
+        &self,
+        width: u32,
+        height: u32,
+        bounds: (Vec2, Vec2),
+    ) -> PeriodicPixelTransform {
+        PeriodicPixelTransform {
+            width: f64::from(width),
+            height: f64::from(height),
+            center: self.view_center(bounds),
+            scale: self.pixel_scale(width, height, bounds),
+        }
+    }
+
     fn world_to_pixel(&self, point: Vec2, width: u32, height: u32) -> (i32, i32) {
-        let bounds = self.world_bounds();
-        let center = self.view_center(bounds);
-        let scale = self.pixel_scale(width, height, bounds);
-        (
-            (f64::from(width) * 0.5 + (point.x - center.x) * scale).round() as i32,
-            (f64::from(height) * 0.5 + (point.y - center.y) * scale).round() as i32,
-        )
+        self.pixel_transform(width, height, self.world_bounds())
+            .world_to_pixel(point)
     }
 
     fn pixel_to_world(&self, px: u32, py: u32, width: u32, height: u32) -> Vec2 {
         let bounds = self.world_bounds();
-        let center = self.view_center(bounds);
-        let scale = self.pixel_scale(width, height, bounds);
+        let transform = self.pixel_transform(width, height, bounds);
         Vec2::new(
-            (f64::from(px) - f64::from(width) * 0.5) / scale + center.x,
-            (f64::from(py) - f64::from(height) * 0.5) / scale + center.y,
+            (f64::from(px) - transform.width * 0.5) / transform.scale + transform.center.x,
+            (f64::from(py) - transform.height * 0.5) / transform.scale + transform.center.y,
         )
     }
+}
+
+fn world_bounds_for_cells(cells: &[PeriodicKernelCell]) -> (Vec2, Vec2) {
+    let mut minimum = Vec2::new(f64::INFINITY, f64::INFINITY);
+    let mut maximum = Vec2::new(f64::NEG_INFINITY, f64::NEG_INFINITY);
+    for (_, polygon, _, _) in cells {
+        for point in polygon {
+            minimum.x = minimum.x.min(point.x);
+            minimum.y = minimum.y.min(point.y);
+            maximum.x = maximum.x.max(point.x);
+            maximum.y = maximum.y.max(point.y);
+        }
+    }
+    if !minimum.x.is_finite() {
+        return (Vec2::new(-1.0, -1.0), Vec2::new(1.0, 1.0));
+    }
+    let margin = ((maximum.x - minimum.x).max(maximum.y - minimum.y) * 0.06).max(0.05);
+    (
+        Vec2::new(minimum.x - margin, minimum.y - margin),
+        Vec2::new(maximum.x + margin, maximum.y + margin),
+    )
 }
 
 impl GraphicsScene for PeriodicKernelScene {
@@ -561,6 +593,7 @@ impl GraphicsScene for PeriodicKernelScene {
             .copied()
             .unwrap_or(1.0)
             .max(f32::EPSILON);
+        let transform = self.pixel_transform(width, height, world_bounds_for_cells(&cells));
         for (selection, polygon, value, active) in cells {
             let intensity = ((value.abs() / scale).min(1.0) * 230.0).round() as u8;
             let color = if !active {
@@ -572,7 +605,7 @@ impl GraphicsScene for PeriodicKernelScene {
             } else {
                 [8, 8, 8, 255]
             };
-            draw_world_polygon(&mut rgba, width, height, self, &polygon, color);
+            draw_world_polygon(&mut rgba, width, height, transform, &polygon, color);
             let edge = if self.selected == Some(selection) {
                 [255, 255, 255, 255]
             } else if selection.offset == [0, 0] && selection.source_basis == self.target_basis {
@@ -580,7 +613,7 @@ impl GraphicsScene for PeriodicKernelScene {
             } else {
                 [70, 100, 135, 255]
             };
-            draw_world_outline(&mut rgba, width, height, self, &polygon, edge);
+            draw_world_outline(&mut rgba, width, height, transform, &polygon, edge);
         }
         GraphicsFrame::new(width, height, rgba, 0).expect("valid periodic kernel frame")
     }
@@ -604,13 +637,13 @@ fn draw_world_polygon(
     rgba: &mut [u8],
     width: u32,
     height: u32,
-    scene: &PeriodicKernelScene,
+    transform: PeriodicPixelTransform,
     polygon: &[Vec2],
     color: [u8; 4],
 ) {
     let points = polygon
         .iter()
-        .map(|point| scene.world_to_pixel(*point, width, height))
+        .map(|point| transform.world_to_pixel(*point))
         .collect::<Vec<_>>();
     let minimum_y = points.iter().map(|point| point.1).min().unwrap_or(0).max(0);
     let maximum_y = points
@@ -646,7 +679,7 @@ fn draw_world_outline(
     rgba: &mut [u8],
     width: u32,
     height: u32,
-    scene: &PeriodicKernelScene,
+    transform: PeriodicPixelTransform,
     polygon: &[Vec2],
     color: [u8; 4],
 ) {
@@ -655,8 +688,8 @@ fn draw_world_outline(
             rgba,
             width,
             height,
-            scene.world_to_pixel(polygon[index], width, height),
-            scene.world_to_pixel(polygon[(index + 1) % polygon.len()], width, height),
+            transform.world_to_pixel(polygon[index]),
+            transform.world_to_pixel(polygon[(index + 1) % polygon.len()]),
             color,
         );
     }
@@ -960,6 +993,37 @@ mod tests {
                 "rendered basis polygon and mouse hit-test must share geometry",
             );
         }
+    }
+
+    #[test]
+    fn periodic_27x27_kernel_renders_within_interactive_budget() {
+        let tiling = build_preset(TilingPreset::Square, 1.0);
+        let built = ring_definition(13, 0.5, 0.15).build().unwrap();
+        let definition = PeriodicKernelDefinition {
+            width: built.width,
+            height: built.height,
+            anchor_x: built.anchor_x,
+            anchor_y: built.anchor_y,
+            planes: [(
+                BasisId(0),
+                BasisWeightPlane {
+                    values: built.values,
+                    mask: built.mask,
+                },
+            )]
+            .into(),
+        };
+        let scene = PeriodicKernelScene::new(tiling, definition, BasisId(0));
+
+        let started = std::time::Instant::now();
+        let frame = scene.render_rgba(1280, 1024);
+        let elapsed = started.elapsed();
+
+        assert_eq!((frame.width, frame.height), (1280, 1024));
+        assert!(
+            elapsed < std::time::Duration::from_millis(500),
+            "27x27 periodic kernel took {elapsed:?}; graphics editing must remain interactive",
+        );
     }
 
     #[test]
