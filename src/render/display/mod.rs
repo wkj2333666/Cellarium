@@ -790,7 +790,7 @@ impl KittySharedFrame {
         // The viewport is fully opaque, so packed RGB preserves its pixels
         // while reducing each shared-memory frame by 25% compared with RGBA.
         let mut rgb = Vec::with_capacity(expected / 4 * 3);
-        for pixel in rgba.chunks_exact(4) {
+        for pixel in rgba.chunks(4) {
             rgb.extend_from_slice(&pixel[..3]);
         }
 
