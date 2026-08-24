@@ -1273,7 +1273,7 @@ pub fn decode_kitty_pixels(
         "32" if pixels.len() == pixel_count * 4 => Some(pixels.to_vec()),
         "24" if pixels.len() == pixel_count * 3 => {
             let mut rgba = Vec::with_capacity(pixel_count * 4);
-            for rgb in pixels.chunks_exact(3) {
+            for rgb in pixels.chunks(3) {
                 rgba.extend_from_slice(rgb);
                 rgba.push(255);
             }
