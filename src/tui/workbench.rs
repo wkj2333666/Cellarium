@@ -762,12 +762,22 @@ fn tiling_inspector_texts(state: &crate::workbench::WorkbenchState) -> Vec<Strin
         .map_or("unnamed", |prototype| prototype.name.as_str());
     let mut lines = vec![
         format!(
-            "cell: {} polygons · {} shapes",
+            "central cell: {} {} · {} shape {}",
             tiling.instances.len(),
+            if tiling.instances.len() == 1 {
+                "polygon"
+            } else {
+                "polygons"
+            },
             tiling.prototypes.len(),
+            if tiling.prototypes.len() == 1 {
+                "type"
+            } else {
+                "types"
+            },
         ),
         format!(
-            "selected: basis {} · prototype {} ({selected_name})",
+            "editing polygon: basis {} · shape {} ({selected_name})",
             state.selected_basis().0,
             selected_prototype.map_or_else(|| "—".into(), |id| id.0.to_string())
         ),
@@ -1372,6 +1382,25 @@ mod tests {
         assert!(text.contains("exact edge-to-edge tiling"));
         assert!(text.contains("Euler 0"));
         assert!(text.contains("neighbor seams 6"));
+    }
+
+    #[test]
+    fn tiling_inspector_distinguishes_the_complete_cell_from_the_edited_polygon() {
+        let mut spec = crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4);
+        spec.tiling = Some(crate::sim::tiling::build_preset(
+            crate::sim::tiling::TilingPreset::OctagonSquare,
+            1.0,
+        ));
+        let state = crate::workbench::WorkbenchState::new(spec);
+        let text = tiling_inspector_texts(&state).join("\n");
+        assert!(
+            text.contains("central cell: 2 polygons · 2 shape types"),
+            "inspector must name the complete unit-cell composition: {text}"
+        );
+        assert!(
+            text.contains("editing polygon:"),
+            "the selected polygon must be labeled as an editing target, not as the cell: {text}"
+        );
     }
 
     #[test]

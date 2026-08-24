@@ -264,34 +264,18 @@ impl TilingScene {
         Some(transform_vertices(&base, instance.transform))
     }
 
-    #[cfg(test)]
-    fn neighbor_polygons(&self) -> Vec<(crate::sim::tiling::BasisId, [i32; 2], Vec<Vec2>)> {
-        let Some(selected) = self.selected_basis else {
-            return Vec::new();
-        };
+    fn neighbor_cell_offsets(&self) -> Vec<[i32; 2]> {
         let Ok(report) = crate::sim::tiling::validate_coverage(&self.draft) else {
             return Vec::new();
         };
         let mut seen = std::collections::BTreeSet::new();
         report
             .neighbor_ring
-            .get(&selected)
-            .into_iter()
+            .values()
             .flatten()
-            .filter_map(|neighbor| {
-                let key = (neighbor.target_basis, neighbor.lattice_offset);
-                if !seen.insert(key) {
-                    return None;
-                }
-                let shift = self.draft.translation_a * f64::from(neighbor.lattice_offset[0])
-                    + self.draft.translation_b * f64::from(neighbor.lattice_offset[1]);
-                let polygon = self
-                    .instance_polygon(neighbor.target_basis)?
-                    .into_iter()
-                    .map(|point| point + shift)
-                    .collect();
-                Some((neighbor.target_basis, neighbor.lattice_offset, polygon))
-            })
+            .map(|neighbor| neighbor.lattice_offset)
+            .filter(|offset| *offset != [0, 0])
+            .filter(|offset| seen.insert(*offset))
             .collect()
     }
 
@@ -519,58 +503,26 @@ impl GraphicsScene for TilingScene {
             pixel.copy_from_slice(&[5, 10, 24, 255]);
         }
         let coverage_valid = crate::sim::tiling::validate_coverage(&self.draft).is_ok();
-        let half_a = self.draft.translation_a * 0.5;
-        let half_b = self.draft.translation_b * 0.5;
-        let cell_boundary = vec![
-            Vec2::ZERO - half_a - half_b,
-            Vec2::ZERO + half_a - half_b,
-            Vec2::ZERO + half_a + half_b,
-            Vec2::ZERO - half_a + half_b,
-        ];
         if coverage_valid {
-            for lattice_a in -1..=1 {
-                for lattice_b in -1..=1 {
-                    if lattice_a == 0 && lattice_b == 0 {
-                        continue;
+            for offset in self.neighbor_cell_offsets() {
+                let shift = self.draft.translation_a * f64::from(offset[0])
+                    + self.draft.translation_b * f64::from(offset[1]);
+                for instance in &self.draft.instances {
+                    if let Some(polygon) = self.instance_polygon(instance.id) {
+                        let polygon = polygon
+                            .into_iter()
+                            .map(|point| point + shift)
+                            .collect::<Vec<_>>();
+                        draw_filled_polygon(
+                            &mut rgba,
+                            width,
+                            height,
+                            self,
+                            &polygon,
+                            [28, 66, 108, 48],
+                        );
+                        draw_polygon(&mut rgba, width, height, self, &polygon, [80, 135, 195, 95]);
                     }
-                    let shift = self.draft.translation_a * f64::from(lattice_a)
-                        + self.draft.translation_b * f64::from(lattice_b);
-                    for instance in &self.draft.instances {
-                        if let Some(polygon) = self.instance_polygon(instance.id) {
-                            let polygon = polygon
-                                .into_iter()
-                                .map(|point| point + shift)
-                                .collect::<Vec<_>>();
-                            draw_filled_polygon(
-                                &mut rgba,
-                                width,
-                                height,
-                                self,
-                                &polygon,
-                                [28, 66, 108, 48],
-                            );
-                            draw_polygon(
-                                &mut rgba,
-                                width,
-                                height,
-                                self,
-                                &polygon,
-                                [80, 135, 195, 95],
-                            );
-                        }
-                    }
-                    let boundary = cell_boundary
-                        .iter()
-                        .map(|point| *point + shift)
-                        .collect::<Vec<_>>();
-                    draw_polygon(
-                        &mut rgba,
-                        width,
-                        height,
-                        self,
-                        &boundary,
-                        [65, 115, 170, 65],
-                    );
                 }
             }
         }
@@ -581,28 +533,26 @@ impl GraphicsScene for TilingScene {
             let selected = Some(instance.id) == self.selected_basis;
             let polygon_valid = validate_polygon(&polygon).is_empty();
             let (fill, edge) = if !polygon_valid || !coverage_valid {
-                if selected {
-                    ([130, 25, 42, 175], [255, 75, 90, 255])
-                } else {
-                    ([85, 30, 50, 170], [220, 100, 125, 230])
-                }
-            } else if selected {
-                ([175, 135, 35, 180], [255, 238, 170, 255])
+                (
+                    [85, 30, 50, 170],
+                    if selected {
+                        [255, 75, 90, 255]
+                    } else {
+                        [220, 100, 125, 230]
+                    },
+                )
             } else {
-                ([40, 105, 155, 190], [135, 210, 245, 235])
+                (
+                    [40, 105, 155, 190],
+                    if selected {
+                        [255, 238, 170, 255]
+                    } else {
+                        [135, 210, 245, 235]
+                    },
+                )
             };
             draw_filled_polygon(&mut rgba, width, height, self, &polygon, fill);
             draw_polygon(&mut rgba, width, height, self, &polygon, edge);
-        }
-        if !self.draft.instances.is_empty() {
-            draw_polygon(
-                &mut rgba,
-                width,
-                height,
-                self,
-                &cell_boundary,
-                [105, 195, 235, 225],
-            );
         }
         let selected_handles = self
             .selected_basis
@@ -1106,16 +1056,55 @@ mod tests {
     }
 
     #[test]
-    fn preview_uses_the_validated_topological_neighbor_ring() {
+    fn selecting_a_polygon_changes_only_its_outline_not_the_central_cell_fill() {
+        let draft = build_preset(TilingPreset::OctagonSquare, 1.0);
+        let sampled_inside = |selected: crate::sim::tiling::BasisId, instance: &TileInstance| {
+            let scene = TilingScene::new(draft.clone()).with_selected_basis(selected);
+            let frame = scene.render_rgba(640, 480);
+            let prototype = draft
+                .prototypes
+                .iter()
+                .find(|prototype| prototype.id == instance.prototype)
+                .unwrap();
+            let polygon = transform_vertices(
+                &prototype_vertices(&prototype.shape).unwrap(),
+                instance.transform,
+            );
+            let center = polygon.iter().fold(Vec2::ZERO, |sum, point| sum + *point)
+                * (1.0 / polygon.len() as f64);
+            let point = center + (polygon[0] - center) * 0.31;
+            let (x, y) = scene.world_to_pixel(point, 640, 480);
+            let index = (y as usize * 640 + x as usize) * 4;
+            [
+                frame.rgba[index],
+                frame.rgba[index + 1],
+                frame.rgba[index + 2],
+            ]
+        };
+        for instance in &draft.instances {
+            let selected = sampled_inside(instance.id, instance);
+            let other = draft
+                .instances
+                .iter()
+                .find(|candidate| candidate.id != instance.id)
+                .unwrap();
+            let unselected = sampled_inside(other.id, instance);
+            assert_eq!(
+                selected, unselected,
+                "selection must not recolor a polygon as though it alone were the unit cell"
+            );
+        }
+    }
+
+    #[test]
+    fn preview_uses_the_complete_cells_from_the_validated_topological_neighbor_ring() {
         let square = build_preset(TilingPreset::Square, 1.0);
-        let square_scene =
-            TilingScene::new(square.clone()).with_selected_basis(square.instances[0].id);
-        assert_eq!(square_scene.neighbor_polygons().len(), 4);
+        let square_scene = TilingScene::new(square);
+        assert_eq!(square_scene.neighbor_cell_offsets().len(), 4);
 
         let hexagon = build_preset(TilingPreset::RegularHexagon, 1.0);
-        let hexagon_scene =
-            TilingScene::new(hexagon.clone()).with_selected_basis(hexagon.instances[0].id);
-        assert_eq!(hexagon_scene.neighbor_polygons().len(), 6);
+        let hexagon_scene = TilingScene::new(hexagon);
+        assert_eq!(hexagon_scene.neighbor_cell_offsets().len(), 6);
     }
 
     #[test]
