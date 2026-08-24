@@ -444,12 +444,29 @@ impl WorkbenchState {
                         .collect::<Vec<_>>()
                         .join("; ")
                 })?;
-            } else {
-                for rule in &mut next.rules.sets {
-                    for kernel in &mut rule.kernels {
-                        if let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) =
-                            &mut kernel.spatial
-                        {
+            }
+            for rule in &mut next.rules.sets {
+                for kernel in &mut rule.kernels {
+                    let replacement = match &mut kernel.spatial {
+                        crate::sim::ruleset::KernelSpatialDefinition::Raster(definition) => {
+                            let built = definition.build().map_err(|error| error.to_string())?;
+                            Some(crate::sim::ruleset::KernelSpatialDefinition::Periodic(
+                                crate::sim::basis_kernel::PeriodicKernelDefinition {
+                                    width: built.width,
+                                    height: built.height,
+                                    anchor_x: built.anchor_x,
+                                    anchor_y: built.anchor_y,
+                                    planes: std::collections::BTreeMap::from([(
+                                        basis,
+                                        crate::sim::basis_kernel::BasisWeightPlane {
+                                            values: built.values,
+                                            mask: built.mask,
+                                        },
+                                    )]),
+                                },
+                            ))
+                        }
+                        crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) => {
                             let plane_len = definition.width * definition.height;
                             let template = definition.planes.values().next().cloned().unwrap_or(
                                 crate::sim::basis_kernel::BasisWeightPlane {
@@ -458,21 +475,27 @@ impl WorkbenchState {
                                 },
                             );
                             definition.planes.insert(basis, template);
+                            None
                         }
+                    };
+                    if let Some(replacement) = replacement {
+                        kernel.spatial = replacement;
                     }
                 }
-                for output in next
-                    .channels
-                    .iter()
-                    .filter(|channel| !channel.frozen)
-                    .map(|channel| channel.id)
-                    .collect::<Vec<_>>()
-                {
-                    let default = *next
-                        .rules
-                        .defaults
-                        .get(&output)
-                        .ok_or("active channel has no default rule-set")?;
+            }
+            for output in next
+                .channels
+                .iter()
+                .filter(|channel| !channel.frozen)
+                .map(|channel| channel.id)
+                .collect::<Vec<_>>()
+            {
+                let default = *next
+                    .rules
+                    .defaults
+                    .get(&output)
+                    .ok_or("active channel has no default rule-set")?;
+                if next.rules.binding(basis, output).is_none() {
                     next.rules.bindings.push(crate::sim::ruleset::RuleBinding {
                         basis,
                         output,
@@ -1730,6 +1753,17 @@ mod tests {
         let tiling = state.draft().tiling.as_ref().unwrap();
         assert_eq!(tiling.instances.len(), 1);
         crate::sim::tiling::validate_coverage(tiling).unwrap();
+        let basis = state.selected_basis();
+        let rule = state.rule_for(basis, ChannelId(0)).unwrap();
+        let KernelSpatialDefinition::Periodic(definition) = &rule.kernels[0].spatial else {
+            panic!("first free-drawn tiling must convert raster kernels to periodic basis planes");
+        };
+        assert!(definition.planes.contains_key(&basis));
+        state
+            .draft()
+            .rules
+            .validate(&state.draft().basis_ids(), &state.draft().channels)
+            .unwrap();
     }
 
     #[test]
