@@ -49,6 +49,10 @@ where
 {
     let options = parse_cli(args).map_err(CliError)?;
     match &options.mode {
+        CliMode::Version => {
+            println!("cellarium {}", env!("CARGO_PKG_VERSION"));
+            return Ok(());
+        }
         CliMode::Server => return Ok(cellarium::app::run_server()?),
         CliMode::Connect { host } => {
             return Ok(cellarium::app::run_connect_with_command(
@@ -95,6 +99,7 @@ struct CliOptions {
 enum CliMode {
     #[default]
     Direct,
+    Version,
     Server,
     Connect {
         host: String,
@@ -109,6 +114,13 @@ where
     let mut args = args.into_iter();
     while let Some(argument) = args.next() {
         let flag = argument.to_string_lossy();
+        if flag == "--version" || flag == "-V" {
+            if options != CliOptions::default() || args.next().is_some() {
+                return Err("--version cannot be combined with other arguments");
+            }
+            options.mode = CliMode::Version;
+            break;
+        }
         if flag == "server" {
             if options.mode != CliMode::Direct {
                 return Err("duplicate mode");
@@ -206,6 +218,27 @@ mod tests {
             Some(PathBuf::from("/tmp/output.ron"))
         );
         assert_eq!(options.kernel, None);
+    }
+
+    #[test]
+    fn cli_parses_standalone_version_flags_and_rejects_combinations() {
+        assert_eq!(
+            parse_cli([OsString::from("--version")]).unwrap().mode,
+            CliMode::Version
+        );
+        assert_eq!(
+            parse_cli([OsString::from("-V")]).unwrap().mode,
+            CliMode::Version
+        );
+        assert_eq!(
+            parse_cli([
+                OsString::from("connect"),
+                OsString::from("tinker"),
+                OsString::from("--version")
+            ])
+            .unwrap_err(),
+            "--version cannot be combined with other arguments"
+        );
     }
 
     #[test]
