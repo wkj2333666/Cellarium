@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::input::UiCommand;
 use crate::render::display::ViewportDisplay;
-use crate::render::workbench_graphics::GraphicsScene;
+use crate::render::workbench_graphics::{GraphicsScene, PlacementAction};
 use crate::workbench::{WorkbenchFocus, WorkbenchSection};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -58,9 +58,11 @@ fn toolbar_segments(
             ("[F] Freeze", ToolbarAction::Ui(UiCommand::ToggleFrozen)),
         ],
         WorkbenchSection::Kernels => vec![
-            ("[A] Add", ToolbarAction::Ui(UiCommand::ContextAdd)),
+            ("[A] Add kernel", ToolbarAction::Ui(UiCommand::ContextAdd)),
             ("[Del] Remove", ToolbarAction::Ui(UiCommand::ContextDelete)),
             ("] Kernel", ToolbarAction::Ui(UiCommand::SelectNext)),
+            ("[S] Source", ToolbarAction::EditorKey(KeyCode::Char('s'))),
+            ("[U] Output", ToolbarAction::EditorKey(KeyCode::Char('u'))),
             (
                 "[E/Enter] Exact",
                 ToolbarAction::EditorKey(KeyCode::Char('e')),
@@ -157,7 +159,116 @@ fn inspector_kernel_count(state: &crate::workbench::WorkbenchState) -> usize {
     state
         .selected_rule_set()
         .and_then(|id| state.draft().rules.get(id))
-        .map_or_else(|| state.draft().kernels.len(), |rule| rule.kernels.len())
+        .map_or_else(
+            || {
+                state
+                    .draft()
+                    .kernels
+                    .iter()
+                    .filter(|kernel| kernel.target == state.selected_channel())
+                    .count()
+            },
+            |rule| rule.kernels.len(),
+        )
+}
+
+fn effective_kernel_count(spec: &crate::sim::experiment_model::ExperimentSpec) -> usize {
+    if spec.rules.is_empty() {
+        spec.kernels.len()
+    } else {
+        spec.rules
+            .bindings
+            .iter()
+            .filter_map(|binding| spec.rules.get(binding.rule_set))
+            .map(|rule| rule.kernels.len())
+            .sum()
+    }
+}
+
+fn growth_program_count(spec: &crate::sim::experiment_model::ExperimentSpec) -> usize {
+    if spec.rules.is_empty() {
+        spec.growth.len()
+    } else {
+        spec.rules.bindings.len()
+    }
+}
+
+fn experiment_review_lines(state: &crate::workbench::WorkbenchState) -> Vec<String> {
+    let active = state.authoritative();
+    let draft = state.draft();
+    let validation = crate::sim::experiment_model::validate_structure(draft);
+    let mut lines = vec![
+        "Experiment review".into(),
+        match &validation {
+            Ok(()) => "Validation: VALID · ready to apply".into(),
+            Err(errors) => format!("Validation: INVALID · {} problem(s)", errors.len()),
+        },
+        "".into(),
+        "Active → draft".into(),
+        format!(
+            "Channels        {} → {}",
+            active.channels.len(),
+            draft.channels.len()
+        ),
+        format!(
+            "Effective kernels {} → {}",
+            effective_kernel_count(active),
+            effective_kernel_count(draft)
+        ),
+        format!(
+            "Growth programs  {} → {}",
+            growth_program_count(active),
+            growth_program_count(draft)
+        ),
+    ];
+    for channel in draft
+        .channels
+        .iter()
+        .filter(|channel| !active.channels.iter().any(|active| active.id == channel.id))
+    {
+        lines.push(format!("  + {}", channel.name));
+    }
+    for channel in active
+        .channels
+        .iter()
+        .filter(|channel| !draft.channels.iter().any(|draft| draft.id == channel.id))
+    {
+        lines.push(format!("  − {}", channel.name));
+    }
+    if active.channels != draft.channels && active.channels.len() == draft.channels.len() {
+        lines.push("  ~ channel metadata or initial field changed".into());
+    }
+    if active.kernels != draft.kernels || active.rules != draft.rules {
+        lines.push("  ~ kernel weights or routing changed".into());
+    }
+    if active.growth != draft.growth || active.rules != draft.rules {
+        lines.push("  ~ growth programs changed".into());
+    }
+    if active.tiling != draft.tiling {
+        lines.push("  ~ periodic tiling changed".into());
+    }
+    if active.geometry != draft.geometry {
+        lines.push("  ~ world geometry changed".into());
+    }
+    if active == draft {
+        lines.push("No unapplied changes.".into());
+    }
+    if let Err(errors) = validation {
+        lines.push("".into());
+        lines.push("Problems".into());
+        lines.extend(
+            errors
+                .into_iter()
+                .take(6)
+                .map(|error| format!("  ! {error}")),
+        );
+    }
+    lines.extend([
+        "".into(),
+        "Apply restarts the runtime from the draft initial field.".into(),
+        "Ctrl+Enter Apply · Ctrl+R Revert · Ctrl+E/L Export/Load draft".into(),
+    ]);
+    lines
 }
 
 pub fn draw_workbench(
@@ -203,6 +314,12 @@ pub fn draw_workbench(
         [pixel_width as u32, pixel_height as u32],
         display.protocol(),
     );
+    if matches!(
+        placement_action,
+        PlacementAction::DeleteBeforePresent | PlacementAction::DeleteOnly
+    ) {
+        display.invalidate_pending_graphics();
+    }
     let state = app.workbench();
     let outline_lines = WorkbenchSection::ALL
         .into_iter()
@@ -338,11 +455,7 @@ pub fn draw_workbench(
             );
             lines
         }
-        WorkbenchSection::Experiment => vec![
-            "Experiment review".into(),
-            "Validate · Apply · Revert · Save · Load".into(),
-            "Runtime changes only after Apply".into(),
-        ],
+        WorkbenchSection::Experiment => experiment_review_lines(state),
     };
     frame.render_widget(canvas_block, layout.canvas);
     let header = match state.section() {
@@ -446,11 +559,10 @@ pub fn draw_workbench(
             let mut graphics = scene.render_rgba(width as u32, height as u32);
             graphics.generation = scene_generation;
             display.render_graphics(frame, graphics_area, &graphics);
-        } else if let Some(kernel) = state.selected_legacy_kernel() {
-            let scene =
-                crate::workbench::kernel_editor::KernelScene::new(kernel.definition.clone())
-                    .with_view(state.kernel_view())
-                    .with_selected(state.kernel_selection());
+        } else if let Some(definition) = state.selected_raster_kernel_definition() {
+            let scene = crate::workbench::kernel_editor::KernelScene::new(definition.clone())
+                .with_view(state.kernel_view())
+                .with_selected(state.kernel_selection());
             let (width, height) = display.framebuffer_size(graphics_area);
             let mut graphics = scene.render_rgba(width as u32, height as u32);
             graphics.generation = scene_generation;
@@ -625,26 +737,36 @@ pub fn draw_workbench(
                             "kernel {} `{}` · source {} ({})",
                             kernel.id.0, kernel.symbol, kernel.source_channel.0, source_name,
                         )));
-                        if let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) =
-                            &kernel.spatial
-                        {
-                            lines.push(Line::from(format!(
-                                "stencil {}×{} · anchor {},{} · {} source basis plane(s)",
-                                definition.width,
-                                definition.height,
-                                definition.anchor_x,
-                                definition.anchor_y,
-                                definition.planes.len(),
-                            )));
-                            lines.push(Line::from(format!(
-                                "source bases: {}",
-                                definition
-                                    .planes
-                                    .keys()
-                                    .map(|basis| basis.0.to_string())
-                                    .collect::<Vec<_>>()
-                                    .join(", ")
-                            )));
+                        match &kernel.spatial {
+                            crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) => {
+                                lines.push(Line::from(format!(
+                                    "stencil {}×{} · anchor {},{} · {} source basis plane(s)",
+                                    definition.width,
+                                    definition.height,
+                                    definition.anchor_x,
+                                    definition.anchor_y,
+                                    definition.planes.len(),
+                                )));
+                                lines.push(Line::from(format!(
+                                    "source bases: {}",
+                                    definition
+                                        .planes
+                                        .keys()
+                                        .map(|basis| basis.0.to_string())
+                                        .collect::<Vec<_>>()
+                                        .join(", ")
+                                )));
+                            }
+                            crate::sim::ruleset::KernelSpatialDefinition::Raster(definition) => {
+                                lines.push(Line::from(format!(
+                                    "raster stencil {}×{} · anchor {},{} · {:?}",
+                                    definition.width,
+                                    definition.height,
+                                    definition.anchor_x,
+                                    definition.anchor_y,
+                                    definition.normalization,
+                                )));
+                            }
                         }
                     }
                 } else if let Some(kernel) = state.selected_legacy_kernel() {
@@ -666,7 +788,9 @@ pub fn draw_workbench(
                 ));
                 lines.push(Line::from("Cell wheel ±0.05 · Shift ±0.005 · Ctrl ±0.5"));
                 lines.push(Line::from("Empty wheel zoom · middle pan · E exact value"));
-                lines.push(Line::from("A add · Del remove · ] next kernel"));
+                lines.push(Line::from("A add kernel · Del remove · ] next kernel"));
+                lines.push(Line::from("S source channel · U output channel"));
+                lines.push(Line::from("Channel count: Channels section A/Del"));
                 lines.push(Line::from(format!(
                     "paint value: {:.4}",
                     state.kernel_paint_value()
@@ -697,7 +821,7 @@ pub fn draw_workbench(
         }
         lines.extend([
             Line::from("Ctrl+Z/Y undo/redo · Ctrl+Enter Apply"),
-            Line::from("Ctrl+S active · Ctrl+E/O draft"),
+            Line::from("Ctrl+S active · Ctrl+E/L draft"),
             Line::from(app.workbench_notice().unwrap_or("")),
             Line::from("W leave Workbench · ? help"),
         ]);
@@ -1277,6 +1401,17 @@ mod tests {
     }
 
     #[test]
+    fn inspector_kernel_count_uses_the_selected_legacy_output() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.add_channel().unwrap();
+
+        assert_eq!(state.draft().kernels.len(), 2);
+        assert_eq!(inspector_kernel_count(&state), 1);
+    }
+
+    #[test]
     fn world_graphics_respects_the_selected_solo_channel_color() {
         let mut spec = crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(1, 1);
         spec.channels[0].initial[0] = 1.0;
@@ -1355,6 +1490,62 @@ mod tests {
             toolbar_action_at(&state, revert),
             Some(ToolbarAction::Ui(UiCommand::RevertDraft))
         );
+    }
+
+    #[test]
+    fn experiment_review_reports_real_differences_and_apply_consequences() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.add_channel().unwrap();
+
+        let text = experiment_review_lines(&state).join("\n");
+
+        assert!(
+            text.contains("VALID · ready to apply"),
+            "review was:\n{text}"
+        );
+        assert!(
+            text.contains("Channels        1 → 2"),
+            "review was:\n{text}"
+        );
+        assert!(text.contains("+ channel_2"), "review was:\n{text}");
+        assert!(
+            !text.contains("(channel 1)"),
+            "internal zero-based channel ids should not leak into the review:\n{text}"
+        );
+        assert!(
+            text.contains("Effective kernels 1 → 2"),
+            "review was:\n{text}"
+        );
+        assert!(
+            text.contains("Growth programs  1 → 2"),
+            "review was:\n{text}"
+        );
+        assert!(
+            text.contains("Apply restarts the runtime from the draft initial field"),
+            "review was:\n{text}"
+        );
+        assert!(
+            text.contains("Ctrl+E/L Export/Load draft"),
+            "letter O is indistinguishable from zero in common terminal fonts:\n{text}"
+        );
+    }
+
+    #[test]
+    fn experiment_review_surfaces_validation_failures_in_the_canvas() {
+        let mut spec = crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4);
+        spec.channels[0].initial.clear();
+        let state = crate::workbench::WorkbenchState::new(spec);
+
+        let text = experiment_review_lines(&state).join("\n");
+
+        assert!(
+            text.contains("INVALID · 1 problem(s)"),
+            "review was:\n{text}"
+        );
+        assert!(text.contains("!"), "review was:\n{text}");
+        assert!(text.contains("initial"), "review was:\n{text}");
     }
 
     #[test]
@@ -1465,5 +1656,24 @@ mod tests {
         state.select_section(WorkbenchSection::Kernels);
         let text = toolbar_text(&state);
         assert!(text.contains("] Kernel"), "kernel toolbar was {text:?}");
+    }
+
+    #[test]
+    fn kernel_toolbar_exposes_source_and_output_channel_controls() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.select_section(WorkbenchSection::Kernels);
+        let text = toolbar_text(&state);
+        for (label, key) in [("[S] Source", 's'), ("[U] Output", 'u')] {
+            assert!(text.contains(label), "kernel toolbar was {text:?}");
+            let column = text.find(label).unwrap() as u16 + 2;
+            assert_eq!(
+                toolbar_action_at(&state, column),
+                Some(ToolbarAction::EditorKey(crossterm::event::KeyCode::Char(
+                    key
+                )))
+            );
+        }
     }
 }

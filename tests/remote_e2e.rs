@@ -123,6 +123,19 @@ fn terminal_screen_visual_hash_includes_ansi_colors() {
     assert_ne!(red, green);
 }
 
+#[test]
+fn terminal_probe_expands_kitty_rgb_frames_for_visual_checks() {
+    assert_eq!(
+        terminal_probe::decode_kitty_pixels(
+            "a=T,f=24,t=s,s=2,v=1",
+            2,
+            1,
+            &[255, 51, 0, 0, 255, 255],
+        ),
+        Some(vec![255, 51, 0, 255, 0, 255, 255, 255])
+    );
+}
+
 #[cfg(feature = "cuda")]
 #[test]
 #[ignore = "requires tinker's NVIDIA driver and NVRTC"]

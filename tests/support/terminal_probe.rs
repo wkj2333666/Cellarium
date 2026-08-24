@@ -416,12 +416,13 @@ impl PtySession {
     ) -> io::Result<u64> {
         let result = self.pump_until(description, INPUT_TIMEOUT, |session| {
             let fresh = &session.frames[checkpoint.min(session.frames.len())..];
-            if fresh.len() < 2 {
-                return false;
-            }
-            let last = fresh[fresh.len() - 1].hash;
-            let previous = fresh[fresh.len() - 2].hash;
-            last == previous && Some(last) != old_hash
+            // Static Workbench scenes are deduplicated and intentionally emit
+            // only one fresh graphics frame.  Treat that frame as stable once
+            // it has remained the latest presentation for 120 ms; requiring
+            // a duplicate frame would turn the optimization into a timeout.
+            fresh.last().is_some_and(|last| {
+                Some(last.hash) != old_hash && last.at.elapsed() >= Duration::from_millis(120)
+            })
         });
         if let Err(error) = result {
             return Err(io::Error::new(
@@ -517,12 +518,13 @@ impl PtySession {
                         size: frame.bytes.len(),
                     });
                     if let Some((width, height)) = dimensions
-                        && frame.bytes.len() == width as usize * height as usize * 4
+                        && let Some(rgba) =
+                            decode_kitty_pixels(&command.control, width, height, &frame.bytes)
                     {
                         self.latest_graphics = Some(CapturedGraphics {
                             width,
                             height,
-                            rgba: frame.bytes,
+                            rgba,
                         });
                     }
                 }
@@ -553,13 +555,14 @@ impl PtySession {
                 return Err(io::Error::new(
                     io::ErrorKind::TimedOut,
                     format!(
-                        "timed out waiting for {description}; frames={}, output_bytes={}; tail={:?}; screen=\\n{}",
+                        "timed out waiting for {description}; frames={}, output_bytes={}; tail={:?}; screen=\\n{}; trace={}",
                         self.frames.len(),
                         self.output.len(),
                         String::from_utf8_lossy(
                             &self.output[self.output.len().saturating_sub(500)..]
                         ),
-                        self.screen.dump()
+                        self.screen.dump(),
+                        self.trace_tail()
                     ),
                 ));
             }
@@ -824,7 +827,8 @@ pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
     // one-based; the section is the fourth terminal row).
     session.write(b"\x1b[<0;5;4M\x1b[<0;5;4m")?;
     session.pump_until("Channels section", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"Channel compositor")
+        session.screen.contains(b"section: Channels")
+            && session.screen.contains(b"Add/remove channels")
     })?;
     if !session.active_kitty_images.is_empty() {
         return Err(io::Error::other(
@@ -867,7 +871,7 @@ pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
     // evaluated kernel so the result becomes directly editable.
     let kernel_trace_start = session.trace_len();
     let kernel_frame_start = session.frames.len();
-    session.write(b"\x1b[<0;30;8M\x1b[<0;30;8m")?;
+    session.write(b"\x1b[<0;30;8M\x1b[<32;32;8M\x1b[<0;32;8m")?;
     session.pump_until("kernel mouse mutation", INPUT_TIMEOUT, |session| {
         session.trace_contains_since(kernel_trace_start, b"E2E_WORKBENCH_MOUSE applied=true")
     })?;
@@ -891,7 +895,7 @@ pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
     )?;
     session.write(b"e")?;
     session.pump_until("Growth editor", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"Growth source (editing")
+        session.screen.contains(b"section: Growth") && session.screen.contains(b"EDITING")
     })?;
     // Type a valid expression suffix through the real PTY editor and require
     // the high-resolution plot itself to change, not merely the text panel.
@@ -930,7 +934,9 @@ pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
     let graphics_before_tiling = session.frames.last().map(|frame| frame.hash);
     session.write(b"\x1b[<0;5;3M\x1b[<0;5;3mp")?;
     session.pump_until("square tiling editor", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"selected Tiling") && !session.active_kitty_images.is_empty()
+        session.screen.contains(b"section: Tiling")
+            && session.screen.contains(b"exact edge-to-edge tiling")
+            && !session.active_kitty_images.is_empty()
     })?;
     let tiling_hash = Some(session.wait_for_stable_new_kitty_frame(
         "stable square tiling graphics",
@@ -941,7 +947,9 @@ pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
     // and release. Undo afterwards so the final Apply remains a valid tiling.
     let tiling_trace_start = session.trace_len();
     let tiling_frame_start = session.frames.len();
-    session.write(b"\x1b[<0;55;18M\x1b[<32;56;18M\x1b[<0;56;18m")?;
+    // The graphics viewport begins below the two-line Canvas header.  Row 19
+    // maps to pixel y=height/2, the square preset's world-origin vertex.
+    session.write(b"\x1b[<0;55;19M\x1b[<32;56;19M\x1b[<0;56;19m")?;
     session.pump_until("tiling vertex mutation", INPUT_TIMEOUT, |session| {
         session.trace_contains_since(tiling_trace_start, b"E2E_WORKBENCH_MOUSE applied=true")
     })?;
@@ -1074,7 +1082,7 @@ pub fn run_workbench_fallback_probe(host: &str) -> io::Result<()> {
         Some(zoomed_kernel_hash),
     )?;
     let kernel_trace_start = session.trace_len();
-    session.write(b"\x1b[<0;30;8M\x1b[<0;30;8m")?;
+    session.write(b"\x1b[<0;30;8M\x1b[<32;32;8M\x1b[<0;32;8m")?;
     session.pump_until("fallback kernel mutation", INPUT_TIMEOUT, |session| {
         session.trace_contains_since(kernel_trace_start, b"E2E_WORKBENCH_MOUSE applied=true")
     })?;
@@ -1095,7 +1103,8 @@ pub fn run_workbench_fallback_probe(host: &str) -> io::Result<()> {
     let growth_trace_start = session.trace_len();
     session.write(b"e+0.1*sin(potential*10)")?;
     session.pump_until("fallback Growth source typing", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"Growth source (editing")
+        session.screen.contains(b"section: Growth")
+            && session.screen.contains(b"EDITING")
             && session.screen.contains(b"sin(potential*10)")
             && session
                 .last_trace_line_since(growth_trace_start, b"E2E_GROWTH_VALID")
@@ -1113,7 +1122,8 @@ pub fn run_workbench_fallback_probe(host: &str) -> io::Result<()> {
     session.pump_for(Duration::from_millis(200))?;
     session.write(b"\x1b[<0;5;3M\x1b[<0;5;3mp")?;
     session.pump_until("fallback square Tiling", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"selected Tiling")
+        session.screen.contains(b"section: Tiling")
+            && session.screen.contains(b"exact edge-to-edge tiling")
     })?;
     canvas_hash = session.wait_for_stable_new_terminal_visual(
         "stable fallback Tiling canvas",
@@ -1246,6 +1256,31 @@ fn kitty_dimensions(control: &str) -> Option<(u32, u32)> {
         fields.get("s")?.parse().ok()?,
         fields.get("v")?.parse().ok()?,
     ))
+}
+
+pub fn decode_kitty_pixels(
+    control: &str,
+    width: u32,
+    height: u32,
+    pixels: &[u8],
+) -> Option<Vec<u8>> {
+    let format = control
+        .split(',')
+        .find_map(|field| field.strip_prefix("f="))
+        .unwrap_or("32");
+    let pixel_count = width as usize * height as usize;
+    match format {
+        "32" if pixels.len() == pixel_count * 4 => Some(pixels.to_vec()),
+        "24" if pixels.len() == pixel_count * 3 => {
+            let mut rgba = Vec::with_capacity(pixel_count * 4);
+            for rgb in pixels.chunks_exact(3) {
+                rgba.extend_from_slice(rgb);
+                rgba.push(255);
+            }
+            Some(rgba)
+        }
+        _ => None,
+    }
 }
 
 fn observe_kitty_placement(control: &str, active: &mut HashSet<u32>) {

@@ -163,8 +163,10 @@ run_session() {
     XDG_CONFIG_HOME="$XDG_CONFIG_HOME" \
     kitty --config "$run_dir/kitty.conf" --hold --start-as fullscreen \
     --title "$title" --class "$title" \
-    /usr/bin/sh -c 'printf "%s\n" "$$" >"$1"; shift; exec "$@"' \
-    sh "$run_dir/client.pid" "$@" >"$run_dir/logs/kitty.log" 2>&1 &
+    /usr/bin/sh -c \
+    'printf "%s\n" "$$" >"$1"; shift; client_stderr=$1; shift; exec "$@" 2>"$client_stderr"' \
+    sh "$run_dir/client.pid" "$run_dir/logs/client.stderr" "$@" \
+    >"$run_dir/logs/kitty.log" 2>&1 &
   kitty_pid=$!
   agentic_manifest_set "$manifest" KITTY_PID "$kitty_pid"
   agentic_manifest_set "$manifest" KITTY_START_TIME "$(agentic_proc_start_time "$kitty_pid")"

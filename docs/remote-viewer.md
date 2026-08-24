@@ -17,7 +17,7 @@ connect command starts `$HOME/.local/bin/cellarium server` through SSH. Only
 scalar snapshots and input events cross SSH; Kitty graphics escape sequences
 are generated locally, so a Kitty-capable terminal keeps high-precision output
 without sending image pixels through SSH. On native local Unix Kitty terminals,
-Cellarium transfers each RGBA frame through POSIX shared memory and sends only
+Cellarium transfers each opaque RGB frame through POSIX shared memory and sends only
 a small graphics command through the terminal PTY. This keeps terminal output
 from blocking keyboard or mouse input at high resolutions. Cellarium waits for
 Kitty to unlink each consumed object; if consumption stalls or shared-memory

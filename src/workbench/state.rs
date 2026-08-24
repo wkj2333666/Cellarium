@@ -3,8 +3,9 @@ use super::kernel_editor::{KernelPoint, KernelSelection};
 use super::numeric_editor::NumericEditor;
 use super::{ChannelView, DraftCommand, GrowthEditorState, History, HistoryError};
 use crate::sim::experiment_model::{
-    ChannelId, DisplayColor, ExperimentSpec, KernelId, KernelSlot, RgbColor,
+    ChannelId, ChannelSpec, DisplayColor, ExperimentSpec, KernelId, KernelSlot, RgbColor,
 };
+use crate::sim::kernel::KernelDefinition;
 use crate::sim::ruleset::{BindingKey, RuleKernel, RuleSet, RuleSetId};
 use crate::sim::tiling::{BasisId, PrototypeId, PrototypeShape, TilingPreset, build_preset};
 
@@ -232,6 +233,77 @@ impl WorkbenchState {
             .kernels
             .iter()
             .find(|entry| entry.id == kernel)
+    }
+    pub fn selected_raster_kernel_definition(&self) -> Option<&KernelDefinition> {
+        if let Some(kernel) = self.selected_rule_kernel() {
+            return match &kernel.spatial {
+                crate::sim::ruleset::KernelSpatialDefinition::Raster(definition) => {
+                    Some(definition)
+                }
+                crate::sim::ruleset::KernelSpatialDefinition::Periodic(_) => None,
+            };
+        }
+        self.selected_legacy_kernel()
+            .map(|kernel| &kernel.definition)
+    }
+    pub fn replace_selected_raster_kernel_definition(
+        &mut self,
+        definition: KernelDefinition,
+    ) -> Result<(), HistoryError> {
+        definition
+            .build()
+            .map_err(|error| HistoryError::Edit(error.to_string()))?;
+        let selected_kernel = self
+            .selected_kernel
+            .ok_or_else(|| HistoryError::Edit("no selected kernel".into()))?;
+        if self.selected_rule_set.is_some() {
+            let binding = BindingKey {
+                basis: self.selected_basis,
+                output: self.selected_channel,
+            };
+            let mut next = self.draft.clone();
+            let rule_set = next
+                .rules
+                .detach(binding)
+                .map_err(|error| HistoryError::Edit(error.to_string()))?;
+            let kernel = next
+                .rules
+                .get_mut(rule_set)
+                .and_then(|rule| {
+                    rule.kernels
+                        .iter_mut()
+                        .find(|kernel| kernel.id == selected_kernel)
+                })
+                .ok_or_else(|| HistoryError::Edit("selected rule kernel is missing".into()))?;
+            if !matches!(
+                kernel.spatial,
+                crate::sim::ruleset::KernelSpatialDefinition::Raster(_)
+            ) {
+                return Err(HistoryError::Edit(
+                    "selected kernel is not a raster kernel".into(),
+                ));
+            }
+            kernel.spatial = crate::sim::ruleset::KernelSpatialDefinition::Raster(definition);
+            next.rules
+                .get(rule_set)
+                .expect("detached rule-set must remain available")
+                .validate()
+                .map_err(|error| HistoryError::Edit(error.to_string()))?;
+            self.execute(DraftCommand::ReplaceDraft(Box::new(next)))?;
+            self.refresh_rule_selection();
+            self.selected_kernel = Some(selected_kernel);
+            return Ok(());
+        }
+        let mut next = self.draft.clone();
+        let kernel = next
+            .kernels
+            .iter_mut()
+            .find(|kernel| kernel.id == selected_kernel)
+            .ok_or_else(|| HistoryError::Edit("selected legacy kernel is missing".into()))?;
+        kernel.definition = definition;
+        self.replace_draft(next)?;
+        self.selected_kernel = Some(selected_kernel);
+        Ok(())
     }
     pub fn kernel_paint_value(&self) -> f32 {
         self.kernel_paint_value
@@ -627,45 +699,27 @@ impl WorkbenchState {
     pub fn revert(&mut self) {
         self.finish_tiling_drag();
         self.draft = self.authoritative.clone();
-        self.growth_editor =
-            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
         self.growth_editing = false;
-        self.selected_prototype = self
-            .draft
-            .tiling
-            .as_ref()
-            .and_then(|tiling| tiling.prototypes.first().map(|prototype| prototype.id));
+        self.numeric_editor = None;
+        self.cancel_color_editor();
         self.history.clear();
         self.status = DraftStatus::Clean;
         self.tiling_construction.clear();
         self.tiling_pointer = None;
         self.tiling_tool = super::tiling_editor::TilingTool::Select;
         self.tiling_new_basis = false;
-        self.selected_basis = self
-            .draft
-            .basis_ids()
-            .first()
-            .copied()
-            .unwrap_or(BasisId(0));
-        self.refresh_rule_selection();
+        self.reconcile_selection_to_draft();
     }
     pub fn accept(&mut self, normalized: ExperimentSpec) {
         self.finish_tiling_drag();
         self.authoritative = normalized.clone();
         self.draft = normalized;
-        self.selected_channel = self.draft.channels.first().map_or(ChannelId(0), |c| c.id);
-        self.growth_editor =
-            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
         self.growth_editing = false;
+        self.numeric_editor = None;
+        self.cancel_color_editor();
         self.history.clear();
         self.status = DraftStatus::Clean;
-        self.selected_basis = self
-            .draft
-            .basis_ids()
-            .first()
-            .copied()
-            .unwrap_or(BasisId(0));
-        self.refresh_rule_selection();
+        self.reconcile_selection_to_draft();
     }
     pub fn select_section(&mut self, section: WorkbenchSection) {
         if self.section != section {
@@ -745,6 +799,43 @@ impl WorkbenchState {
         }
         self.kernel_selection = None;
         self.periodic_kernel_selection = None;
+    }
+
+    fn reconcile_selection_to_draft(&mut self) {
+        if !self
+            .draft
+            .channels
+            .iter()
+            .any(|channel| channel.id == self.selected_channel)
+        {
+            self.selected_channel = self
+                .draft
+                .channels
+                .first()
+                .map_or(ChannelId(0), |channel| channel.id);
+        }
+        let bases = self.draft.basis_ids();
+        if !bases.contains(&self.selected_basis) {
+            self.selected_basis = bases.first().copied().unwrap_or(BasisId(0));
+        }
+        let selected_prototype_is_valid = self.selected_prototype.is_some_and(|selected| {
+            self.draft.tiling.as_ref().is_some_and(|tiling| {
+                tiling
+                    .prototypes
+                    .iter()
+                    .any(|prototype| prototype.id == selected)
+            })
+        });
+        if !selected_prototype_is_valid {
+            self.selected_prototype = self
+                .draft
+                .tiling
+                .as_ref()
+                .and_then(|tiling| tiling.prototypes.first().map(|prototype| prototype.id));
+        }
+        self.refresh_rule_selection();
+        self.growth_editor =
+            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
     }
 
     pub fn selected_legacy_kernel(&self) -> Option<&KernelSlot> {
@@ -882,7 +973,27 @@ impl WorkbenchState {
         let mut next = self.draft.clone();
         let name = format!("channel_{}", next.channels.len() + 1);
         let id = next.add_channel(name, false);
-        if !next.rules.is_empty() {
+        let selected_kernel = if next.rules.is_empty() {
+            let kernel_id = KernelId(
+                next.kernels
+                    .iter()
+                    .map(|kernel| kernel.id.0)
+                    .max()
+                    .unwrap_or(0)
+                    .checked_add(1)
+                    .ok_or_else(|| HistoryError::Edit("kernel id exhausted".into()))?,
+            );
+            let symbol = format!("k{}", kernel_id.0);
+            next.kernels
+                .push(KernelSlot::identity(kernel_id, symbol, id, id));
+            let growth = next
+                .growth
+                .iter_mut()
+                .find(|growth| growth.target == id)
+                .ok_or_else(|| HistoryError::Edit("new channel growth is missing".into()))?;
+            growth.kernel_inputs = vec![kernel_id];
+            Some(kernel_id)
+        } else {
             next.growth.retain(|growth| growth.target != id);
             let rule_set_id = RuleSetId(
                 next.rules
@@ -931,10 +1042,12 @@ impl WorkbenchState {
                         rule_set: rule_set_id,
                     }
                 }));
-        }
+            Some(KernelId(0))
+        };
         self.selected_channel = id;
         self.replace_draft(next)?;
         self.refresh_rule_selection();
+        self.selected_kernel = selected_kernel.or(self.selected_kernel);
         Ok(())
     }
 
@@ -1166,6 +1279,100 @@ impl WorkbenchState {
         self.growth_editor =
             editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
         Ok(())
+    }
+
+    pub fn cycle_selected_kernel_source(&mut self) -> Result<ChannelId, HistoryError> {
+        if self.draft.channels.len() <= 1 {
+            return Err(HistoryError::Edit(
+                "add another channel before changing the kernel source".into(),
+            ));
+        }
+        let selected = self
+            .selected_kernel
+            .ok_or_else(|| HistoryError::Edit("no kernel is selected".into()))?;
+        let next_source = |current: ChannelId, channels: &[ChannelSpec]| {
+            let index = channels
+                .iter()
+                .position(|channel| channel.id == current)
+                .unwrap_or(0);
+            channels[(index + 1) % channels.len()].id
+        };
+        let mut next = self.draft.clone();
+        let source = if !next.rules.is_empty() {
+            let binding = BindingKey {
+                basis: self.selected_basis,
+                output: self.selected_channel,
+            };
+            let rule_set = next
+                .rules
+                .detach(binding)
+                .map_err(|error| HistoryError::Edit(error.to_string()))?;
+            let kernel = next
+                .rules
+                .get_mut(rule_set)
+                .and_then(|rule| rule.kernels.iter_mut().find(|kernel| kernel.id == selected))
+                .ok_or_else(|| HistoryError::Edit("selected rule kernel is missing".into()))?;
+            let source = next_source(kernel.source_channel, &next.channels);
+            kernel.source_channel = source;
+            next.rules
+                .validate(&next.basis_ids(), &next.channels)
+                .map_err(|errors| {
+                    HistoryError::Edit(
+                        errors
+                            .into_iter()
+                            .map(|error| error.to_string())
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    )
+                })?;
+            source
+        } else {
+            let kernel = next
+                .kernels
+                .iter_mut()
+                .find(|kernel| kernel.id == selected && kernel.target == self.selected_channel)
+                .ok_or_else(|| HistoryError::Edit("selected kernel is missing".into()))?;
+            let source = next_source(kernel.source, &next.channels);
+            kernel.source = source;
+            crate::sim::experiment_model::validate_structure(&next).map_err(|errors| {
+                HistoryError::Edit(
+                    errors
+                        .into_iter()
+                        .map(|error| error.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; "),
+                )
+            })?;
+            source
+        };
+        self.replace_draft(next)?;
+        self.refresh_rule_selection();
+        self.selected_kernel = Some(selected);
+        Ok(source)
+    }
+
+    pub fn select_next_kernel_output(&mut self) -> Result<ChannelId, HistoryError> {
+        let outputs = self
+            .draft
+            .channels
+            .iter()
+            .filter(|channel| !channel.frozen)
+            .map(|channel| channel.id)
+            .collect::<Vec<_>>();
+        if outputs.is_empty() {
+            return Err(HistoryError::Edit(
+                "no active output channel is available".into(),
+            ));
+        }
+        let index = outputs
+            .iter()
+            .position(|channel| *channel == self.selected_channel)
+            .unwrap_or(0);
+        self.selected_channel = outputs[(index + 1) % outputs.len()];
+        self.growth_editor =
+            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+        self.refresh_rule_selection();
+        Ok(self.selected_channel)
     }
 
     pub fn remove_last_kernel_for_selected(&mut self) -> Result<(), String> {
@@ -1512,6 +1719,87 @@ mod tests {
     }
 
     #[test]
+    fn adding_a_legacy_channel_creates_one_editable_default_kernel() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+
+        state.add_channel().unwrap();
+
+        let output = state.selected_channel();
+        let kernels = state
+            .draft()
+            .kernels
+            .iter()
+            .filter(|kernel| kernel.target == output)
+            .collect::<Vec<_>>();
+        assert_eq!(kernels.len(), 1);
+        assert_eq!(kernels[0].source, output);
+        assert_eq!(
+            state
+                .draft()
+                .growth
+                .iter()
+                .find(|growth| growth.target == output)
+                .unwrap()
+                .kernel_inputs,
+            vec![kernels[0].id],
+        );
+        assert_eq!(state.selected_kernel(), Some(kernels[0].id));
+        crate::sim::experiment_model::validate_structure(state.draft()).unwrap();
+    }
+
+    #[test]
+    fn reverting_a_removed_selected_channel_restores_a_valid_editing_selection() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        state.add_channel().unwrap();
+        state.accept(state.draft().clone());
+        state.add_channel().unwrap();
+        assert_eq!(state.draft().channels.len(), 3);
+
+        state.revert();
+
+        assert_eq!(state.draft().channels.len(), 2);
+        assert!(
+            state
+                .draft()
+                .channels
+                .iter()
+                .any(|channel| channel.id == state.selected_channel()),
+            "revert left a removed channel selected"
+        );
+        let selected = state
+            .selected_legacy_kernel()
+            .expect("revert should select an editable kernel");
+        assert_eq!(selected.target, state.selected_channel());
+        assert!(state.selected_kernel().is_some());
+    }
+
+    #[test]
+    fn legacy_kernel_source_cycles_across_channels_and_is_undoable() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        state.add_channel().unwrap();
+        let kernel = state.selected_kernel().unwrap();
+        let output = state.selected_channel();
+
+        state.cycle_selected_kernel_source().unwrap();
+
+        let changed = state
+            .draft()
+            .kernels
+            .iter()
+            .find(|entry| entry.id == kernel && entry.target == output)
+            .unwrap();
+        assert_eq!(changed.source, ChannelId(0));
+        state.undo().unwrap();
+        let restored = state
+            .draft()
+            .kernels
+            .iter()
+            .find(|entry| entry.id == kernel && entry.target == output)
+            .unwrap();
+        assert_eq!(restored.source, output);
+    }
+
+    #[test]
     fn tiling_pointer_drag_is_one_undo_unit() {
         let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
         state.cycle_tiling_preset().unwrap();
@@ -1554,6 +1842,33 @@ mod tests {
         assert_eq!(state.draft().tiling.as_ref().unwrap().prototypes.len(), 1);
         state.cycle_tiling_preset().unwrap();
         assert_eq!(state.draft().tiling.as_ref().unwrap().prototypes.len(), 2);
+    }
+
+    #[test]
+    fn normalized_raster_rule_kernel_is_exposed_and_editable() {
+        let spec = ExperimentSpec::single_channel_lenia(8, 8)
+            .normalize_rules()
+            .unwrap();
+        let mut state = WorkbenchState::new(spec);
+
+        let definition = state
+            .selected_raster_kernel_definition()
+            .expect("normalized raster kernel should be visible to the editor")
+            .clone();
+        assert_eq!((definition.width, definition.height), (27, 27));
+
+        let mut edited = definition;
+        edited.values =
+            crate::sim::kernel::KernelValues::Explicit(vec![0.25; edited.width * edited.height]);
+        state
+            .replace_selected_raster_kernel_definition(edited)
+            .unwrap();
+
+        let edited = state.selected_raster_kernel_definition().unwrap();
+        let crate::sim::kernel::KernelValues::Explicit(values) = &edited.values else {
+            panic!("edited raster should remain explicit");
+        };
+        assert!(values.iter().all(|value| *value == 0.25));
     }
 
     #[test]
@@ -1676,6 +1991,27 @@ mod tests {
         for basis in [BasisId(0), BasisId(1)] {
             assert!(state.draft().rules.binding(basis, channel).is_some());
         }
+        state
+            .draft()
+            .rules
+            .validate(&state.draft().basis_ids(), &state.draft().channels)
+            .unwrap();
+    }
+
+    #[test]
+    fn normalized_kernel_source_edit_detaches_only_the_selected_basis_output() {
+        let mut state = WorkbenchState::new(basis_fixture());
+        state.add_channel().unwrap();
+        let output = state.selected_channel();
+        let sibling_before = state.rule_for(BasisId(1), output).unwrap().clone();
+
+        state.cycle_selected_kernel_source().unwrap();
+
+        assert_eq!(
+            state.rule_for(BasisId(0), output).unwrap().kernels[0].source_channel,
+            ChannelId(0),
+        );
+        assert_eq!(state.rule_for(BasisId(1), output).unwrap(), &sibling_before);
         state
             .draft()
             .rules

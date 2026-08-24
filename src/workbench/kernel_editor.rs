@@ -6,6 +6,8 @@ use crate::sim::tiling::{
     polygon::{prototype_vertices, transform_vertices},
 };
 
+const MAX_FITTED_KERNEL_CELL_PIXELS: f64 = 96.0;
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct KernelPoint {
     pub x: usize,
@@ -201,7 +203,7 @@ impl KernelScene {
     fn pixel_scale(&self, width: u32, height: u32) -> f64 {
         let fit = (f64::from(width.max(1)) / self.definition.width.max(1) as f64)
             .min(f64::from(height.max(1)) / self.definition.height.max(1) as f64);
-        fit * self.view.zoom
+        fit.min(MAX_FITTED_KERNEL_CELL_PIXELS) * self.view.zoom
     }
 
     fn continuous_cell_at_pixel(&self, px: u32, py: u32, width: u32, height: u32) -> [f64; 2] {
@@ -255,8 +257,9 @@ impl KernelScene {
     fn fitted_layout(&self, width: u32, height: u32) -> (u32, u32, u32, u32) {
         let kernel_width = self.definition.width.max(1) as f64;
         let kernel_height = self.definition.height.max(1) as f64;
-        let scale =
-            (f64::from(width.max(1)) / kernel_width).min(f64::from(height.max(1)) / kernel_height);
+        let scale = (f64::from(width.max(1)) / kernel_width)
+            .min(f64::from(height.max(1)) / kernel_height)
+            .min(MAX_FITTED_KERNEL_CELL_PIXELS);
         let grid_width = (kernel_width * scale).round().max(1.0) as u32;
         let grid_height = (kernel_height * scale).round().max(1.0) as u32;
         (
@@ -306,6 +309,7 @@ impl GraphicsScene for KernelScene {
             .unwrap_or(1.0)
             .max(f32::EPSILON);
         let mask = self.definition.mask.as_deref();
+        let mut selected_bounds: Option<[u32; 4]> = None;
         for py in 0..height {
             for px in 0..width {
                 let Some([x, y]) = self.cell_coordinates_at_pixel(px, py, width, height) else {
@@ -326,11 +330,35 @@ impl GraphicsScene for KernelScene {
                 };
                 let idx = (py * width + px) as usize * 4;
                 let selected = self.selected == Some(KernelPoint { x, y });
-                rgba[idx..idx + 4].copy_from_slice(if selected {
-                    &[255, 255, 255, 255]
-                } else {
-                    &color
-                });
+                if selected {
+                    match &mut selected_bounds {
+                        Some(bounds) => {
+                            bounds[0] = bounds[0].min(px);
+                            bounds[1] = bounds[1].min(py);
+                            bounds[2] = bounds[2].max(px);
+                            bounds[3] = bounds[3].max(py);
+                        }
+                        None => selected_bounds = Some([px, py, px, py]),
+                    }
+                }
+                rgba[idx..idx + 4].copy_from_slice(&color);
+            }
+        }
+        if let Some([left, top, right, bottom]) = selected_bounds {
+            let edge = [255, 255, 255, 255];
+            for inset in 0..2_u32 {
+                let x0 = left.saturating_add(inset).min(right);
+                let x1 = right.saturating_sub(inset).max(left);
+                let y0 = top.saturating_add(inset).min(bottom);
+                let y1 = bottom.saturating_sub(inset).max(top);
+                for x in x0..=x1 {
+                    set_pixel(&mut rgba, width, height, x as i32, y0 as i32, edge);
+                    set_pixel(&mut rgba, width, height, x as i32, y1 as i32, edge);
+                }
+                for y in y0..=y1 {
+                    set_pixel(&mut rgba, width, height, x0 as i32, y as i32, edge);
+                    set_pixel(&mut rgba, width, height, x1 as i32, y as i32, edge);
+                }
             }
         }
         GraphicsFrame::new(width, height, rgba, 0).expect("valid kernel frame")
@@ -792,6 +820,37 @@ mod tests {
                 .iter()
                 .any(|p| p[0] != 8 || p[1] != 8 || p[2] != 8)
         );
+    }
+
+    #[test]
+    fn one_by_one_kernel_is_a_centered_cell_instead_of_a_solid_canvas() {
+        let scene = KernelScene::new(render_definition(1, 1));
+        let frame = scene.render_rgba(256, 256);
+        let pixel = |x: usize, y: usize| {
+            &frame.rgba[(y * frame.width as usize + x) * 4..(y * frame.width as usize + x) * 4 + 4]
+        };
+
+        assert_eq!(pixel(0, 0), &[8, 8, 8, 255]);
+        assert!(pixel(128, 128)[1] > 200);
+        assert_eq!(
+            scene.cell_at_pixel_in(128, 128, 256, 256),
+            Some(KernelPoint { x: 0, y: 0 })
+        );
+        assert_eq!(scene.cell_at_pixel_in(0, 0, 256, 256), None);
+    }
+
+    #[test]
+    fn selection_uses_a_border_without_hiding_the_kernel_value_color() {
+        let mut definition = render_definition(1, 1);
+        definition.values = KernelValues::Explicit(vec![-0.2]);
+        let scene = KernelScene::new(definition).with_selected(Some(KernelPoint { x: 0, y: 0 }));
+        let frame = scene.render_rgba(256, 256);
+        let pixel = |x: usize, y: usize| {
+            &frame.rgba[(y * frame.width as usize + x) * 4..(y * frame.width as usize + x) * 4 + 4]
+        };
+
+        assert_eq!(pixel(128, 128), &[255, 51, 0, 255]);
+        assert_eq!(pixel(80, 128), &[255, 255, 255, 255]);
     }
 
     #[test]

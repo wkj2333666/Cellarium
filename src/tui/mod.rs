@@ -87,8 +87,11 @@ fn draw_impl(
         ratatui::layout::Constraint::Min(28),
     ])
     .split(chunks[0]);
+    let clear_previous_graphics = app.take_workbench_display_clear();
+    if clear_previous_graphics {
+        display.invalidate_pending_graphics();
+    }
     if app.mode() == crate::workbench::AppMode::Workbench {
-        let clear_previous_graphics = app.take_workbench_display_clear();
         workbench::draw_workbench(frame, app, display, chunks[0]);
         draw_footer(frame, app, display, chunks[1]);
         if app.help_visible() {
@@ -173,6 +176,9 @@ fn draw_impl(
         .style(Style::default().bg(Color::Rgb(12, 18, 32))),
         chunks[1],
     );
+    if clear_previous_graphics {
+        display.clear_graphics(frame, chunks[0]);
+    }
     fresh_graphics
 }
 

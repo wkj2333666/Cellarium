@@ -173,10 +173,17 @@ impl GraphicsSurface {
         if self.scene == Some(scene) {
             return PlacementAction::Keep;
         }
-        let replacing = self.scene.replace(scene).is_some();
+        let previous = self.scene.replace(scene);
         self.presented_generation = None;
         self.dirty = true;
-        if replacing {
+        if previous.is_some_and(|previous| {
+            previous.section != scene.section
+                || previous.selected_basis != scene.selected_basis
+                || previous.selected_channel != scene.selected_channel
+                || previous.selected_kernel != scene.selected_kernel
+                || previous.display_mode != scene.display_mode
+                || previous.transform_generation != scene.transform_generation
+        }) {
             PlacementAction::DeleteBeforePresent
         } else {
             PlacementAction::Present
@@ -352,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn scene_transitions_delete_before_present_and_repeated_draws_are_stale() {
+    fn content_updates_keep_the_old_placement_until_the_new_frame_is_ready() {
         let mut surface = GraphicsSurface::new();
         let first = SceneKey::test(1, 10, 5);
         assert_eq!(surface.transition(first), PlacementAction::Present);
@@ -361,6 +368,21 @@ mod tests {
         assert_eq!(surface.transition(first), PlacementAction::Keep);
         assert_eq!(surface.present(frame(2, 2, 5)), Ok(PresentResult::Stale));
         assert_eq!(surface.fresh_presentations(), 1);
+
+        let edited = SceneKey::test(1, 10, 6);
+        assert_eq!(
+            surface.transition(edited),
+            PlacementAction::Present,
+            "content edits must not blank the current Kitty image while its replacement is encoded"
+        );
+        assert!(surface.needs_present());
+
+        let different_editor = SceneKey::test(2, 10, 6);
+        assert_eq!(
+            surface.transition(different_editor),
+            PlacementAction::DeleteBeforePresent,
+            "switching editors must not expose an unrelated delayed graphics frame"
+        );
 
         let resized = SceneKey::test(1, 11, 6);
         assert_eq!(

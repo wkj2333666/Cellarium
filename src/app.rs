@@ -203,7 +203,7 @@ impl App {
     }
     pub fn leave_workbench(&mut self) {
         self.mode = AppMode::Simulation;
-        self.workbench_display_needs_clear = false;
+        self.workbench_display_needs_clear = true;
     }
     pub fn take_workbench_display_clear(&mut self) -> bool {
         let needs_clear = self.workbench_display_needs_clear;
@@ -711,7 +711,14 @@ impl App {
                 self.workbench_draft_scene_generation.wrapping_add(1);
             return true;
         }
-        if key.code == KeyCode::Char('0') && key.modifiers.is_empty() {
+        if key.code == KeyCode::Char('0')
+            && key.modifiers.is_empty()
+            && self.workbench.numeric_editor().is_none()
+            && matches!(
+                self.workbench.section(),
+                WorkbenchSection::Tiling | WorkbenchSection::Kernels
+            )
+        {
             match self.workbench.section() {
                 WorkbenchSection::Tiling => {
                     self.workbench.set_tiling_camera(
@@ -724,7 +731,7 @@ impl App {
                         .set_kernel_view(crate::workbench::kernel_editor::KernelView::default());
                     self.workbench_notice = Some("kernel view fitted".into());
                 }
-                _ => return false,
+                _ => unreachable!("section guard only admits view editors"),
             }
             self.workbench_draft_scene_generation =
                 self.workbench_draft_scene_generation.wrapping_add(1);
@@ -779,6 +786,39 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        if self.workbench.section() == WorkbenchSection::Kernels
+            && key.modifiers.is_empty()
+            && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('u'))
+        {
+            let result = match key.code {
+                KeyCode::Char('s') => self
+                    .workbench
+                    .cycle_selected_kernel_source()
+                    .map(|channel| ("source", channel)),
+                KeyCode::Char('u') => self
+                    .workbench
+                    .select_next_kernel_output()
+                    .map(|channel| ("output", channel)),
+                _ => unreachable!(),
+            };
+            match result {
+                Ok((role, channel)) => {
+                    let name = self
+                        .workbench
+                        .draft()
+                        .channels
+                        .iter()
+                        .find(|entry| entry.id == channel)
+                        .map_or("—", |entry| entry.name.as_str());
+                    self.workbench_notice =
+                        Some(format!("kernel {role} = channel {} ({name})", channel.0));
+                }
+                Err(error) => self.workbench_notice = Some(error.to_string()),
+            }
+            self.workbench_draft_scene_generation =
+                self.workbench_draft_scene_generation.wrapping_add(1);
+            return true;
         }
         if self.workbench.numeric_editor().is_some() {
             match key.code {
@@ -888,19 +928,17 @@ impl App {
                     self.workbench_draft_scene_generation.wrapping_add(1);
                 return true;
             }
-            if let Some(kernel) = self.workbench.selected_legacy_kernel() {
+            if let Some(definition) = self.workbench.selected_raster_kernel_definition() {
                 let current = self.workbench.kernel_selection().unwrap_or(
                     crate::workbench::kernel_editor::KernelPoint {
-                        x: kernel.definition.anchor_x,
-                        y: kernel.definition.anchor_y,
+                        x: definition.anchor_x,
+                        y: definition.anchor_y,
                     },
                 );
                 let point = crate::workbench::kernel_editor::KernelPoint {
-                    x: (current.x as i32 + dx)
-                        .clamp(0, kernel.definition.width.saturating_sub(1) as i32)
+                    x: (current.x as i32 + dx).clamp(0, definition.width.saturating_sub(1) as i32)
                         as usize,
-                    y: (current.y as i32 + dy)
-                        .clamp(0, kernel.definition.height.saturating_sub(1) as i32)
+                    y: (current.y as i32 + dy).clamp(0, definition.height.saturating_sub(1) as i32)
                         as usize,
                 };
                 self.workbench.select_kernel_point(point);
@@ -981,17 +1019,15 @@ impl App {
         &self,
         point: crate::workbench::kernel_editor::KernelPoint,
     ) -> Option<f32> {
-        let kernel = self.workbench.selected_legacy_kernel()?;
-        if point.x >= kernel.definition.width || point.y >= kernel.definition.height {
+        let definition = self.workbench.selected_raster_kernel_definition()?;
+        if point.x >= definition.width || point.y >= definition.height {
             return None;
         }
-        let values = match &kernel.definition.values {
+        let values = match &definition.values {
             KernelValues::Explicit(values) => values.clone(),
-            KernelValues::Expression(_) => kernel.definition.build().ok()?.values,
+            KernelValues::Expression(_) => definition.build().ok()?.values,
         };
-        values
-            .get(point.y * kernel.definition.width + point.x)
-            .copied()
+        values.get(point.y * definition.width + point.x).copied()
     }
 
     fn set_kernel_cell_value(
@@ -999,23 +1035,18 @@ impl App {
         point: crate::workbench::kernel_editor::KernelPoint,
         value: f32,
     ) -> Result<(), String> {
-        let Some(kernel) = self.workbench.selected_legacy_kernel().cloned() else {
+        let Some(definition) = self.workbench.selected_raster_kernel_definition().cloned() else {
             return Err("no selected kernel".into());
         };
-        let mut scene = crate::workbench::kernel_editor::KernelScene::new(kernel.definition)
+        let mut scene = crate::workbench::kernel_editor::KernelScene::new(definition)
             .with_view(self.workbench.kernel_view());
         scene.apply_gesture(crate::workbench::kernel_editor::KernelGesture::SetValue {
             x: point.x,
             y: point.y,
             value,
         })?;
-        let mut draft = self.workbench.draft().clone();
-        let Some(target) = draft.kernels.iter_mut().find(|entry| entry.id == kernel.id) else {
-            return Err("selected kernel disappeared".into());
-        };
-        target.definition = scene.definition;
         self.workbench
-            .import_draft(draft)
+            .replace_selected_raster_kernel_definition(scene.definition)
             .map_err(|error| error.to_string())?;
         self.workbench.select_kernel_point(point);
         self.workbench_draft_scene_generation =
@@ -2270,6 +2301,8 @@ impl App {
                                     factor,
                                 );
                                 self.workbench.set_kernel_view(scene.view);
+                                self.workbench_draft_scene_generation =
+                                    self.workbench_draft_scene_generation.wrapping_add(1);
                                 return true;
                             }
                             crate::input::MouseAction::Pan { dx, dy } => {
@@ -2282,6 +2315,8 @@ impl App {
                                     frame_size[1] as u32,
                                 );
                                 self.workbench.set_kernel_view(scene.view);
+                                self.workbench_draft_scene_generation =
+                                    self.workbench_draft_scene_generation.wrapping_add(1);
                                 return true;
                             }
                             _ => {}
@@ -2324,13 +2359,14 @@ impl App {
                             | crate::input::MouseAction::Zoom { .. } => unreachable!(),
                         }
                     }
-                    let Some(kernel) = self.workbench.selected_legacy_kernel().cloned() else {
+                    let Some(definition) =
+                        self.workbench.selected_raster_kernel_definition().cloned()
+                    else {
                         return false;
                     };
-                    let mut scene =
-                        crate::workbench::kernel_editor::KernelScene::new(kernel.definition)
-                            .with_view(self.workbench.kernel_view())
-                            .with_selected(self.workbench.kernel_selection());
+                    let mut scene = crate::workbench::kernel_editor::KernelScene::new(definition)
+                        .with_view(self.workbench.kernel_view())
+                        .with_selected(self.workbench.kernel_selection());
                     match action {
                         crate::input::MouseAction::Zoom { direction } => {
                             if let Some(point) = scene.cell_at_pixel_in(
@@ -2379,6 +2415,8 @@ impl App {
                                 factor,
                             );
                             self.workbench.set_kernel_view(scene.view);
+                            self.workbench_draft_scene_generation =
+                                self.workbench_draft_scene_generation.wrapping_add(1);
                             return true;
                         }
                         crate::input::MouseAction::Pan { dx, dy } => {
@@ -2391,6 +2429,8 @@ impl App {
                                 frame_size[1] as u32,
                             );
                             self.workbench.set_kernel_view(scene.view);
+                            self.workbench_draft_scene_generation =
+                                self.workbench_draft_scene_generation.wrapping_add(1);
                             return true;
                         }
                         _ => {}
@@ -2428,13 +2468,9 @@ impl App {
                         | crate::input::MouseAction::Zoom { .. } => unreachable!(),
                     };
                     if result.is_ok() {
-                        let mut draft = self.workbench.draft().clone();
-                        if let Some(target) =
-                            draft.kernels.iter_mut().find(|entry| entry.id == kernel.id)
-                        {
-                            target.definition = scene.definition;
-                        }
-                        let _ = self.workbench.import_draft(draft);
+                        let _ = self
+                            .workbench
+                            .replace_selected_raster_kernel_definition(scene.definition);
                         self.workbench.select_kernel_point(point);
                         self.workbench_draft_scene_generation =
                             self.workbench_draft_scene_generation.wrapping_add(1);
@@ -4853,6 +4889,18 @@ mod tests {
     }
 
     #[test]
+    fn both_entering_and_leaving_workbench_request_a_graphics_pipeline_clear() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+
+        app.enter_workbench();
+        assert!(app.take_workbench_display_clear());
+        assert!(!app.take_workbench_display_clear());
+
+        app.leave_workbench();
+        assert!(app.take_workbench_display_clear());
+    }
+
+    #[test]
     fn moving_pointer_while_drawing_updates_tiling_preview_without_adding_a_vertex() {
         let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
         app.enter_workbench();
@@ -5006,6 +5054,61 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         )));
         assert_eq!(app.workbench().numeric_editor().unwrap().buffer(), "-");
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('0'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.workbench().numeric_editor().unwrap().buffer(),
+            "-0",
+            "numeric input must receive zero instead of triggering the kernel fit shortcut",
+        );
+    }
+
+    #[test]
+    fn kernel_metadata_keys_cycle_source_and_output_channels() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Channels);
+        app.workbench_mut().add_channel().unwrap();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Kernels);
+        assert_eq!(
+            app.workbench().selected_channel(),
+            crate::sim::experiment_model::ChannelId(1)
+        );
+        assert_eq!(
+            app.workbench().selected_legacy_kernel().unwrap().source,
+            crate::sim::experiment_model::ChannelId(1)
+        );
+
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('s'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.workbench().selected_legacy_kernel().unwrap().source,
+            crate::sim::experiment_model::ChannelId(0)
+        );
+        assert_eq!(
+            app.workbench_notice(),
+            Some("kernel source = channel 0 (state)"),
+        );
+
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('u'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.workbench().selected_channel(),
+            crate::sim::experiment_model::ChannelId(0)
+        );
+        assert!(app.workbench().selected_legacy_kernel().is_some());
+        assert_eq!(
+            app.workbench_notice(),
+            Some("kernel output = channel 0 (state)"),
+        );
     }
 
     #[test]
@@ -5066,6 +5169,67 @@ mod tests {
             "0",
             "Ctrl+A must select the source so normal typing replaces it"
         );
+    }
+
+    #[test]
+    fn workbench_key_routing_does_not_steal_zero_from_growth_source() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Growth);
+        app.workbench_mut().toggle_growth_editing();
+
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )));
+        for character in "0.5 + 1.0".chars() {
+            assert!(
+                app.handle_workbench_editor_key(KeyEvent::new(
+                    KeyCode::Char(character),
+                    crossterm::event::KeyModifiers::NONE,
+                )),
+                "growth editor must receive {character:?}"
+            );
+        }
+
+        assert_eq!(
+            app.workbench().growth_editor().buffer().as_str(),
+            "0.5 + 1.0"
+        );
+        assert!(app.workbench().growth_editor().diagnostics().is_empty());
+    }
+
+    #[test]
+    fn invalid_growth_edit_keeps_the_last_valid_curve_through_app_routing() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Growth);
+        app.workbench_mut().toggle_growth_editing();
+
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )));
+        for character in "if potential > 0.5 { 1.0 - potential } else { potential }".chars() {
+            assert!(app.handle_workbench_editor_key(KeyEvent::new(
+                KeyCode::Char(character),
+                crossterm::event::KeyModifiers::NONE,
+            )));
+        }
+        assert!(app.workbench().growth_editor().diagnostics().is_empty());
+        let valid = app.workbench().growth_editor().plot().data.clone();
+        assert!(valid.iter().flatten().any(|value| *value > 0.4));
+
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Backspace,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+
+        assert!(!app.workbench().growth_editor().diagnostics().is_empty());
+        assert_eq!(app.workbench().growth_editor().plot().data, valid);
+        assert!(app.workbench().growth_editor().plot().stale);
     }
 
     #[test]
@@ -5349,6 +5513,7 @@ mod tests {
             });
         app.set_viewport(ratatui::layout::Rect::new(24, 1, 60, 32), [480, 512]);
         let before = app.workbench().kernel_view();
+        let generation_before = app.workbench_draft_scene_generation;
         let mut tracker = crate::input::MouseTracker::new();
         let down = crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Middle),
@@ -5365,6 +5530,7 @@ mod tests {
         app.handle_mouse(down, &mut tracker);
         assert!(app.handle_mouse(drag, &mut tracker));
         assert_ne!(app.workbench().kernel_view(), before);
+        assert_ne!(app.workbench_draft_scene_generation, generation_before);
         assert_eq!(
             app.workbench().status(),
             crate::workbench::DraftStatus::Clean

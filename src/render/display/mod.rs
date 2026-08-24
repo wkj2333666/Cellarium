@@ -49,7 +49,7 @@ impl DisplayProtocol {
     }
 }
 
-type EncodedPixelFrame = (ratatui_image::protocol::Protocol, (u16, u16));
+type EncodedPixelFrame = (ratatui_image::protocol::Protocol, (u16, u16), u64);
 
 // Some PTYs report rows and columns but leave their pixel dimensions at zero.
 // Graphics protocols still scale an image to the requested cell rectangle, so
@@ -62,7 +62,8 @@ pub struct PixelDisplay {
     protocol: Arc<Mutex<Option<EncodedPixelFrame>>>,
     ready_sequence: Arc<AtomicU64>,
     displayed_sequence: AtomicU64,
-    queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size, (u16, u16))>,
+    queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size, (u16, u16), u64)>,
+    epoch: Arc<AtomicU64>,
     last_graphics_request: Mutex<Option<GraphicsRequestKey>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -293,7 +294,7 @@ impl<T> LatestWorkQueue<T> {
 
 #[cfg(unix)]
 struct KittySharedState {
-    ready: Option<KittySharedFrame>,
+    ready: Option<(u64, KittySharedFrame)>,
     displayed_id: Option<u32>,
     retained: VecDeque<KittySharedFrame>,
     failed: bool,
@@ -304,7 +305,8 @@ struct KittySharedState {
 pub struct KittySharedDisplay {
     font_size: (u16, u16),
     state: Arc<Mutex<KittySharedState>>,
-    queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size)>,
+    queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size, u64)>,
+    epoch: Arc<AtomicU64>,
     last_graphics_request: Mutex<Option<GraphicsRequestKey>>,
     worker: Option<JoinHandle<()>>,
 }
@@ -312,7 +314,8 @@ pub struct KittySharedDisplay {
 #[cfg(unix)]
 impl KittySharedDisplay {
     fn new(font_size: (u16, u16)) -> Self {
-        let queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size)> = LatestWorkQueue::new();
+        let queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size, u64)> =
+            LatestWorkQueue::new();
         let state = Arc::new(Mutex::new(KittySharedState {
             ready: None,
             displayed_id: None,
@@ -322,8 +325,10 @@ impl KittySharedDisplay {
         }));
         let worker_state = Arc::clone(&state);
         let worker_queue = queue.clone();
+        let epoch = Arc::new(AtomicU64::new(0));
+        let worker_epoch = Arc::clone(&epoch);
         let worker = std::thread::spawn(move || {
-            while let Some((image, area)) = worker_queue.recv() {
+            while let Some((image, area, request_epoch)) = worker_queue.recv() {
                 let image_id = match worker_state.lock() {
                     Ok(mut state) => {
                         let image_id = state.next_image_id;
@@ -347,8 +352,13 @@ impl KittySharedDisplay {
                     }
                     break;
                 };
-                if let Ok(mut state) = worker_state.lock() {
-                    state.ready = Some(frame);
+                if worker_epoch.load(Ordering::Acquire) != request_epoch {
+                    continue;
+                }
+                if let Ok(mut state) = worker_state.lock()
+                    && worker_epoch.load(Ordering::Acquire) == request_epoch
+                {
+                    state.ready = Some((request_epoch, frame));
                 }
             }
         });
@@ -356,6 +366,7 @@ impl KittySharedDisplay {
             font_size,
             state,
             queue,
+            epoch,
             last_graphics_request: Mutex::new(None),
             worker: Some(worker),
         }
@@ -365,7 +376,19 @@ impl KittySharedDisplay {
         if self.state.lock().map_or(true, |state| state.failed) {
             return;
         }
-        self.queue.submit((image, size));
+        let epoch = self.epoch.load(Ordering::Acquire);
+        self.queue.submit((image, size, epoch));
+    }
+
+    fn invalidate_pending(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut state) = self.state.lock() {
+            state.ready = None;
+            state.displayed_id = None;
+        }
+        if let Ok(mut request) = self.last_graphics_request.lock() {
+            *request = None;
+        }
     }
 
     fn should_submit_graphics(&self, key: GraphicsRequestKey) -> bool {
@@ -426,7 +449,7 @@ impl KittySharedDisplay {
                 fresh: false,
             };
         }
-        let Some(shared) = state.ready.take() else {
+        let Some((ready_epoch, shared)) = state.ready.take() else {
             frame.render_widget(
                 GraphicsCommandWidget {
                     command: None,
@@ -439,6 +462,12 @@ impl KittySharedDisplay {
                 fresh: false,
             };
         };
+        if ready_epoch != self.epoch.load(Ordering::Acquire) {
+            return RenderStatus {
+                rendered: state.displayed_id.is_some(),
+                fresh: false,
+            };
+        }
         let image_id = shared.image_id;
         let mut command = shared.command.clone();
         if let Some(previous_id) = state.displayed_id {
@@ -490,14 +519,18 @@ impl ratatui::widgets::Widget for GraphicsPlacementWidget {
         ) {
             return;
         }
-        if self.action == PlacementAction::DeleteOnly {
+        if matches!(
+            self.action,
+            PlacementAction::DeleteBeforePresent | PlacementAction::DeleteOnly
+        ) {
             // Cells hidden below a graphics placement may be blank in
             // ratatui's previous buffer even though the terminal still holds
             // older text there: Skip deliberately prevented those blanks from
-            // being written. When the image is deleted, force every ordinary
-            // cell to be emitted so that the covered terminal contents cannot
-            // reappear. Preserve Skip/ForcedWidth cells belonging to a fresh
-            // image command rendered in this same frame.
+            // being written. Whenever the image is deleted or replaced, force
+            // every ordinary cell to be emitted so that the covered terminal
+            // contents cannot reappear while a replacement is still encoding.
+            // Preserve Skip/ForcedWidth cells belonging to a fresh image
+            // command rendered in this same frame.
             for y in area.top()..area.bottom() {
                 for x in area.left()..area.right() {
                     if let Some(cell) = buffer.cell_mut((x, y))
@@ -552,27 +585,31 @@ impl PixelDisplay {
     fn new(picker: ratatui_image::picker::Picker) -> Self {
         let font_size = picker.font_size();
         let initial_cell_size = (font_size.width, font_size.height);
-        let queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size, (u16, u16))> =
+        let queue: LatestWorkQueue<(DynamicImage, ratatui::layout::Size, (u16, u16), u64)> =
             LatestWorkQueue::new();
         let protocol = Arc::new(Mutex::new(None));
         let ready_sequence = Arc::new(AtomicU64::new(0));
         let worker_protocol = Arc::clone(&protocol);
         let worker_ready_sequence = Arc::clone(&ready_sequence);
+        let epoch = Arc::new(AtomicU64::new(0));
+        let worker_epoch = Arc::clone(&epoch);
         let picker_protocol = picker.protocol_type();
         let mut worker_picker = picker.clone();
         let mut worker_cell_size = initial_cell_size;
         let worker_queue = queue.clone();
         let worker = std::thread::spawn(move || {
-            while let Some((image, size, cell_size)) = worker_queue.recv() {
+            while let Some((image, size, cell_size, request_epoch)) = worker_queue.recv() {
                 if cell_size != worker_cell_size {
                     worker_picker = picker_for_cell_size(picker_protocol, cell_size);
                     worker_cell_size = cell_size;
                 }
                 if let Ok(encoded) =
                     worker_picker.new_protocol(image, size, ratatui_image::Resize::Fit(None))
+                    && worker_epoch.load(Ordering::Acquire) == request_epoch
                     && let Ok(mut slot) = worker_protocol.lock()
+                    && worker_epoch.load(Ordering::Acquire) == request_epoch
                 {
-                    *slot = Some((encoded, cell_size));
+                    *slot = Some((encoded, cell_size, request_epoch));
                     worker_ready_sequence.fetch_add(1, Ordering::Release);
                     if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
                         eprintln!(
@@ -590,13 +627,27 @@ impl PixelDisplay {
             ready_sequence,
             displayed_sequence: AtomicU64::new(0),
             queue,
+            epoch,
             last_graphics_request: Mutex::new(None),
             worker: Some(worker),
         }
     }
 
     fn submit(&self, image: DynamicImage, size: ratatui::layout::Size, cell_size: (u16, u16)) {
-        self.queue.submit((image, size, cell_size));
+        let epoch = self.epoch.load(Ordering::Acquire);
+        self.queue.submit((image, size, cell_size, epoch));
+    }
+
+    fn invalidate_pending(&self) {
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        if let Ok(mut protocol) = self.protocol.lock() {
+            *protocol = None;
+        }
+        if let Ok(mut request) = self.last_graphics_request.lock() {
+            *request = None;
+        }
+        let ready = self.ready_sequence.fetch_add(1, Ordering::AcqRel) + 1;
+        self.displayed_sequence.store(ready, Ordering::Release);
     }
 
     fn current_cell_size(&self) -> (u16, u16) {
@@ -621,12 +672,18 @@ impl PixelDisplay {
                 fresh: false,
             };
         };
-        let Some((protocol, encoded_cell_size)) = protocol.as_ref() else {
+        let Some((protocol, encoded_cell_size, epoch)) = protocol.as_ref() else {
             return RenderStatus {
                 rendered: false,
                 fresh: false,
             };
         };
+        if *epoch != self.epoch.load(Ordering::Acquire) {
+            return RenderStatus {
+                rendered: false,
+                fresh: false,
+            };
+        }
         if *encoded_cell_size != self.current_cell_size() {
             if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
                 eprintln!(
@@ -730,11 +787,18 @@ impl KittySharedFrame {
             ));
         }
 
-        let name = create_shared_memory(rgba)?;
+        // The viewport is fully opaque, so packed RGB preserves its pixels
+        // while reducing each shared-memory frame by 25% compared with RGBA.
+        let mut rgb = Vec::with_capacity(expected / 4 * 3);
+        for pixel in rgba.chunks_exact(4) {
+            rgb.extend_from_slice(&pixel[..3]);
+        }
+
+        let name = create_shared_memory(&rgb)?;
         let encoded_name = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
         let command = format!(
-            "\x1b_Ga=T,f=32,t=s,s={width},v={height},S={},i={image_id},p=1,c={columns},r={rows},C=1,q=1;{encoded_name}\x1b\\",
-            rgba.len()
+            "\x1b_Ga=T,f=24,t=s,s={width},v={height},S={},i={image_id},p=1,c={columns},r={rows},C=1,q=1;{encoded_name}\x1b\\",
+            rgb.len()
         );
         Ok(Self {
             command,
@@ -837,6 +901,15 @@ pub fn should_use_kitty_shared_memory(
 }
 
 impl ViewportDisplay {
+    pub fn invalidate_pending_graphics(&self) {
+        match self {
+            Self::Pixel(display) => display.invalidate_pending(),
+            #[cfg(unix)]
+            Self::KittyShared(display) => display.invalidate_pending(),
+            Self::HalfBlock => {}
+        }
+    }
+
     /// Remove image placements left by the pixel renderer before drawing a
     /// text-only workbench over the same terminal area. Kitty placements are
     /// terminal state rather than ordinary cells, so ratatui's next frame
@@ -1356,7 +1429,7 @@ mod tests {
         {
             let mut state = display.state.lock().unwrap();
             state.displayed_id = Some(99);
-            state.ready = Some(ready);
+            state.ready = Some((0, ready));
         }
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(1, 1)).unwrap();
@@ -1376,11 +1449,34 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn invalidating_shared_graphics_drops_ready_frames_and_resets_deduplication() {
+        let display = KittySharedDisplay::new((8, 16));
+        let pixels = [1_u8, 2, 3, 255];
+        let ready = KittySharedFrame::new(&pixels, 1, 1, 1, 1, 41).unwrap();
+        display.state.lock().unwrap().ready = Some((0, ready));
+        let request = GraphicsRequestKey {
+            generation: 7,
+            width: 1,
+            height: 1,
+            terminal_size: ratatui::layout::Size::new(1, 1),
+            cell_size: (8, 16),
+        };
+        assert!(display.should_submit_graphics(request));
+        assert!(!display.should_submit_graphics(request));
+
+        display.invalidate_pending();
+
+        assert!(display.state.lock().unwrap().ready.is_none());
+        assert!(display.should_submit_graphics(request));
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn shared_display_anchors_every_placement_and_never_moves_the_cursor() {
         let display = KittySharedDisplay::new((8, 16));
         let pixels = [1_u8, 2, 3, 255];
         let ready = KittySharedFrame::new(&pixels, 1, 1, 3, 2, 41).unwrap();
-        display.state.lock().unwrap().ready = Some(ready);
+        display.state.lock().unwrap().ready = Some((0, ready));
         let mut terminal =
             ratatui::Terminal::new(ratatui::backend::TestBackend::new(8, 5)).unwrap();
 
@@ -1495,7 +1591,7 @@ mod tests {
 
         assert!(frame.command.contains("a=T"));
         assert!(frame.command.contains("t=s"));
-        assert!(frame.command.contains("f=32"));
+        assert!(frame.command.contains("f=24"));
         assert!(frame.command.contains("s=2,v=1"));
         assert!(frame.command.contains("c=12,r=4"));
         assert!(frame.command.contains("i=41,p=1"));
@@ -1504,7 +1600,7 @@ mod tests {
         assert!(!frame.command.contains("q=2"));
         assert!(!frame.command.contains("a=d,d=I"));
         assert!(frame.command.len() < 256);
-        assert_eq!(frame.read_pixels_for_test().unwrap(), pixels);
+        assert_eq!(frame.read_pixels_for_test().unwrap(), [1, 2, 3, 4, 5, 6]);
     }
 
     #[test]
@@ -1626,6 +1722,28 @@ mod tests {
             changed,
             vec![(0, 0), (1, 0), (2, 0), (3, 0)],
             "deleting an image must force every formerly-covered cell to be repainted"
+        );
+    }
+
+    #[test]
+    fn replacing_kitty_graphics_repaints_non_image_cells_before_the_new_frame_is_ready() {
+        let area = ratatui::layout::Rect::new(0, 0, 4, 1);
+        let previous = ratatui::buffer::Buffer::empty(area);
+        let mut next = ratatui::buffer::Buffer::empty(area);
+        GraphicsPlacementWidget {
+            action: PlacementAction::DeleteBeforePresent,
+        }
+        .render(area, &mut next);
+
+        let changed = previous
+            .diff(&next)
+            .into_iter()
+            .map(|(x, y, _)| (x, y))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            changed,
+            vec![(0, 0), (1, 0), (2, 0), (3, 0)],
+            "replacing an image must not reveal stale terminal text while the new frame encodes"
         );
     }
 

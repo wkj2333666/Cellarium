@@ -70,7 +70,7 @@ pub fn translate_ui_key(event: &KeyEvent) -> Option<UiCommand> {
         (KeyCode::Char('e'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Some(UiCommand::ExportDraft)
         }
-        (KeyCode::Char('o'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
+        (KeyCode::Char('l'), modifiers) if modifiers.contains(KeyModifiers::CONTROL) => {
             Some(UiCommand::LoadDraft)
         }
         (KeyCode::BackTab, _) => Some(UiCommand::FocusPrevious),
@@ -381,6 +381,14 @@ mod tests {
         assert_eq!(
             translate_ui_key(&key(KeyCode::Char(']'))),
             Some(UiCommand::SelectNext)
+        );
+        assert_eq!(
+            translate_ui_key(&KeyEvent::new(KeyCode::Char('l'), KeyModifiers::CONTROL)),
+            Some(UiCommand::LoadDraft)
+        );
+        assert_ne!(
+            translate_ui_key(&KeyEvent::new(KeyCode::Char('o'), KeyModifiers::CONTROL)),
+            Some(UiCommand::LoadDraft)
         );
     }
 
