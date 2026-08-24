@@ -7,6 +7,44 @@ pub mod workbench;
 
 const MINIMUM_KERNEL_PREVIEW_ROWS: usize = 8;
 
+fn simulation_editor_visible(width: u16) -> bool {
+    width >= 120
+}
+
+fn simulation_footer_text(width: usize) -> String {
+    fit_footer_segments(
+        width,
+        &[
+            "[W] editor",
+            "[Space] pause",
+            "[Q] quit",
+            "[N] step",
+            "L/R paint/erase",
+            "M pan",
+            "wheel zoom",
+            "[1/2] rule",
+            "[R] reset",
+            "[A] random",
+            "[C] clear",
+        ],
+    )
+}
+
+fn workbench_footer_text(width: usize) -> String {
+    fit_footer_segments(
+        width,
+        &[
+            "[W] simulate",
+            "[?] help",
+            "[Ctrl+Enter] Apply",
+            "[Click/T] section",
+            "[Tab] focus",
+            "[Ctrl+Z/Y] undo/redo",
+            "[Ctrl+S/E/O] files",
+        ],
+    )
+}
+
 pub fn draw(frame: &mut ratatui::Frame, app: &mut App, display: &ViewportDisplay) -> bool {
     let generation = app.applied_input_sequence();
     draw_impl(frame, app, display, None, generation, generation)
@@ -66,7 +104,7 @@ fn draw_impl(
         }
         return false;
     }
-    let viewport_area = if outer.width >= 96 {
+    let viewport_area = if simulation_editor_visible(outer.width) {
         content[0]
     } else {
         chunks[0]
@@ -103,7 +141,7 @@ fn draw_impl(
         };
     }
 
-    if outer.width >= 96 {
+    if simulation_editor_visible(outer.width) {
         render_editor_panel(frame, app, content[1]);
     }
 
@@ -118,10 +156,7 @@ fn draw_impl(
         truncate_chars(&status_text(app, display), chunks[1].width as usize),
         Style::default().fg(Color::Rgb(190, 215, 255)),
     ));
-    let help = truncate_chars(
-        "[W] editor  [Space] pause  [N] step  [1/2] rule  [R] reset  [A] random  [C] clear  [Q] quit  L/R paint/erase  M pan  wheel zoom",
-        chunks[1].width as usize,
-    );
+    let help = simulation_footer_text(chunks[1].width as usize);
     // Keep the ordinary terminal status row separate from the Kitty image:
     // clear stale cells and clip the help text to the actual terminal width.
     frame.render_widget(Clear, chunks[1]);
@@ -157,18 +192,7 @@ fn draw_footer(
         app.tick(),
         display.protocol().label(),
     );
-    let row2 = fit_footer_segments(
-        area.width as usize,
-        &[
-            "[Click/T] section",
-            "[Tab] focus",
-            "[Ctrl+Z/Y] undo/redo",
-            "[Ctrl+Enter] Apply",
-            "[Ctrl+S/E/O] files",
-            "[W] simulate",
-            "[?] help",
-        ],
-    );
+    let row2 = workbench_footer_text(area.width as usize);
     let lines = vec![
         Line::from(truncate_display_width(&row1, area.width as usize)),
         Line::from(row2),
@@ -797,6 +821,25 @@ mod tests {
                 truncate_display_width("Workbench · 生长函数 · Dirty · Kitty graphics", width);
             assert!(UnicodeWidthStr::width(status.as_str()) <= width);
         }
+    }
+
+    #[test]
+    fn narrow_simulation_hides_editor_and_preserves_core_controls() {
+        assert!(!simulation_editor_visible(110));
+        let help = simulation_footer_text(90);
+        assert!(help.contains("[W] editor"));
+        assert!(help.contains("[Space] pause"));
+        assert!(help.contains("[Q] quit"));
+        assert!(UnicodeWidthStr::width(help.as_str()) <= 90);
+    }
+
+    #[test]
+    fn narrow_workbench_footer_preserves_exit_help_and_apply() {
+        let footer = workbench_footer_text(90);
+        assert!(footer.contains("[W] simulate"));
+        assert!(footer.contains("[?] help"));
+        assert!(footer.contains("[Ctrl+Enter] Apply"));
+        assert!(UnicodeWidthStr::width(footer.as_str()) <= 90);
     }
     use crate::sim::rule::SimulationSpec;
 

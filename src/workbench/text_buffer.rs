@@ -51,6 +51,29 @@ impl TextBuffer {
     pub fn begin_selection(&mut self) {
         self.selection_anchor = Some(self.cursor);
     }
+    pub fn select_all(&mut self) {
+        if self.text.is_empty() {
+            self.selection_anchor = None;
+            self.cursor = 0;
+        } else {
+            self.selection_anchor = Some(0);
+            self.cursor = self.text.len();
+        }
+        self.preferred_column = None;
+    }
+    pub fn delete_to_line_start(&mut self) -> bool {
+        if self.delete_selection() {
+            return true;
+        }
+        let start = self.line_start(self.cursor);
+        if start == self.cursor {
+            return false;
+        }
+        self.text.replace_range(start..self.cursor, "");
+        self.cursor = start;
+        self.preferred_column = None;
+        true
+    }
     pub fn set_cursor_line_column(&mut self, line: usize, column: usize) {
         self.set_cursor_line_column_inner(line, column, false);
     }
@@ -316,5 +339,30 @@ mod tests {
         assert_eq!(buffer.selected_text(), Some(" value"));
         buffer.move_word_left(false);
         assert_eq!(buffer.selection(), None);
+    }
+
+    #[test]
+    fn select_all_replaces_the_complete_utf8_program() {
+        let mut buffer = TextBuffer::new("if potential > 0.5 { 生长 } else { self }");
+
+        buffer.select_all();
+        assert_eq!(
+            buffer.selected_text(),
+            Some("if potential > 0.5 { 生长 } else { self }")
+        );
+        buffer.insert_str("potential - self");
+
+        assert_eq!(buffer.as_str(), "potential - self");
+        assert_eq!(buffer.selection(), None);
+    }
+
+    #[test]
+    fn delete_to_line_start_removes_only_the_current_line_prefix() {
+        let mut buffer = TextBuffer::new("let x = potential;\nself + x");
+
+        assert!(buffer.delete_to_line_start());
+
+        assert_eq!(buffer.as_str(), "let x = potential;\n");
+        assert_eq!(buffer.cursor(), "let x = potential;\n".len());
     }
 }

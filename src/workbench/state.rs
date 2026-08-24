@@ -80,6 +80,8 @@ pub struct WorkbenchState {
     periodic_kernel_selection: Option<KernelSelection>,
     kernel_paint_value: f32,
     numeric_editor: Option<NumericEditor>,
+    color_editor: Option<String>,
+    color_editor_replace_on_input: bool,
     tiling_tool: super::tiling_editor::TilingTool,
     tiling_camera: super::tiling_editor::TilingCamera,
     tiling_selected_vertex: Option<(PrototypeId, usize)>,
@@ -123,6 +125,8 @@ impl WorkbenchState {
             periodic_kernel_selection: None,
             kernel_paint_value: 0.05,
             numeric_editor: None,
+            color_editor: None,
+            color_editor_replace_on_input: false,
             tiling_tool: super::tiling_editor::TilingTool::Select,
             tiling_camera: super::tiling_editor::TilingCamera::default(),
             tiling_selected_vertex: None,
@@ -240,6 +244,67 @@ impl WorkbenchState {
     }
     pub fn take_numeric_editor(&mut self) -> Option<NumericEditor> {
         self.numeric_editor.take()
+    }
+    pub fn color_editor(&self) -> Option<&str> {
+        self.color_editor.as_deref()
+    }
+    pub fn begin_selected_color_editor(&mut self) {
+        let color = super::channel_editor::resolved_color(&self.draft, self.selected_channel)
+            .unwrap_or(crate::render::channels::Rgb8::new(255, 255, 255));
+        self.color_editor = Some(format!(
+            "#{:02X}{:02X}{:02X}",
+            color.red, color.green, color.blue
+        ));
+        self.color_editor_replace_on_input = true;
+    }
+    pub fn cancel_color_editor(&mut self) {
+        self.color_editor = None;
+        self.color_editor_replace_on_input = false;
+    }
+    pub fn color_editor_insert(&mut self, character: char) -> bool {
+        if !(character == '#' || character.is_ascii_hexdigit()) {
+            return false;
+        }
+        let Some(buffer) = self.color_editor.as_mut() else {
+            return false;
+        };
+        if self.color_editor_replace_on_input {
+            buffer.clear();
+            self.color_editor_replace_on_input = false;
+        }
+        if buffer.len() < 7 {
+            buffer.push(character.to_ascii_uppercase());
+        }
+        true
+    }
+    pub fn color_editor_backspace(&mut self) -> bool {
+        let Some(buffer) = self.color_editor.as_mut() else {
+            return false;
+        };
+        self.color_editor_replace_on_input = false;
+        buffer.pop().is_some()
+    }
+    pub fn commit_color_editor(&mut self) -> Result<RgbColor, String> {
+        let source = self
+            .color_editor
+            .as_deref()
+            .ok_or_else(|| "color editor is not active".to_string())?;
+        let hex = source.strip_prefix('#').unwrap_or(source);
+        if hex.len() != 6 || !hex.chars().all(|character| character.is_ascii_hexdigit()) {
+            return Err("use exactly six hexadecimal digits, for example #33AACC".into());
+        }
+        let color = RgbColor {
+            red: u8::from_str_radix(&hex[0..2], 16).map_err(|error| error.to_string())?,
+            green: u8::from_str_radix(&hex[2..4], 16).map_err(|error| error.to_string())?,
+            blue: u8::from_str_radix(&hex[4..6], 16).map_err(|error| error.to_string())?,
+        };
+        self.execute(DraftCommand::SetChannelColor {
+            channel: self.selected_channel,
+            color: DisplayColor::Custom(color),
+        })
+        .map_err(|error| error.to_string())?;
+        self.cancel_color_editor();
+        Ok(color)
     }
     pub fn tiling_tool(&self) -> super::tiling_editor::TilingTool {
         self.tiling_tool
@@ -556,6 +621,7 @@ impl WorkbenchState {
     fn close_section_editors(&mut self) {
         self.growth_editing = false;
         self.numeric_editor = None;
+        self.cancel_color_editor();
     }
     pub fn focus_next(&mut self) {
         self.focus = match self.focus {

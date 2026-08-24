@@ -633,6 +633,14 @@ pub fn validate_structure(spec: &ExperimentSpec) -> Result<(), Vec<ExperimentMod
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn single_channel_lenia_can_represent_an_uncommitted_empty_tiling() {
+        let model = ExperimentSpec::single_channel_lenia(32, 24);
+        assert!(model.tiling.is_none());
+        assert_eq!(model.channels.len(), 1);
+        assert_eq!(model.kernels.len(), 1);
+    }
     use crate::sim::tiling::{TilingPreset, build_preset};
 
     #[test]

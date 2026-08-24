@@ -544,6 +544,15 @@ impl App {
             .modifiers
             .contains(crossterm::event::KeyModifiers::CONTROL);
         let changed_source = match key.code {
+            KeyCode::Char('a') if control => {
+                self.workbench.growth_editor_mut().buffer_mut().select_all();
+                false
+            }
+            KeyCode::Char('u') if control => self
+                .workbench
+                .growth_editor_mut()
+                .buffer_mut()
+                .delete_to_line_start(),
             KeyCode::Char(character) if !control => {
                 self.workbench
                     .growth_editor_mut()
@@ -648,6 +657,44 @@ impl App {
     pub fn handle_workbench_editor_key(&mut self, key: KeyEvent) -> bool {
         if self.mode != AppMode::Workbench {
             return false;
+        }
+        if self.workbench.color_editor().is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.workbench.cancel_color_editor();
+                    self.workbench_notice = Some("color edit cancelled".into());
+                }
+                KeyCode::Enter => match self.workbench.commit_color_editor() {
+                    Ok(color) => {
+                        self.workbench_notice = Some(format!(
+                            "channel color = #{:02X}{:02X}{:02X}",
+                            color.red, color.green, color.blue
+                        ));
+                    }
+                    Err(error) => self.workbench_notice = Some(format!("invalid color: {error}")),
+                },
+                KeyCode::Backspace => {
+                    self.workbench.color_editor_backspace();
+                }
+                KeyCode::Char(character) => {
+                    if !self.workbench.color_editor_insert(character) {
+                        self.workbench_notice =
+                            Some("color accepts hexadecimal digits in #RRGGBB form".into());
+                    }
+                }
+                _ => return true,
+            }
+            self.workbench_draft_scene_generation =
+                self.workbench_draft_scene_generation.wrapping_add(1);
+            return true;
+        }
+        if self.workbench.section() == WorkbenchSection::Channels && key.code == KeyCode::Char('e')
+        {
+            self.workbench.begin_selected_color_editor();
+            self.workbench_notice = Some("type #RRGGBB · Enter commit · Esc cancel".into());
+            self.workbench_draft_scene_generation =
+                self.workbench_draft_scene_generation.wrapping_add(1);
+            return true;
         }
         if key.code == KeyCode::Char('0') {
             match self.workbench.section() {
@@ -1785,6 +1832,20 @@ impl App {
         }
     }
 
+    fn paint_world_segment(&mut self, from: [f32; 2], to: [f32; 2], value: f32) {
+        let dx = to[0] - from[0];
+        let dy = to[1] - from[1];
+        let steps = dx.abs().max(dy.abs()).ceil() as usize;
+        if steps == 0 {
+            self.paint_world(to, value);
+            return;
+        }
+        for step in 0..=steps {
+            let amount = step as f32 / steps as f32;
+            self.paint_world([from[0] + dx * amount, from[1] + dy * amount], value);
+        }
+    }
+
     pub fn handle_mouse(
         &mut self,
         event: MouseEvent,
@@ -1799,9 +1860,17 @@ impl App {
         let mut local = event;
         local.column = event.column.saturating_sub(viewport.x);
         local.row = event.row.saturating_sub(viewport.y);
-        let Some(action) = tracker.update(&local, viewport.width, viewport.height) else {
+        let Some(mut action) = tracker.update(&local, viewport.width, viewport.height) else {
             return false;
         };
+        if self.mode == AppMode::Simulation
+            && matches!(
+                local.kind,
+                crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+            )
+        {
+            action = crate::input::MouseAction::Paint;
+        }
         if self.mode == AppMode::Workbench
             && self.workbench.section() == crate::workbench::WorkbenchSection::World
         {
@@ -1817,9 +1886,6 @@ impl App {
             let world = self
                 .camera
                 .screen_to_world(screen, frame_size[0], frame_size[1]);
-            let x = (world[0].floor() as isize).rem_euclid(grid.width as isize) as usize;
-            let y = (world[1].floor() as isize).rem_euclid(grid.height as isize) as usize;
-            let tile = y.saturating_mul(grid.width as usize).saturating_add(x);
             let value = match action {
                 crate::input::MouseAction::Erase => Some(0.0),
                 crate::input::MouseAction::Inspect | crate::input::MouseAction::Paint => Some(1.0),
@@ -1828,12 +1894,40 @@ impl App {
                 }
             };
             if let Some(value) = value {
+                let from = tracker
+                    .stroke_segment()
+                    .map(|(from, _)| {
+                        let from_screen = [
+                            (from.0 + 0.5) * frame_size[0] as f32 / viewport.width.max(1) as f32,
+                            (from.1 + 0.5) * frame_size[1] as f32 / viewport.height.max(1) as f32,
+                        ];
+                        self.camera
+                            .screen_to_world(from_screen, frame_size[0], frame_size[1])
+                    })
+                    .unwrap_or(world);
+                let dx = world[0] - from[0];
+                let dy = world[1] - from[1];
+                let steps = dx.abs().max(dy.abs()).ceil() as usize;
+                let mut values = Vec::with_capacity(steps.saturating_add(1));
+                for step in 0..=steps {
+                    let amount = if steps == 0 {
+                        1.0
+                    } else {
+                        step as f32 / steps as f32
+                    };
+                    let point = [from[0] + dx * amount, from[1] + dy * amount];
+                    let x = (point[0].floor() as isize).rem_euclid(grid.width as isize) as usize;
+                    let y = (point[1].floor() as isize).rem_euclid(grid.height as isize) as usize;
+                    let tile = y.saturating_mul(grid.width as usize).saturating_add(x);
+                    if !values.iter().any(|(existing, _)| *existing == tile) {
+                        values.push((tile, value));
+                    }
+                }
                 let applied = self
                     .workbench
-                    .execute(crate::workbench::DraftCommand::SetChannelValue {
+                    .execute(crate::workbench::DraftCommand::SetChannelValues {
                         channel: self.workbench.selected_channel(),
-                        tile,
-                        value,
+                        values,
                     })
                     .is_ok();
                 if applied {
@@ -2309,8 +2403,23 @@ impl App {
                 self.camera.pan_screen([dx * scale[0], dy * scale[1]]);
             }
             crate::input::MouseAction::Inspect => self.inspect_world(world),
-            crate::input::MouseAction::Paint => self.paint_world(world, 1.0),
-            crate::input::MouseAction::Erase => self.paint_world(world, 0.0),
+            crate::input::MouseAction::Paint | crate::input::MouseAction::Erase => {
+                let value = if action == crate::input::MouseAction::Paint {
+                    1.0
+                } else {
+                    0.0
+                };
+                let from = tracker
+                    .stroke_segment()
+                    .map(|(from, _)| {
+                        let from_screen = [(from.0 + 0.5) * scale[0], (from.1 + 0.5) * scale[1]];
+                        self.camera
+                            .screen_to_world(from_screen, frame_size[0], frame_size[1])
+                    })
+                    .unwrap_or(world);
+                self.paint_world_segment(from, world, value);
+                self.inspect_world(world);
+            }
         }
         true
     }
@@ -3345,6 +3454,50 @@ fn handle_remote_terminal_event<W: std::io::Write>(
             }
         }
         Event::Mouse(mouse) => {
+            if app.mode() == AppMode::Workbench
+                && app.workbench().section() == crate::workbench::WorkbenchSection::Experiment
+                && matches!(
+                    mouse.kind,
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left)
+                )
+            {
+                let layout = crate::tui::workbench::workbench_layout(app.workbench_area);
+                let point = ratatui::layout::Position::new(mouse.column, mouse.row);
+                let canvas_content = Rect::new(
+                    layout.canvas.x.saturating_add(1),
+                    layout.canvas.y.saturating_add(1),
+                    layout.canvas.width.saturating_sub(2),
+                    layout.canvas.height.saturating_sub(2),
+                );
+                let canvas_header = Rect::new(
+                    canvas_content.x,
+                    canvas_content.y,
+                    canvas_content.width,
+                    canvas_content.height.min(2),
+                );
+                if canvas_header.contains(point) {
+                    let column = point.x.saturating_sub(canvas_header.x);
+                    if crate::tui::workbench::toolbar_action_at(app.workbench(), column)
+                        == Some(crate::tui::workbench::ToolbarAction::Ui(
+                            UiCommand::ApplyDraft,
+                        ))
+                    {
+                        app.workbench.set_focus(WorkbenchFocus::Canvas);
+                        app.workbench_notice = Some("apply sent".into());
+                        let request = app.workbench_apply_request(*next_input_sequence);
+                        let mut guard = writer
+                            .lock()
+                            .map_err(|_| std::io::Error::other("SSH writer mutex poisoned"))?;
+                        crate::remote::write_message(
+                            &mut *guard,
+                            &crate::remote::RemoteMessage::ApplyDraft(request),
+                        )
+                        .map_err(std::io::Error::other)?;
+                        *next_input_sequence = (*next_input_sequence).wrapping_add(1).max(1);
+                        return Ok(false);
+                    }
+                }
+            }
             if app.handle_workbench_panel_mouse(mouse) {
                 return Ok(false);
             }
@@ -4563,7 +4716,40 @@ mod tests {
         };
 
         assert!(app.handle_mouse(event, &mut tracker));
-        assert_eq!(app.inspected(), Some(0.75));
+        assert_eq!(app.world().get(18, 9), 1.0);
+    }
+
+    #[test]
+    fn sparse_left_drag_paints_a_continuous_world_stroke() {
+        let mut app = App::new(SimulationSpec::conway(), 32, 16);
+        app.world_mut().clear();
+        app.set_viewport(ratatui::layout::Rect::new(0, 0, 32, 16), [32, 16]);
+        let mut tracker = crate::input::MouseTracker::new();
+        let down = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 5,
+            row: 8,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let drag = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 13,
+            row: 8,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        assert!(app.handle_mouse(down, &mut tracker));
+        assert!(app.handle_mouse(drag, &mut tracker));
+        let painted = app
+            .world()
+            .cells()
+            .iter()
+            .filter(|value| **value > 0.5)
+            .count();
+        assert!(
+            painted >= 8,
+            "two sparse pointer samples must be interpolated, got {painted} painted cells"
+        );
     }
 
     #[test]
@@ -4595,6 +4781,41 @@ mod tests {
     }
 
     #[test]
+    fn sparse_workbench_world_drag_paints_a_continuous_initial_field_stroke() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 32, 16);
+        app.enter_workbench();
+        let mut draft = app.workbench().draft().clone();
+        draft.channels[0].initial.fill(0.0);
+        app.workbench_mut().import_draft(draft).unwrap();
+        app.set_viewport(ratatui::layout::Rect::new(0, 0, 32, 16), [32, 16]);
+        let mut tracker = crate::input::MouseTracker::new();
+        let down = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 5,
+            row: 8,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let drag = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left),
+            column: 13,
+            row: 8,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        assert!(app.handle_mouse(down, &mut tracker));
+        assert!(app.handle_mouse(drag, &mut tracker));
+        let painted = app.workbench().draft().channels[0]
+            .initial
+            .iter()
+            .filter(|value| **value > 0.5)
+            .count();
+        assert!(
+            painted >= 8,
+            "two sparse pointer samples must be interpolated in the initial field, got {painted}"
+        );
+    }
+
+    #[test]
     fn workbench_toolbar_click_executes_the_visible_channel_add_action() {
         let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
         app.enter_workbench();
@@ -4616,23 +4837,69 @@ mod tests {
     }
 
     #[test]
+    fn remote_experiment_apply_toolbar_click_sends_an_apply_request() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Experiment);
+        app.set_workbench_area(ratatui::layout::Rect::new(0, 0, 160, 40));
+        let layout =
+            crate::tui::workbench::workbench_layout(ratatui::layout::Rect::new(0, 0, 160, 40));
+        let click = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: layout.canvas.x + 3,
+            row: layout.canvas.y + 1,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        let writer = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+        let mut tracker = crate::input::MouseTracker::new();
+        let mut next_sequence = 7;
+
+        assert!(
+            !handle_remote_terminal_event(
+                &mut app,
+                &mut tracker,
+                &writer,
+                &mut next_sequence,
+                Event::Mouse(click),
+            )
+            .unwrap()
+        );
+        let bytes = writer.lock().unwrap().clone();
+        let message = crate::remote::read_message(&mut std::io::Cursor::new(bytes))
+            .unwrap()
+            .expect("clicking the visible Apply action must write a protocol request");
+        assert!(matches!(
+            message,
+            crate::remote::RemoteMessage::ApplyDraft(_)
+        ));
+        assert_eq!(app.workbench_notice(), Some("apply sent"));
+    }
+
+    #[test]
     fn kernel_arrows_select_cells_and_exact_typing_replaces_the_old_value() {
         let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
         app.enter_workbench();
         app.workbench_mut()
             .select_section(crate::workbench::WorkbenchSection::Kernels);
-        let anchor = app.workbench().draft().kernels[0].definition.anchor_x;
+        let raster_anchor = app
+            .workbench()
+            .draft()
+            .kernels
+            .first()
+            .map(|kernel| (kernel.definition.anchor_x, kernel.definition.anchor_y));
 
         assert!(app.handle_workbench_editor_key(KeyEvent::new(
             KeyCode::Right,
             crossterm::event::KeyModifiers::NONE,
         )));
-        let point = app.workbench().kernel_selection().unwrap();
-        assert_eq!(point.x, anchor + 1);
-        assert_eq!(
-            point.y,
-            app.workbench().draft().kernels[0].definition.anchor_y
-        );
+        if let Some((anchor_x, anchor_y)) = raster_anchor {
+            let point = app.workbench().kernel_selection().unwrap();
+            assert_eq!((point.x, point.y), (anchor_x + 1, anchor_y));
+        } else {
+            let selection = app.workbench().periodic_kernel_selection().unwrap();
+            assert_eq!(selection.offset, [1, 0]);
+        }
         assert!(app.handle_workbench_editor_key(KeyEvent::new(
             KeyCode::Char('e'),
             crossterm::event::KeyModifiers::NONE,
@@ -4642,6 +4909,71 @@ mod tests {
             crossterm::event::KeyModifiers::NONE,
         )));
         assert_eq!(app.workbench().numeric_editor().unwrap().buffer(), "-");
+    }
+
+    #[test]
+    fn growth_ctrl_a_then_typing_replaces_the_complete_source() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Growth);
+        app.workbench_mut().toggle_growth_editing();
+        let original = app
+            .workbench()
+            .growth_editor()
+            .buffer()
+            .as_str()
+            .to_string();
+        assert!(!original.is_empty());
+
+        assert!(app.handle_workbench_growth_key(KeyEvent::new(
+            KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )));
+        assert!(app.handle_workbench_growth_key(KeyEvent::new(
+            KeyCode::Char('0'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+
+        assert_eq!(
+            app.workbench().growth_editor().buffer().as_str(),
+            "0",
+            "Ctrl+A must select the source so normal typing replaces it"
+        );
+    }
+
+    #[test]
+    fn channels_exact_color_editor_commits_a_hex_rgb_value() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Channels);
+
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('e'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        for character in "3366CC".chars() {
+            assert!(app.handle_workbench_editor_key(KeyEvent::new(
+                KeyCode::Char(character),
+                crossterm::event::KeyModifiers::NONE,
+            )));
+        }
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+
+        assert_eq!(
+            app.workbench().draft().channels[0].display.color,
+            crate::sim::experiment_model::DisplayColor::Custom(
+                crate::sim::experiment_model::RgbColor {
+                    red: 0x33,
+                    green: 0x66,
+                    blue: 0xCC,
+                }
+            )
+        );
     }
 
     #[test]

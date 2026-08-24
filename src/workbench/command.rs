@@ -9,6 +9,10 @@ pub enum DraftCommand {
         tile: usize,
         value: f32,
     },
+    SetChannelValues {
+        channel: ChannelId,
+        values: Vec<(usize, f32)>,
+    },
     RenameChannel {
         channel: ChannelId,
         name: String,
@@ -89,6 +93,33 @@ impl DraftCommand {
                     channel: *channel,
                     tile: *tile,
                     value: previous,
+                })
+            }
+            Self::SetChannelValues { channel, values } => {
+                if values
+                    .iter()
+                    .any(|(_, value)| !value.is_finite() || !(0.0..=1.0).contains(value))
+                {
+                    return Err("channel values must be finite and within 0..=1".into());
+                }
+                let target = draft
+                    .channels
+                    .iter_mut()
+                    .find(|entry| entry.id == *channel)
+                    .ok_or_else(|| "unknown channel".to_string())?;
+                if values.iter().any(|(tile, _)| *tile >= target.initial.len()) {
+                    return Err("tile index is outside the channel".into());
+                }
+                let previous = values
+                    .iter()
+                    .map(|(tile, _)| (*tile, target.initial[*tile]))
+                    .collect::<Vec<_>>();
+                for (tile, value) in values {
+                    target.initial[*tile] = *value;
+                }
+                Ok(Self::SetChannelValues {
+                    channel: *channel,
+                    values: previous,
                 })
             }
             Self::RenameChannel { channel, name } => {

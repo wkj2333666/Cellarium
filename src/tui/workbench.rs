@@ -48,6 +48,10 @@ fn toolbar_segments(
             ("[V] View", ToolbarAction::Ui(UiCommand::CyclePresentation)),
             ("[C] Color", ToolbarAction::Ui(UiCommand::CycleColor)),
             (
+                "[E] Exact color",
+                ToolbarAction::EditorKey(KeyCode::Char('e')),
+            ),
+            (
                 "[X] Visible",
                 ToolbarAction::Ui(UiCommand::ToggleVisibility),
             ),
@@ -70,7 +74,13 @@ fn toolbar_segments(
             },
             ToolbarAction::ToggleGrowthEditor,
         )],
-        WorkbenchSection::Experiment => Vec::new(),
+        WorkbenchSection::Experiment => vec![
+            (
+                "[Ctrl+Enter] Apply",
+                ToolbarAction::Ui(UiCommand::ApplyDraft),
+            ),
+            ("[Ctrl+R] Revert", ToolbarAction::Ui(UiCommand::RevertDraft)),
+        ],
     }
 }
 
@@ -553,7 +563,13 @@ pub fn draw_workbench(
             }
             WorkbenchSection::Channels => {
                 lines.push(Line::from("A add · Del remove · ] select"));
-                lines.push(Line::from("V view · C color · X visible · F freeze"));
+                lines.push(Line::from(
+                    "V view · C palette · E exact color · X visible · F freeze",
+                ));
+                if let Some(color) = state.color_editor() {
+                    lines.push(Line::from(format!("color = {color}▌")));
+                    lines.push(Line::from("Enter commit · Esc cancel"));
+                }
                 lines.push(Line::from(""));
                 lines.extend(channel_inspector_texts(state).into_iter().map(Line::from));
             }
@@ -771,11 +787,46 @@ fn tiling_inspector_texts(state: &crate::workbench::WorkbenchState) -> Vec<Strin
                 errors
                     .into_iter()
                     .take(4)
-                    .map(|error| format!("! {}: {}", error.code, error.message)),
+                    .map(|error| format!("! {}", tiling_diagnostic_guidance(error.code))),
             );
         }
     }
     lines
+}
+
+fn tiling_diagnostic_guidance(code: &str) -> &'static str {
+    match code {
+        "coverage_gap" => {
+            "Gap: the polygons do not fill one period. Extend an edge or add the missing polygon."
+        }
+        "coverage_overlap" | "coverage_multiplicity" => {
+            "Overlap: polygons cover part of the period more than once. Move or reshape them."
+        }
+        "proper_crossing" | "self_intersection" => {
+            "Crossing edges: boundary edges may meet, but must not cross through each other."
+        }
+        "unmatched_atomic_edge" => {
+            "Open seam: this edge has no matching opposite edge in a neighboring cell."
+        }
+        "competing_twins" | "incompatible_collinear_overlap" => {
+            "Ambiguous seam: an edge matches multiple boundaries. Remove the overlap."
+        }
+        "invalid_period" => {
+            "Invalid period: the two translation arrows must be finite and non-parallel."
+        }
+        "non_ccw_or_degenerate" | "zero_edge" | "zero_length_fragment" => {
+            "Invalid polygon: keep at least three distinct corners in counter-clockwise order."
+        }
+        "too_few_vertices" => "Incomplete polygon: add at least three corners, then close it.",
+        "too_many_vertices" => "Polygon is too complex: use at most 64 corners.",
+        "unknown_tile" | "unknown_prototype" | "empty_arrangement" => {
+            "Missing shape: add or select a polygon for this periodic cell."
+        }
+        code if code.starts_with("budget_") || code.ends_with("_overflow") => {
+            "Geometry is too large or dense to validate safely. Simplify it or increase its scale."
+        }
+        _ => "Geometry could not be validated. Check polygon order, seams, gaps, and overlaps.",
+    }
 }
 
 fn initial_field_graphics(
@@ -1256,6 +1307,27 @@ mod tests {
     }
 
     #[test]
+    fn experiment_toolbar_exposes_clickable_apply_and_revert_actions() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.select_section(WorkbenchSection::Experiment);
+        let text = toolbar_text(&state);
+        assert!(text.contains("[Ctrl+Enter] Apply"));
+        assert!(text.contains("[Ctrl+R] Revert"));
+        let apply = text.find("[Ctrl+Enter] Apply").unwrap() as u16 + 2;
+        let revert = text.find("[Ctrl+R] Revert").unwrap() as u16 + 2;
+        assert_eq!(
+            toolbar_action_at(&state, apply),
+            Some(ToolbarAction::Ui(UiCommand::ApplyDraft))
+        );
+        assert_eq!(
+            toolbar_action_at(&state, revert),
+            Some(ToolbarAction::Ui(UiCommand::RevertDraft))
+        );
+    }
+
+    #[test]
     fn canvas_header_separates_actions_from_context_without_duplication() {
         let mut state = crate::workbench::WorkbenchState::new(
             crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
@@ -1280,6 +1352,29 @@ mod tests {
         assert!(text.contains("exact edge-to-edge tiling"));
         assert!(text.contains("Euler 0"));
         assert!(text.contains("neighbor seams 6"));
+    }
+
+    #[test]
+    fn tiling_inspector_translates_internal_geometry_errors_into_user_guidance() {
+        let mut spec = crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4);
+        spec.tiling = Some(crate::sim::tiling::build_preset(
+            crate::sim::tiling::TilingPreset::Square,
+            1.0,
+        ));
+        let tiling = spec.tiling.as_mut().unwrap();
+        tiling.translation_a.x = 2.0;
+        let state = crate::workbench::WorkbenchState::new(spec);
+
+        let text = tiling_inspector_texts(&state).join("\n");
+
+        assert!(text.contains("not a valid periodic tiling"));
+        assert!(
+            text.contains("gap") || text.contains("seam"),
+            "diagnostic should explain what the user needs to repair: {text}"
+        );
+        assert!(!text.contains("ShapeEdgeRef"));
+        assert!(!text.contains("BasisId("));
+        assert!(!text.contains("offset ["));
     }
 
     #[test]

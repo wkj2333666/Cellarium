@@ -165,11 +165,17 @@ pub fn translate_key(event: &KeyEvent) -> Option<Command> {
 #[derive(Default)]
 pub struct MouseTracker {
     previous: Option<(f32, f32)>,
+    stroke_previous: Option<(f32, f32)>,
+    stroke_segment: Option<((f32, f32), (f32, f32))>,
 }
 
 impl MouseTracker {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    pub fn stroke_segment(&self) -> Option<((f32, f32), (f32, f32))> {
+        self.stroke_segment
     }
 
     pub fn update(
@@ -184,21 +190,45 @@ impl MouseTracker {
 
         let current = (event.column as f32, event.row as f32);
         match event.kind {
-            MouseEventKind::ScrollUp => Some(MouseAction::Zoom {
-                direction: ZoomDirection::In,
-            }),
-            MouseEventKind::ScrollDown => Some(MouseAction::Zoom {
-                direction: ZoomDirection::Out,
-            }),
-            MouseEventKind::Down(MouseButton::Left) => Some(MouseAction::Inspect),
-            MouseEventKind::Down(MouseButton::Right) => Some(MouseAction::Erase),
+            MouseEventKind::ScrollUp => {
+                self.stroke_segment = None;
+                Some(MouseAction::Zoom {
+                    direction: ZoomDirection::In,
+                })
+            }
+            MouseEventKind::ScrollDown => {
+                self.stroke_segment = None;
+                Some(MouseAction::Zoom {
+                    direction: ZoomDirection::Out,
+                })
+            }
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.stroke_previous = Some(current);
+                self.stroke_segment = Some((current, current));
+                Some(MouseAction::Inspect)
+            }
+            MouseEventKind::Down(MouseButton::Right) => {
+                self.stroke_previous = Some(current);
+                self.stroke_segment = Some((current, current));
+                Some(MouseAction::Erase)
+            }
             MouseEventKind::Down(MouseButton::Middle) => {
+                self.stroke_segment = None;
                 self.previous = Some(current);
                 None
             }
-            MouseEventKind::Drag(MouseButton::Left) => Some(MouseAction::Paint),
-            MouseEventKind::Drag(MouseButton::Right) => Some(MouseAction::Erase),
+            MouseEventKind::Drag(MouseButton::Left) => {
+                let previous = self.stroke_previous.replace(current).unwrap_or(current);
+                self.stroke_segment = Some((previous, current));
+                Some(MouseAction::Paint)
+            }
+            MouseEventKind::Drag(MouseButton::Right) => {
+                let previous = self.stroke_previous.replace(current).unwrap_or(current);
+                self.stroke_segment = Some((previous, current));
+                Some(MouseAction::Erase)
+            }
             MouseEventKind::Drag(MouseButton::Middle) => {
+                self.stroke_segment = None;
                 let Some(previous) = self.previous else {
                     self.previous = Some(current);
                     return None;
@@ -211,9 +241,14 @@ impl MouseTracker {
             }
             MouseEventKind::Up(_) => {
                 self.previous = None;
+                self.stroke_previous = None;
+                self.stroke_segment = None;
                 None
             }
-            _ => None,
+            _ => {
+                self.stroke_segment = None;
+                None
+            }
         }
     }
 }
@@ -394,6 +429,27 @@ mod tests {
             tracker.update(&drag, 10, 8),
             Some(MouseAction::Pan { dx: 1.0, dy: 0.0 })
         );
+    }
+
+    #[test]
+    fn left_drag_retains_the_previous_pointer_sample_for_stroke_interpolation() {
+        let mut tracker = MouseTracker::new();
+        let down = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 5,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        };
+        let drag = MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 9,
+            row: 6,
+            modifiers: KeyModifiers::NONE,
+        };
+
+        assert_eq!(tracker.update(&down, 10, 8), Some(MouseAction::Inspect));
+        assert_eq!(tracker.update(&drag, 10, 8), Some(MouseAction::Paint));
+        assert_eq!(tracker.stroke_segment(), Some(((5.0, 3.0), (9.0, 6.0))));
     }
 
     #[test]
