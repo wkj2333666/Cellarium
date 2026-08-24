@@ -490,6 +490,24 @@ impl ratatui::widgets::Widget for GraphicsPlacementWidget {
         ) {
             return;
         }
+        if self.action == PlacementAction::DeleteOnly {
+            // Cells hidden below a graphics placement may be blank in
+            // ratatui's previous buffer even though the terminal still holds
+            // older text there: Skip deliberately prevented those blanks from
+            // being written. When the image is deleted, force every ordinary
+            // cell to be emitted so that the covered terminal contents cannot
+            // reappear. Preserve Skip/ForcedWidth cells belonging to a fresh
+            // image command rendered in this same frame.
+            for y in area.top()..area.bottom() {
+                for x in area.left()..area.right() {
+                    if let Some(cell) = buffer.cell_mut((x, y))
+                        && cell.diff_option == CellDiffOption::None
+                    {
+                        cell.set_diff_option(CellDiffOption::AlwaysUpdate);
+                    }
+                }
+            }
+        }
         let Some(cell) = buffer.cell_mut(area.as_position()) else {
             return;
         };
@@ -1586,6 +1604,28 @@ mod tests {
         assert!(
             symbol.ends_with('W'),
             "clearing a placement must preserve the text cell beneath it"
+        );
+    }
+
+    #[test]
+    fn clearing_kitty_graphics_repaints_cells_that_were_hidden_beneath_the_image() {
+        let area = ratatui::layout::Rect::new(0, 0, 4, 1);
+        let previous = ratatui::buffer::Buffer::empty(area);
+        let mut next = ratatui::buffer::Buffer::empty(area);
+        GraphicsPlacementWidget {
+            action: PlacementAction::DeleteOnly,
+        }
+        .render(area, &mut next);
+
+        let changed = previous
+            .diff(&next)
+            .into_iter()
+            .map(|(x, y, _)| (x, y))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            changed,
+            vec![(0, 0), (1, 0), (2, 0), (3, 0)],
+            "deleting an image must force every formerly-covered cell to be repainted"
         );
     }
 
