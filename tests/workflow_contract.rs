@@ -1,6 +1,17 @@
 const CI: &str = include_str!("../.github/workflows/ci.yml");
 const PTY_TEST: &str = include_str!("pty_startup.rs");
 const RELEASE: &str = include_str!("../.github/workflows/release.yml");
+const CARGO_TOML: &str = include_str!("../Cargo.toml");
+
+#[test]
+fn package_version_is_a_stable_release_not_a_prerelease() {
+    let version = CARGO_TOML
+        .lines()
+        .find_map(|line| line.strip_prefix("version = \"")?.strip_suffix('"'))
+        .expect("package version");
+    assert_eq!(version, "0.2.0");
+    assert!(!version.contains('-'));
+}
 
 #[test]
 fn ci_checks_both_backend_configurations() {
