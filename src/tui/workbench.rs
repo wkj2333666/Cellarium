@@ -110,6 +110,8 @@ fn toolbar_segments(
                 },
                 ToolbarAction::EditorKey(KeyCode::Char('m')),
             ),
+            ("[d] Plot min", ToolbarAction::EditorKey(KeyCode::Char('d'))),
+            ("[D] Plot max", ToolbarAction::EditorKey(KeyCode::Char('D'))),
         ],
         WorkbenchSection::Experiment => vec![
             (
@@ -254,6 +256,11 @@ fn growth_inspector_texts(state: &crate::workbench::WorkbenchState) -> Vec<Strin
             UpdateMode::DirectUpdate => "next = clamp(result, 0, 1)".into(),
         },
         format!("dt = {}", state.draft().simulation_dt),
+        format!(
+            "plot domain [d/D] = [{:.3}, {:.3}] (editor only)",
+            state.growth_editor().primary_axis_interval()[0],
+            state.growth_editor().primary_axis_interval()[1]
+        ),
         "self = current target cell value".into(),
         "result = final expression value".into(),
         "clamp means: below lo → lo; above hi → hi".into(),
@@ -640,8 +647,12 @@ pub fn draw_workbench(
     frame.render_widget(Paragraph::new(header_lines), canvas_header);
     if matches!(state.section(), WorkbenchSection::World) {
         let (width, height) = display.framebuffer_size(graphics_area);
-        let mut graphics =
-            initial_field_graphics(state, *app.camera(), width as u32, height as u32);
+        let mut graphics = app
+            .workbench_initial_basis_scene(state.channel_view(), scene_generation)
+            .map(|scene| scene.render_frame(width as u32, height as u32))
+            .unwrap_or_else(|| {
+                initial_field_graphics(state, *app.camera(), width as u32, height as u32)
+            });
         graphics.generation = scene_generation;
         display.render_graphics(frame, graphics_area, &graphics);
     } else if state.section() == WorkbenchSection::Tiling {
@@ -756,8 +767,16 @@ pub fn draw_workbench(
         display.render_graphics(frame, graphics_area, &graphics);
     } else if state.section() == WorkbenchSection::Channels {
         let (width, height) = display.framebuffer_size(graphics_area);
-        let mut graphics = channel_graphics(state, width as u32, height as u32);
-        graphics.generation = scene_generation;
+        let runtime_generation =
+            scene_generation.wrapping_add(app.render_generation().rotate_left(23));
+        let mut graphics = authoritative_channel_graphics(
+            app,
+            state,
+            width as u32,
+            height as u32,
+            runtime_generation,
+        );
+        graphics.generation = runtime_generation;
         display.render_graphics(frame, graphics_area, &graphics);
     } else {
         frame.render_widget(
@@ -1347,6 +1366,59 @@ fn channel_graphics(
     }
     crate::render::workbench_graphics::GraphicsFrame::new(width, height, rgba, 0)
         .expect("channel graphics dimensions are valid")
+}
+
+fn authoritative_channel_graphics(
+    app: &crate::app::App,
+    state: &crate::workbench::WorkbenchState,
+    width: u32,
+    height: u32,
+    generation: u64,
+) -> crate::render::workbench_graphics::GraphicsFrame {
+    let width = width.max(1);
+    let height = height.max(1);
+    if state.channel_view() != crate::workbench::ChannelView::Grid {
+        if let Some(scene) = app.workbench_basis_scene(state.channel_view(), generation) {
+            return scene.render_frame(width, height);
+        }
+        return channel_graphics(state, width, height);
+    }
+
+    let channel_count = state.draft().channels.len().max(1);
+    let columns = (channel_count as f64).sqrt().ceil().max(1.0) as usize;
+    let rows = channel_count.div_ceil(columns).max(1);
+    let mut rgba = vec![0_u8; width as usize * height as usize * 4];
+    for pixel in rgba.chunks_exact_mut(4) {
+        pixel.copy_from_slice(&[
+            crate::render::channels::OUTSIDE_DOMAIN.red,
+            crate::render::channels::OUTSIDE_DOMAIN.green,
+            crate::render::channels::OUTSIDE_DOMAIN.blue,
+            255,
+        ]);
+    }
+    for channel in 0..channel_count {
+        let column = channel % columns;
+        let row = channel / columns;
+        let left = column * width as usize / columns;
+        let right = (column + 1) * width as usize / columns;
+        let top = row * height as usize / rows;
+        let bottom = (row + 1) * height as usize / rows;
+        let panel_width = right.saturating_sub(left).max(1);
+        let panel_height = bottom.saturating_sub(top).max(1);
+        let Some(scene) = app.workbench_basis_scene_channel(channel, generation) else {
+            continue;
+        };
+        let panel = scene.render_frame(panel_width as u32, panel_height as u32);
+        for py in 0..panel_height {
+            for px in 0..panel_width {
+                let source = (py * panel_width + px) * 4;
+                let target = ((top + py) * width as usize + left + px) * 4;
+                rgba[target..target + 4].copy_from_slice(&panel.rgba[source..source + 4]);
+            }
+        }
+    }
+    crate::render::workbench_graphics::GraphicsFrame::new(width, height, rgba, generation)
+        .expect("channel grid dimensions are valid")
 }
 
 fn growth_source_preview(editor: &crate::workbench::GrowthEditorState) -> Vec<Line<'static>> {

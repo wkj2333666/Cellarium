@@ -21,6 +21,7 @@ use std::time::{Duration, Instant};
 
 use crate::render::raster::{Framebuffer, Rgb8, rasterize_world_into_while};
 use crate::render::{
+    basis_scene::BasisStateScene,
     camera::Camera,
     workbench_graphics::{GraphicsFrame, PlacementAction},
 };
@@ -85,13 +86,20 @@ struct LatestWorkQueue<T> {
 
 struct RasterRequest {
     generation: u64,
-    world_width: usize,
-    world_height: usize,
-    cells: Vec<f32>,
-    camera: Camera,
+    source: RasterSource,
     frame_width: usize,
     frame_height: usize,
     terminal_size: ratatui::layout::Size,
+}
+
+enum RasterSource {
+    World {
+        width: usize,
+        height: usize,
+        cells: Vec<f32>,
+        camera: Camera,
+    },
+    Basis(BasisStateScene),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -154,19 +162,44 @@ impl AsyncRasterizer {
             let mut world = World::new(1, 1);
             let mut framebuffer = Framebuffer::new(1, 1);
             while let Some(request) = worker_queue.recv() {
-                if world.width() != request.world_width || world.height() != request.world_height {
-                    world = World::new(request.world_width, request.world_height);
-                }
-                world.replace_cells(&request.cells);
-                framebuffer.ensure_size(request.frame_width, request.frame_height);
-                let completed =
-                    rasterize_world_into_while(&world, &request.camera, &mut framebuffer, || {
-                        worker_generation.load(Ordering::Acquire) == request.generation
-                    });
-                if !completed || worker_generation.load(Ordering::Acquire) != request.generation {
-                    continue;
-                }
-                let image = framebuffer_to_dynamic_image(&framebuffer);
+                let image = match request.source {
+                    RasterSource::World {
+                        width,
+                        height,
+                        cells,
+                        camera,
+                    } => {
+                        if world.width() != width || world.height() != height {
+                            world = World::new(width, height);
+                        }
+                        world.replace_cells(&cells);
+                        framebuffer.ensure_size(request.frame_width, request.frame_height);
+                        let completed =
+                            rasterize_world_into_while(&world, &camera, &mut framebuffer, || {
+                                worker_generation.load(Ordering::Acquire) == request.generation
+                            });
+                        if !completed {
+                            continue;
+                        }
+                        framebuffer_to_dynamic_image(&framebuffer)
+                    }
+                    RasterSource::Basis(scene) => {
+                        let Some(graphics) = scene.render_frame_while(
+                            request.frame_width as u32,
+                            request.frame_height as u32,
+                            || worker_generation.load(Ordering::Acquire) == request.generation,
+                        ) else {
+                            continue;
+                        };
+                        let Some(image) =
+                            ImageBuffer::from_raw(graphics.width, graphics.height, graphics.rgba)
+                                .map(DynamicImage::ImageRgba8)
+                        else {
+                            continue;
+                        };
+                        image
+                    }
+                };
                 if worker_generation.load(Ordering::Acquire) != request.generation {
                     continue;
                 }
@@ -212,10 +245,47 @@ impl AsyncRasterizer {
             .store(generation.priority, Ordering::Release);
         self.queue.submit(RasterRequest {
             generation: generation.priority,
-            world_width: world.width(),
-            world_height: world.height(),
-            cells: world.cells().to_vec(),
+            source: RasterSource::World {
+                width: world.width(),
+                height: world.height(),
+                cells: world.cells().to_vec(),
+                camera,
+            },
+            frame_width,
+            frame_height,
+            terminal_size,
+        });
+    }
+
+    pub fn submit_basis(
+        &self,
+        scene: BasisStateScene,
+        frame_width: usize,
+        frame_height: usize,
+        terminal_size: ratatui::layout::Size,
+        generation: RasterGeneration,
+    ) {
+        let camera = scene.camera();
+        let key = RasterRequestKey {
+            generation: generation.content,
             camera,
+            frame_width,
+            frame_height,
+            terminal_size,
+        };
+        let Ok(mut last_request) = self.last_request.lock() else {
+            return;
+        };
+        if !should_submit_raster(*last_request, key) {
+            return;
+        }
+        *last_request = Some(key);
+        drop(last_request);
+        self.latest_generation
+            .store(generation.priority, Ordering::Release);
+        self.queue.submit(RasterRequest {
+            generation: generation.priority,
+            source: RasterSource::Basis(scene),
             frame_width,
             frame_height,
             terminal_size,
@@ -1205,6 +1275,35 @@ impl ViewportDisplay {
             terminal_size,
             generation,
         );
+        if let Some((image, size, frame_priority)) = rasterizer.take_ready()
+            && ready_generation_is_current(frame_priority, generation.priority)
+        {
+            match self {
+                Self::Pixel(display) => display.submit(image, size, display.current_cell_size()),
+                #[cfg(unix)]
+                Self::KittyShared(display) => display.submit(image, size),
+                Self::HalfBlock => return false,
+            }
+        }
+        match self {
+            Self::Pixel(display) => display.render(frame, area).fresh,
+            #[cfg(unix)]
+            Self::KittyShared(display) => display.render(frame, area).fresh,
+            Self::HalfBlock => false,
+        }
+    }
+
+    pub fn render_async_basis(
+        &self,
+        frame: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        scene: BasisStateScene,
+        rasterizer: &AsyncRasterizer,
+        generation: RasterGeneration,
+    ) -> bool {
+        let (frame_width, frame_height) = self.framebuffer_size(area);
+        let terminal_size = ratatui::layout::Size::new(area.width, area.height);
+        rasterizer.submit_basis(scene, frame_width, frame_height, terminal_size, generation);
         if let Some((image, size, frame_priority)) = rasterizer.take_ready()
             && ready_generation_is_current(frame_priority, generation.priority)
         {

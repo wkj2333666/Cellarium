@@ -124,20 +124,26 @@ fn draw_impl(
     let mut fresh_graphics = false;
     if viewport.width > 0 && viewport.height > 0 {
         frame.render_widget(block, viewport_area);
+        let basis_scene = app.simulation_basis_scene(content_generation);
         fresh_graphics = if let Some(rasterizer) = rasterizer
             && display.protocol().is_pixel_protocol()
         {
-            display.render_async(
-                frame,
-                viewport,
-                app.world(),
-                *app.camera(),
-                rasterizer,
-                RasterGeneration {
-                    priority: priority_generation,
-                    content: content_generation,
-                },
-            )
+            let generation = RasterGeneration {
+                priority: priority_generation,
+                content: content_generation,
+            };
+            if let Some(scene) = basis_scene {
+                display.render_async_basis(frame, viewport, scene, rasterizer, generation)
+            } else {
+                display.render_async(
+                    frame,
+                    viewport,
+                    app.world(),
+                    *app.camera(),
+                    rasterizer,
+                    generation,
+                )
+            }
         } else {
             let framebuffer = app.render_framebuffer(frame_width, frame_height);
             display.render(frame, viewport, framebuffer)

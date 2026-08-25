@@ -1937,6 +1937,7 @@ impl WorkbenchState {
 
     pub fn cycle_tiling_preset(&mut self) -> Result<(), HistoryError> {
         let mut next = self.draft.clone();
+        let previous_bases = next.basis_ids().len();
         let preset = match next
             .tiling
             .as_ref()
@@ -1950,6 +1951,25 @@ impl WorkbenchState {
             Some(_) => TilingPreset::Square,
         };
         next.tiling = Some(build_preset(preset, 1.0));
+        let bases = next.basis_ids();
+        let tiles = next.geometry.tile_count().ok_or_else(|| {
+            HistoryError::Edit("geometry is too large to resize its initial state".into())
+        })?;
+        for channel in &mut next.channels {
+            if channel.initial.len() == tiles * previous_bases && previous_bases != bases.len() {
+                let previous = std::mem::take(&mut channel.initial);
+                channel.initial = (0..tiles)
+                    .flat_map(|tile| {
+                        (0..bases.len()).map({
+                            let previous = &previous;
+                            move |basis| {
+                                previous[tile * previous_bases + basis.min(previous_bases - 1)]
+                            }
+                        })
+                    })
+                    .collect();
+            }
+        }
         if next.rules.is_empty() {
             next = next.normalize_rules().map_err(|errors| {
                 HistoryError::Edit(
@@ -1961,7 +1981,6 @@ impl WorkbenchState {
                 )
             })?;
         }
-        let bases = next.basis_ids();
         let active_channels = next
             .channels
             .iter()
@@ -2328,12 +2347,16 @@ mod tests {
     #[test]
     fn channel_and_tiling_actions_are_reversible() {
         let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        state.draft.channels[0].initial[3] = 0.375;
         state.add_channel().unwrap();
         assert_eq!(state.draft().channels.len(), 2);
         state.cycle_tiling_preset().unwrap();
         assert_eq!(state.draft().tiling.as_ref().unwrap().prototypes.len(), 1);
         state.cycle_tiling_preset().unwrap();
         assert_eq!(state.draft().tiling.as_ref().unwrap().prototypes.len(), 2);
+        assert_eq!(state.draft().channels[0].initial.len(), 8 * 8 * 2);
+        assert_eq!(state.draft().channels[0].initial[3 * 2], 0.375);
+        assert_eq!(state.draft().channels[0].initial[3 * 2 + 1], 0.375);
     }
 
     #[test]

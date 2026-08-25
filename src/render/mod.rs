@@ -1,3 +1,4 @@
+pub mod basis_scene;
 pub mod camera;
 pub mod channels;
 pub mod display;

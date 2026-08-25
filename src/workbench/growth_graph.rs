@@ -14,6 +14,7 @@ pub struct GrowthScene {
     pub heatmap: Option<crate::sim::growth::plot::HeatmapData>,
     pub stale: bool,
     pub cursor: Option<GrowthCursor>,
+    pub x_interval: [f32; 2],
 }
 
 impl GrowthScene {
@@ -23,6 +24,7 @@ impl GrowthScene {
             heatmap: editor.plot().heatmap.clone(),
             stale: editor.plot().stale,
             cursor: None,
+            x_interval: editor.primary_axis_interval(),
         }
     }
 
@@ -41,7 +43,9 @@ impl GrowthScene {
         let value = self.plot[sample];
         let cursor = GrowthCursor {
             sample,
-            input: sample as f32 / self.plot.len().saturating_sub(1).max(1) as f32,
+            input: self.x_interval[0]
+                + (self.x_interval[1] - self.x_interval[0]) * sample as f32
+                    / self.plot.len().saturating_sub(1).max(1) as f32,
             value,
         };
         self.cursor = Some(cursor);

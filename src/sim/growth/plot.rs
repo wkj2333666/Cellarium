@@ -2,6 +2,39 @@ use super::eval::{EvalTrace, ScalarInputs, evaluate_with_trace};
 use super::types::TypedProgram;
 use std::collections::BTreeMap;
 
+/// Conservative interval for a raw (unnormalized) weighted sum.
+///
+/// Each positive weight reaches its minimum at the source minimum and each
+/// negative weight reaches its minimum at the source maximum; maxima use the
+/// opposite corners. This intentionally does not normalize kernel weights.
+pub fn potential_interval(weights: &[f32], source_interval: [f32; 2]) -> [f32; 2] {
+    let [source_min, source_max] = source_interval;
+    weights
+        .iter()
+        .fold([0.0, 0.0], |[minimum, maximum], weight| {
+            if *weight >= 0.0 {
+                [minimum + weight * source_min, maximum + weight * source_max]
+            } else {
+                [minimum + weight * source_max, maximum + weight * source_min]
+            }
+        })
+}
+
+#[cfg(test)]
+mod interval_tests {
+    use super::potential_interval;
+
+    #[test]
+    fn six_raw_unit_weights_span_zero_to_six() {
+        assert_eq!(potential_interval(&[1.0; 6], [0.0, 1.0]), [0.0, 6.0]);
+    }
+
+    #[test]
+    fn signed_weights_choose_conservative_corners() {
+        assert_eq!(potential_interval(&[2.0, -3.0], [0.0, 1.0]), [-3.0, 2.0]);
+    }
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct PinnedInputs(pub BTreeMap<String, f32>);
 

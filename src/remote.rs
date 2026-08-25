@@ -5,7 +5,7 @@ use crate::sim::service::{ApplyAccepted, ApplyRejected, ApplyRequest, Diagnostic
 use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use std::io::{self, Read, Write};
 
-pub const PROTOCOL_VERSION: u8 = 9;
+pub const PROTOCOL_VERSION: u8 = 10;
 pub const MAX_FRAME_SIZE: u32 = 64 * 1024 * 1024;
 const MAX_EXPERIMENT_SIZE: usize = 8 * 1024 * 1024;
 const MAX_CHANNELS: usize = 64;
@@ -33,6 +33,11 @@ pub struct Snapshot {
     pub selected_kernel: Box<KernelDefinition>,
     pub selected_parameter: Option<String>,
     pub error: Option<String>,
+    /// Sorted semantic basis identifiers used by the flattened state.
+    pub basis_ids: Vec<crate::sim::tiling::BasisId>,
+    /// Number of channel-major planes in `cells`.
+    pub channels: u16,
+    /// Channel-major, then lattice-site-major, then basis-major state.
     pub cells: Vec<f32>,
 }
 
@@ -363,7 +368,10 @@ fn decode_input(cursor: &mut Cursor<'_>) -> Result<InputMessage, ProtocolError> 
 }
 
 fn encode_snapshot(snapshot: &Snapshot, payload: &mut Vec<u8>) -> Result<(), ProtocolError> {
-    let expected = (snapshot.width as usize).saturating_mul(snapshot.height as usize);
+    let expected = (snapshot.width as usize)
+        .saturating_mul(snapshot.height as usize)
+        .saturating_mul(snapshot.basis_ids.len())
+        .saturating_mul(snapshot.channels as usize);
     if expected != snapshot.cells.len() {
         return Err(ProtocolError::Invalid(
             "snapshot dimensions do not match cells",
@@ -406,6 +414,17 @@ fn encode_snapshot(snapshot: &Snapshot, payload: &mut Vec<u8>) -> Result<(), Pro
         }
         None => payload.push(0),
     }
+    if snapshot.basis_ids.is_empty() || snapshot.basis_ids.len() > MAX_BASIS_SITES {
+        return Err(ProtocolError::Invalid("invalid snapshot basis count"));
+    }
+    if snapshot.channels == 0 || snapshot.channels as usize > MAX_CHANNELS {
+        return Err(ProtocolError::Invalid("invalid snapshot channel count"));
+    }
+    put_u32(payload, snapshot.basis_ids.len() as u32);
+    for basis in &snapshot.basis_ids {
+        put_u32(payload, basis.0);
+    }
+    put_u16(payload, snapshot.channels);
     put_u32(payload, snapshot.cells.len() as u32);
     for value in &snapshot.cells {
         payload.extend_from_slice(&value.to_le_bytes());
@@ -445,9 +464,27 @@ fn decode_snapshot(cursor: &mut Cursor<'_>) -> Result<Snapshot, ProtocolError> {
         1 => Some(cursor.string()?),
         _ => return Err(ProtocolError::Invalid("invalid error flag")),
     };
+    let basis_count = cursor.u32()? as usize;
+    if basis_count == 0 || basis_count > MAX_BASIS_SITES {
+        return Err(ProtocolError::Invalid("invalid snapshot basis count"));
+    }
+    let mut basis_ids = Vec::with_capacity(basis_count);
+    for _ in 0..basis_count {
+        basis_ids.push(crate::sim::tiling::BasisId(cursor.u32()?));
+    }
+    basis_ids.sort_unstable();
+    if basis_ids.windows(2).any(|pair| pair[0] == pair[1]) {
+        return Err(ProtocolError::Invalid("duplicate snapshot basis id"));
+    }
+    let channels = cursor.u16()?;
+    if channels == 0 || channels as usize > MAX_CHANNELS {
+        return Err(ProtocolError::Invalid("invalid snapshot channel count"));
+    }
     let length = cursor.u32()? as usize;
     let expected = (width as usize)
         .checked_mul(height as usize)
+        .and_then(|count| count.checked_mul(basis_ids.len()))
+        .and_then(|count| count.checked_mul(channels as usize))
         .ok_or(ProtocolError::Invalid("snapshot dimensions overflow"))?;
     if length != expected || length > MAX_FRAME_SIZE as usize / 4 {
         return Err(ProtocolError::Invalid("invalid snapshot cell count"));
@@ -474,6 +511,8 @@ fn decode_snapshot(cursor: &mut Cursor<'_>) -> Result<Snapshot, ProtocolError> {
         selected_kernel,
         selected_parameter,
         error,
+        basis_ids,
+        channels,
         cells,
     })
 }
@@ -813,6 +852,8 @@ mod tests {
             }),
             selected_parameter: None,
             error: Some("oops".into()),
+            basis_ids: vec![BasisId(0)],
+            channels: 1,
             cells: vec![0.0, 1.0, 0.25, 0.75],
         }
     }
@@ -998,14 +1039,14 @@ mod tests {
     }
 
     #[test]
-    fn protocol_v8_peer_is_rejected_clearly() {
+    fn protocol_v9_peer_is_rejected_clearly() {
         let mut frame = Vec::new();
         frame.extend_from_slice(&MAGIC);
-        frame.extend_from_slice(&[8, 1]);
+        frame.extend_from_slice(&[9, 1]);
         frame.extend_from_slice(&0_u32.to_le_bytes());
         let error = read_message(&mut IoCursor::new(frame)).unwrap_err();
-        assert!(error.to_string().contains("version 8"));
         assert!(error.to_string().contains("version 9"));
+        assert!(error.to_string().contains("version 10"));
     }
 
     #[test]

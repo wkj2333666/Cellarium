@@ -9,24 +9,46 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::input::{Command, UiCommand};
+use crate::render::basis_scene::{BasisSceneHit, BasisSceneView, BasisStateScene};
 use crate::render::camera::Camera;
 use crate::render::display::DisplayProtocol;
 use crate::render::raster::{Framebuffer, rasterize_world_into};
 use crate::render::scene_transform::{SceneCamera, SceneTransform};
 use crate::render::workbench_graphics::{GraphicsSurface, PlacementAction, SceneKey};
 use crate::sim::backend::{BackendKind, SimulationBackend};
+use crate::sim::basis_runtime::StateLayout;
 use crate::sim::experiment::{ExperimentError, ExperimentFile, ExperimentMetadata};
 use crate::sim::experiment_model::{ExperimentSpec, validate_structure};
 use crate::sim::rule::SimulationSpec;
 use crate::sim::service::{
     ApplyAccepted, ApplyRejected, ApplyRequest, Diagnostic, DiagnosticPath, ExperimentService,
 };
-use crate::sim::tiling::PeriodicTilingDraft;
+use crate::sim::tiling::{BasisId, PeriodicTilingDraft};
 use crate::sim::world::World;
 use crate::workbench::{AppMode, WorkbenchFocus, WorkbenchSection, WorkbenchState};
 use crossterm::event::{Event, KeyCode, KeyEvent, MouseEvent};
 use ratatui::layout::Rect;
 use std::path::Path;
+
+fn expanded_initial_state(spec: &ExperimentSpec, bases: usize) -> Option<Vec<f32>> {
+    let tiles = spec.geometry.tile_count()?;
+    let mut state = Vec::new();
+    for channel in &spec.channels {
+        match channel.initial.len() {
+            len if len == tiles * bases => state.extend_from_slice(&channel.initial),
+            len if len == tiles => {
+                state.extend(
+                    channel
+                        .initial
+                        .iter()
+                        .flat_map(|value| std::iter::repeat_n(*value, bases)),
+                );
+            }
+            _ => return None,
+        }
+    }
+    Some(state)
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Panel {
@@ -86,6 +108,9 @@ pub struct App {
     remote_tick: Option<u64>,
     remote_backend: Option<String>,
     remote_rule: Option<String>,
+    remote_basis_ids: Vec<BasisId>,
+    remote_basis_cells: Option<Vec<f32>>,
+    remote_channels: usize,
     applied_input_sequence: u64,
     snapshot_rate: f64,
     graphics_rate: f64,
@@ -203,6 +228,9 @@ impl App {
             remote_tick: None,
             remote_backend: None,
             remote_rule: None,
+            remote_basis_ids: vec![BasisId(0)],
+            remote_basis_cells: None,
+            remote_channels: 1,
             applied_input_sequence: 0,
             snapshot_rate: 0.0,
             graphics_rate: 0.0,
@@ -987,6 +1015,31 @@ impl App {
         }
         if self.workbench.section() == WorkbenchSection::Growth
             && !self.workbench.growth_editing()
+            && !key
+                .modifiers
+                .contains(crossterm::event::KeyModifiers::CONTROL)
+            && matches!(key.code, KeyCode::Char('d') | KeyCode::Char('D'))
+        {
+            let [min, max] = self.workbench.growth_editor().primary_axis_interval();
+            let (label, value, end) = if key.code == KeyCode::Char('d') {
+                ("plot domain min", min, "minimum")
+            } else {
+                ("plot domain max", max, "maximum")
+            };
+            self.workbench.begin_numeric_editor(
+                crate::workbench::numeric_editor::NumericEditor::begin(
+                    label,
+                    f64::from(value),
+                    -1_000_000.0..=1_000_000.0,
+                ),
+            );
+            self.workbench_notice = Some(format!(
+                "type plot-domain {end} · Enter commit · Esc cancel"
+            ));
+            return true;
+        }
+        if self.workbench.section() == WorkbenchSection::Growth
+            && !self.workbench.growth_editing()
             && key.modifiers.is_empty()
             && key.code == KeyCode::Char('m')
         {
@@ -1291,6 +1344,14 @@ impl App {
                 KeyCode::Enter => {
                     let simulation_dt = self.workbench.simulation_dt_editing();
                     let kernel_sigma = self.workbench.kernel_sigma_editing();
+                    let growth_domain_min = self
+                        .workbench
+                        .numeric_editor()
+                        .is_some_and(|editor| editor.label() == "plot domain min");
+                    let growth_domain_max = self
+                        .workbench
+                        .numeric_editor()
+                        .is_some_and(|editor| editor.label() == "plot domain max");
                     let Some(editor) = self.workbench.take_numeric_editor() else {
                         return true;
                     };
@@ -1311,6 +1372,27 @@ impl App {
                                 } else {
                                     self.workbench_notice =
                                         Some(format!("Gaussian sigma = {value:.6}"));
+                                }
+                            } else if growth_domain_min || growth_domain_max {
+                                let [min, max] =
+                                    self.workbench.growth_editor().primary_axis_interval();
+                                let interval = if growth_domain_min {
+                                    [value as f32, max]
+                                } else {
+                                    [min, value as f32]
+                                };
+                                match self
+                                    .workbench
+                                    .growth_editor_mut()
+                                    .set_primary_axis_interval(interval)
+                                {
+                                    Ok(()) => {
+                                        self.workbench_notice = Some(format!(
+                                            "plot domain = [{:.6}, {:.6}] (editor only)",
+                                            interval[0], interval[1]
+                                        ));
+                                    }
+                                    Err(error) => self.workbench_notice = Some(error),
                                 }
                             } else if let Some(selection) =
                                 self.workbench.periodic_kernel_selection()
@@ -1638,6 +1720,197 @@ impl App {
         model
     }
 
+    /// Snapshot the authoritative basis state for the simulation viewport.
+    /// Legacy simulations intentionally return `None` and keep their faster
+    /// rectangular rasterizer.
+    pub fn simulation_basis_scene(&self, generation: u64) -> Option<BasisStateScene> {
+        if self.experiment_service.is_none() && self.remote_basis_cells.is_none() {
+            return None;
+        }
+        let (basis_ids, channels, cells) = if let Some(service) = &self.experiment_service {
+            (
+                self.experiment_model.basis_ids(),
+                service.world().channels(),
+                service.world().cells(),
+            )
+        } else {
+            (
+                self.remote_basis_ids.clone(),
+                self.remote_channels,
+                self.remote_basis_cells.as_deref()?,
+            )
+        };
+        self.basis_scene_from_state(
+            &self.experiment_model,
+            basis_ids,
+            channels,
+            cells,
+            BasisSceneView::Composite,
+            generation,
+        )
+    }
+
+    /// Render Channels against the current authoritative state when its layout
+    /// matches the draft. Before the first Apply, fall back to the explicitly
+    /// labelled initial-state preview without inventing rectangular noise.
+    pub fn workbench_basis_scene(
+        &self,
+        view: crate::workbench::ChannelView,
+        generation: u64,
+    ) -> Option<BasisStateScene> {
+        let draft = self.workbench.draft();
+        let basis_ids = draft.basis_ids();
+        let channels = draft.channels.len();
+        let runtime = self
+            .experiment_service
+            .as_ref()
+            .and_then(|service| {
+                (service.world().bases() == basis_ids.len()
+                    && service.world().channels() == channels)
+                    .then_some(service.world().cells())
+            })
+            .or_else(|| {
+                (self.remote_basis_ids == basis_ids && self.remote_channels == channels)
+                    .then(|| self.remote_basis_cells.as_deref())
+                    .flatten()
+            });
+        let initial;
+        let cells = if let Some(runtime) = runtime {
+            runtime
+        } else {
+            initial = expanded_initial_state(draft, basis_ids.len())?;
+            &initial
+        };
+        let view = match view {
+            crate::workbench::ChannelView::Composite => BasisSceneView::Composite,
+            crate::workbench::ChannelView::Solo => {
+                let selected = draft
+                    .channels
+                    .iter()
+                    .position(|channel| channel.id == self.workbench.selected_channel())
+                    .unwrap_or(0);
+                BasisSceneView::Solo(selected)
+            }
+            crate::workbench::ChannelView::Grid => BasisSceneView::Composite,
+        };
+        self.basis_scene_from_state(draft, basis_ids, channels, cells, view, generation)
+    }
+
+    pub fn workbench_initial_basis_scene(
+        &self,
+        view: crate::workbench::ChannelView,
+        generation: u64,
+    ) -> Option<BasisStateScene> {
+        let draft = self.workbench.draft();
+        let basis_ids = draft.basis_ids();
+        let initial = expanded_initial_state(draft, basis_ids.len())?;
+        let view = match view {
+            crate::workbench::ChannelView::Composite | crate::workbench::ChannelView::Grid => {
+                BasisSceneView::Composite
+            }
+            crate::workbench::ChannelView::Solo => {
+                let selected = draft
+                    .channels
+                    .iter()
+                    .position(|channel| channel.id == self.workbench.selected_channel())
+                    .unwrap_or(0);
+                BasisSceneView::Solo(selected)
+            }
+        };
+        self.basis_scene_from_state(
+            draft,
+            basis_ids,
+            draft.channels.len(),
+            &initial,
+            view,
+            generation,
+        )
+    }
+
+    pub fn workbench_basis_scene_channel(
+        &self,
+        channel: usize,
+        generation: u64,
+    ) -> Option<BasisStateScene> {
+        let draft = self.workbench.draft();
+        if channel >= draft.channels.len() {
+            return None;
+        }
+        let basis_ids = draft.basis_ids();
+        let channels = draft.channels.len();
+        let runtime = self
+            .experiment_service
+            .as_ref()
+            .and_then(|service| {
+                (service.world().bases() == basis_ids.len()
+                    && service.world().channels() == channels)
+                    .then_some(service.world().cells())
+            })
+            .or_else(|| {
+                (self.remote_basis_ids == basis_ids && self.remote_channels == channels)
+                    .then(|| self.remote_basis_cells.as_deref())
+                    .flatten()
+            });
+        let initial;
+        let cells = if let Some(runtime) = runtime {
+            runtime
+        } else {
+            initial = expanded_initial_state(draft, basis_ids.len())?;
+            &initial
+        };
+        self.basis_scene_from_state(
+            draft,
+            basis_ids,
+            channels,
+            cells,
+            BasisSceneView::Solo(channel),
+            generation,
+        )
+    }
+
+    fn basis_scene_from_state(
+        &self,
+        spec: &ExperimentSpec,
+        basis_ids: Vec<BasisId>,
+        channels: usize,
+        cells: &[f32],
+        view: BasisSceneView,
+        generation: u64,
+    ) -> Option<BasisStateScene> {
+        let crate::sim::experiment_model::GeometrySpec::RasterGrid(grid) = &spec.geometry;
+        let layout = StateLayout::new(
+            grid.width as usize,
+            grid.height as usize,
+            basis_ids,
+            channels,
+        )
+        .ok()?;
+        let palette = spec
+            .channels
+            .iter()
+            .map(|channel| {
+                crate::workbench::resolved_color(spec, channel.id)
+                    .unwrap_or(crate::render::channels::Rgb8::new(245, 245, 245))
+            })
+            .collect::<Vec<_>>();
+        let visible = spec
+            .channels
+            .iter()
+            .map(|channel| channel.display.visible)
+            .collect::<Vec<_>>();
+        BasisStateScene::from_snapshot(
+            spec.tiling.as_ref(),
+            layout,
+            cells,
+            &palette,
+            &visible,
+            view,
+            self.camera,
+            generation,
+        )
+        .ok()
+    }
+
     pub fn experiment_model(&self) -> &ExperimentSpec {
         &self.experiment_model
     }
@@ -1897,6 +2170,15 @@ impl App {
     pub fn remote_snapshot(&self) -> crate::remote::Snapshot {
         let (simulation_rate, render_rate) = self.rates();
         let performance = self.performance();
+        let (basis_ids, channels, cells) = if let Some(service) = &self.experiment_service {
+            (
+                self.experiment_model.basis_ids(),
+                service.world().channels(),
+                service.world().cells().to_vec(),
+            )
+        } else {
+            (vec![BasisId(0)], 1, self.world.cells().to_vec())
+        };
         crate::remote::Snapshot {
             width: self.world.width() as u32,
             height: self.world.height() as u32,
@@ -1919,14 +2201,20 @@ impl App {
             ),
             selected_parameter: self.selected_parameter.clone(),
             error: self.backend_error().map(str::to_string),
-            cells: self.world.cells().to_vec(),
+            basis_ids,
+            channels: channels as u16,
+            cells,
         }
     }
 
     pub fn apply_remote_snapshot(&mut self, snapshot: &crate::remote::Snapshot) -> bool {
+        let expected = (snapshot.width as usize)
+            .checked_mul(snapshot.height as usize)
+            .and_then(|count| count.checked_mul(snapshot.basis_ids.len()))
+            .and_then(|count| count.checked_mul(snapshot.channels as usize));
         let dimensions_match = self.world.width() == snapshot.width as usize
             && self.world.height() == snapshot.height as usize
-            && snapshot.cells.len() == self.world.width() * self.world.height();
+            && expected == Some(snapshot.cells.len());
         if !dimensions_match {
             return false;
         }
@@ -1937,7 +2225,17 @@ impl App {
         {
             return false;
         }
-        self.world.replace_cells(&snapshot.cells);
+        let site_count = self.world.width() * self.world.height();
+        let bases = snapshot.basis_ids.len();
+        let mut raster = vec![0.0; site_count];
+        for (site, value) in raster.iter_mut().enumerate() {
+            let start = site * bases;
+            *value = snapshot.cells[start..start + bases].iter().sum::<f32>() / bases as f32;
+        }
+        self.world.replace_cells(&raster);
+        self.remote_basis_ids = snapshot.basis_ids.clone();
+        self.remote_channels = snapshot.channels as usize;
+        self.remote_basis_cells = Some(snapshot.cells.clone());
         self.paused = snapshot.paused;
         self.remote_tick = Some(snapshot.tick);
         self.remote_backend = Some(snapshot.backend.clone());
@@ -2065,6 +2363,9 @@ impl App {
     }
 
     pub fn render_framebuffer(&mut self, width: usize, height: usize) -> &Framebuffer {
+        let basis_frame = self
+            .simulation_basis_scene(self.render_generation())
+            .map(|scene| scene.render_frame(width as u32, height as u32));
         let needs_resize = self
             .framebuffer
             .as_ref()
@@ -2077,7 +2378,24 @@ impl App {
             .framebuffer
             .as_mut()
             .expect("framebuffer is initialized");
-        rasterize_world_into(&self.world, &camera, framebuffer);
+        if let Some(graphics) = basis_frame {
+            for y in 0..height {
+                for x in 0..width {
+                    let offset = (y * width + x) * 4;
+                    framebuffer.set(
+                        x,
+                        y,
+                        crate::render::raster::Rgb8::new(
+                            graphics.rgba[offset],
+                            graphics.rgba[offset + 1],
+                            graphics.rgba[offset + 2],
+                        ),
+                    );
+                }
+            }
+        } else {
+            rasterize_world_into(&self.world, &camera, framebuffer);
+        }
         framebuffer
     }
 
@@ -2415,6 +2733,63 @@ impl App {
         ));
     }
 
+    fn inspect_basis_cell(&mut self, hit: BasisSceneHit) {
+        let basis_ids = self.experiment_model.basis_ids();
+        let Some(basis) = basis_ids
+            .iter()
+            .position(|candidate| *candidate == hit.basis)
+        else {
+            return;
+        };
+        self.inspected = Some(if let Some(service) = &self.experiment_service {
+            service
+                .world()
+                .get_basis(0, hit.x as isize, hit.y as isize, basis)
+        } else if let Some(cells) = &self.remote_basis_cells {
+            StateLayout::new(
+                self.world.width(),
+                self.world.height(),
+                basis_ids,
+                self.remote_channels,
+            )
+            .ok()
+            .and_then(|layout| layout.index(0, hit.x, hit.y, hit.basis))
+            .and_then(|index| cells.get(index))
+            .copied()
+            .unwrap_or(0.0)
+        } else {
+            self.world.get(hit.x as isize, hit.y as isize)
+        });
+    }
+
+    fn paint_basis_cell(&mut self, hit: BasisSceneHit, value: f32) {
+        let basis_ids = self.experiment_model.basis_ids();
+        let Some(basis) = basis_ids
+            .iter()
+            .position(|candidate| *candidate == hit.basis)
+        else {
+            return;
+        };
+        self.world.set(hit.x as isize, hit.y as isize, value);
+        if let Some(service) = &mut self.experiment_service {
+            service
+                .world_mut()
+                .set_basis(0, hit.x as isize, hit.y as isize, basis, value);
+        }
+        if let Some(cells) = &mut self.remote_basis_cells
+            && let Ok(layout) = StateLayout::new(
+                self.world.width(),
+                self.world.height(),
+                basis_ids,
+                self.remote_channels,
+            )
+            && let Some(index) = layout.index(0, hit.x, hit.y, hit.basis)
+            && let Some(cell) = cells.get_mut(index)
+        {
+            *cell = value;
+        }
+    }
+
     pub fn paint_world(&mut self, world: [f32; 2], value: f32) {
         let x = world[0].floor() as isize;
         let y = world[1].floor() as isize;
@@ -2519,9 +2894,6 @@ impl App {
                 (local.column as f32 + 0.5) * frame_size[0] as f32 / viewport.width.max(1) as f32,
                 (local.row as f32 + 0.5) * frame_size[1] as f32 / viewport.height.max(1) as f32,
             ];
-            let world = self
-                .camera
-                .screen_to_world(screen, frame_size[0], frame_size[1]);
             let value = match action {
                 crate::input::MouseAction::Erase => Some(0.0),
                 crate::input::MouseAction::Inspect | crate::input::MouseAction::Paint => Some(1.0),
@@ -2529,6 +2901,66 @@ impl App {
                     None
                 }
             };
+            if let Some(value) = value
+                && let Some(scene) = self.workbench_initial_basis_scene(
+                    crate::workbench::ChannelView::Composite,
+                    self.workbench_draft_scene_generation,
+                )
+            {
+                let scale = [
+                    frame_size[0] as f32 / viewport.width.max(1) as f32,
+                    frame_size[1] as f32 / viewport.height.max(1) as f32,
+                ];
+                let from = tracker
+                    .stroke_segment()
+                    .map(|(from, _)| [(from.0 + 0.5) * scale[0], (from.1 + 0.5) * scale[1]])
+                    .unwrap_or(screen);
+                let dx = screen[0] - from[0];
+                let dy = screen[1] - from[1];
+                let steps = dx.abs().max(dy.abs()).ceil() as usize;
+                let basis_ids = self.workbench.draft().basis_ids();
+                let mut values = Vec::new();
+                for step in 0..=steps {
+                    let amount = if steps == 0 {
+                        1.0
+                    } else {
+                        step as f32 / steps as f32
+                    };
+                    if let Some(hit) = scene.hit_test(
+                        (from[0] + dx * amount) as f64,
+                        (from[1] + dy * amount) as f64,
+                        frame_size[0] as u32,
+                        frame_size[1] as u32,
+                    ) && let Some(basis) = basis_ids
+                        .iter()
+                        .position(|candidate| *candidate == hit.basis)
+                    {
+                        let tile = (hit.y * grid.width as usize + hit.x) * basis_ids.len() + basis;
+                        if !values.iter().any(|(existing, _)| *existing == tile) {
+                            values.push((tile, value));
+                        }
+                    }
+                }
+                let applied = !values.is_empty()
+                    && self
+                        .workbench
+                        .execute(crate::workbench::DraftCommand::SetChannelValues {
+                            channel: self.workbench.selected_channel(),
+                            values,
+                        })
+                        .is_ok();
+                if applied {
+                    self.workbench_draft_scene_generation =
+                        self.workbench_draft_scene_generation.wrapping_add(1);
+                    if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
+                        eprintln!("E2E_WORKBENCH_DRAFT=Dirty");
+                    }
+                }
+                return applied;
+            }
+            let world = self
+                .camera
+                .screen_to_world(screen, frame_size[0], frame_size[1]);
             if let Some(value) = value {
                 let from = tracker
                     .stroke_segment()
@@ -3097,6 +3529,62 @@ impl App {
             (local.column as f32 + 0.5) * scale[0],
             (local.row as f32 + 0.5) * scale[1],
         ];
+        if self.mode == AppMode::Simulation
+            && let Some(scene) = self.simulation_basis_scene(self.render_generation())
+        {
+            match action {
+                crate::input::MouseAction::Inspect => {
+                    if let Some(hit) = scene.hit_test(
+                        screen[0] as f64,
+                        screen[1] as f64,
+                        frame_size[0] as u32,
+                        frame_size[1] as u32,
+                    ) {
+                        self.inspect_basis_cell(hit);
+                    }
+                    return true;
+                }
+                crate::input::MouseAction::Paint | crate::input::MouseAction::Erase => {
+                    let value = if action == crate::input::MouseAction::Paint {
+                        1.0
+                    } else {
+                        0.0
+                    };
+                    let from = tracker
+                        .stroke_segment()
+                        .map(|(from, _)| [(from.0 + 0.5) * scale[0], (from.1 + 0.5) * scale[1]])
+                        .unwrap_or(screen);
+                    let dx = screen[0] - from[0];
+                    let dy = screen[1] - from[1];
+                    let steps = dx.abs().max(dy.abs()).ceil() as usize;
+                    let mut hits = Vec::new();
+                    for step in 0..=steps {
+                        let amount = if steps == 0 {
+                            1.0
+                        } else {
+                            step as f32 / steps as f32
+                        };
+                        if let Some(hit) = scene.hit_test(
+                            (from[0] + dx * amount) as f64,
+                            (from[1] + dy * amount) as f64,
+                            frame_size[0] as u32,
+                            frame_size[1] as u32,
+                        ) && !hits.contains(&hit)
+                        {
+                            hits.push(hit);
+                        }
+                    }
+                    for hit in hits.iter().copied() {
+                        self.paint_basis_cell(hit, value);
+                    }
+                    if let Some(hit) = hits.last().copied() {
+                        self.inspect_basis_cell(hit);
+                    }
+                    return true;
+                }
+                crate::input::MouseAction::Pan { .. } | crate::input::MouseAction::Zoom { .. } => {}
+            }
+        }
         let world = self
             .camera
             .screen_to_world(screen, frame_size[0], frame_size[1]);
@@ -5006,6 +5494,97 @@ mod tests {
     }
 
     #[test]
+    fn channels_scene_uses_runtime_basis_state_in_true_hex_geometry() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 4, 4);
+        let mut draft = ExperimentSpec::single_channel_lenia(4, 4);
+        draft.channels[0].initial.fill(0.0);
+        draft.tiling = Some(crate::sim::tiling::build_preset(
+            crate::sim::tiling::TilingPreset::RegularHexagon,
+            1.0,
+        ));
+        app.submit_draft(ApplyRequest {
+            request_id: 1,
+            base_revision: 0,
+            draft,
+        })
+        .unwrap();
+        app.experiment_service
+            .as_mut()
+            .unwrap()
+            .world_mut()
+            .set_basis(0, 2, 2, 0, 1.0);
+        app.camera = Camera::new([2.0, 2.0], 12.0);
+
+        let frame = app
+            .workbench_basis_scene(crate::workbench::ChannelView::Composite, 7)
+            .unwrap()
+            .render_frame(80, 80);
+        let center = (40 * 80 + 40) * 4;
+        assert!(frame.rgba[center] > 200);
+        let corner = (34 * 80 + 34) * 4;
+        assert!(frame.rgba[corner] < 32);
+    }
+
+    #[test]
+    fn simulation_mouse_paints_the_visible_oblique_hex_not_a_rectangular_alias() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 5, 5);
+        let mut draft = ExperimentSpec::single_channel_lenia(5, 5);
+        draft.channels[0].initial.fill(0.0);
+        draft.tiling = Some(crate::sim::tiling::build_preset(
+            crate::sim::tiling::TilingPreset::RegularHexagon,
+            1.0,
+        ));
+        app.submit_draft(ApplyRequest {
+            request_id: 1,
+            base_revision: 0,
+            draft,
+        })
+        .unwrap();
+        app.camera = Camera::new([2.0, 2.0], 12.0);
+        app.set_viewport(ratatui::layout::Rect::new(0, 0, 80, 80), [80, 80]);
+        let mut tracker = crate::input::MouseTracker::new();
+        let event = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 51,
+            row: 46,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        assert!(app.handle_mouse(event, &mut tracker));
+        let world = app.experiment_service.as_ref().unwrap().world();
+        assert_eq!(world.get_basis(0, 3, 2, 0), 1.0);
+        assert_eq!(world.get_basis(0, 2, 2, 0), 0.0);
+    }
+
+    #[test]
+    fn workbench_world_mouse_paints_the_visible_oblique_hex() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 5, 5);
+        app.enter_workbench();
+        app.workbench_mut().cycle_tiling_preset().unwrap();
+        app.workbench_mut().cycle_tiling_preset().unwrap();
+        app.workbench_mut().cycle_tiling_preset().unwrap();
+        let mut draft = app.workbench().draft().clone();
+        draft.channels[0].initial.fill(0.0);
+        app.workbench = crate::workbench::WorkbenchState::new(draft);
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::World);
+        app.camera = Camera::new([2.0, 2.0], 12.0);
+        app.set_viewport(ratatui::layout::Rect::new(0, 0, 80, 80), [80, 80]);
+        let mut tracker = crate::input::MouseTracker::new();
+        let event = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: 51,
+            row: 46,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        assert!(app.handle_mouse(event, &mut tracker));
+        let initial = &app.workbench().draft().channels[0].initial;
+        assert_eq!(initial[2 * 5 + 3], 1.0);
+        assert_eq!(initial[2 * 5 + 2], 0.0);
+    }
+
+    #[test]
     fn remote_apply_acceptance_switches_to_simulation_only_after_ack() {
         let mut app = App::new(SimulationSpec::lenia_orbium(), 2, 2);
         app.enter_workbench();
@@ -5558,13 +6137,14 @@ mod tests {
     fn workbench_world_paint_invalidates_the_graphics_scene() {
         let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
         app.enter_workbench();
+        app.camera = Camera::new([8.0, 8.0], 8.0);
         app.set_viewport(ratatui::layout::Rect::new(2, 2, 20, 10), [160, 160]);
         let before = app.workbench_draft_scene_generation;
         let mut tracker = crate::input::MouseTracker::new();
         let event = crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
-            column: 8,
-            row: 5,
+            column: 12,
+            row: 7,
             modifiers: crossterm::event::KeyModifiers::NONE,
         };
 
@@ -6145,6 +6725,43 @@ mod tests {
         assert!(
             app.workbench_notice()
                 .is_some_and(|notice| notice.contains("next = clamp(result, 0, 1)"))
+        );
+    }
+
+    #[test]
+    fn growth_domain_shortcuts_edit_exact_min_and_max() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Growth);
+
+        for code in [
+            KeyCode::Char('d'),
+            KeyCode::Char('-'),
+            KeyCode::Char('2'),
+            KeyCode::Enter,
+        ] {
+            assert!(app.handle_workbench_editor_key(KeyEvent::new(
+                code,
+                crossterm::event::KeyModifiers::NONE,
+            )));
+        }
+        for code in [
+            KeyCode::Char('D'),
+            KeyCode::Char('7'),
+            KeyCode::Char('.'),
+            KeyCode::Char('5'),
+            KeyCode::Enter,
+        ] {
+            assert!(app.handle_workbench_editor_key(KeyEvent::new(
+                code,
+                crossterm::event::KeyModifiers::NONE,
+            )));
+        }
+
+        assert_eq!(
+            app.workbench().growth_editor().primary_axis_interval(),
+            [-2.0, 7.5]
         );
     }
 
