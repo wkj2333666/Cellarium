@@ -592,8 +592,9 @@ impl WorkbenchState {
         self.tiling_constraints.clear();
     }
     pub fn solve_tiling_seams(&mut self) -> Result<SeamSolveSummary, String> {
-        let tiling = self
-            .draft
+        let mut candidate = self.draft.clone();
+        complete_single_triangle_cell(&mut candidate)?;
+        let tiling = candidate
             .tiling
             .as_ref()
             .ok_or_else(|| "draw or choose at least one polygon first".to_string())?;
@@ -644,7 +645,7 @@ impl WorkbenchState {
             max_displacement: solved.max_displacement,
             max_residual: solved.max_seam_residual,
         };
-        let mut next = self.draft.clone();
+        let mut next = candidate;
         next.tiling = Some(solved.draft);
         self.replace_draft(next)
             .map_err(|error| error.to_string())?;
@@ -2081,6 +2082,31 @@ impl WorkbenchState {
         Ok(())
     }
 
+    /// Start an explicit new design instead of silently treating the loaded
+    /// experiment's current tiling as a drawing preset. This is one undoable
+    /// draft replacement and intentionally restores the documented defaults:
+    /// one channel, one kernel, no polygon, and no periodic rule bindings.
+    pub fn new_blank_design(&mut self) -> Result<(), HistoryError> {
+        let (width, height) = match &self.draft.geometry {
+            crate::sim::experiment_model::GeometrySpec::RasterGrid(grid) => {
+                (grid.width, grid.height)
+            }
+        };
+        let blank = ExperimentSpec::single_channel_lenia(width, height);
+        self.replace_draft(blank)?;
+        self.selected_channel = ChannelId(0);
+        self.selected_basis = BasisId(0);
+        self.selected_prototype = None;
+        self.tiling_constraints.clear();
+        self.tiling_construction.clear();
+        self.tiling_pointer = None;
+        self.tiling_tool = super::tiling_editor::TilingTool::Select;
+        self.refresh_rule_selection();
+        self.growth_editor =
+            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+        Ok(())
+    }
+
     pub fn tiling_prototype(&self) -> Option<PrototypeId> {
         self.selected_prototype
     }
@@ -2147,6 +2173,126 @@ impl WorkbenchState {
     pub fn finish_tiling_drag(&mut self) {
         self.tiling_drag_active = false;
     }
+}
+
+/// A single translation-only triangle is necessarily half of a fundamental
+/// parallelogram. When the user draws that first triangle, synthesize its
+/// complementary triangle as a second semantic basis, then let the ordinary
+/// strict full-edge solver establish and retain the seam constraints. This is
+/// exact for every non-degenerate triangle; no equilateral assumption enters.
+fn complete_single_triangle_cell(spec: &mut ExperimentSpec) -> Result<bool, String> {
+    let previous_bases = spec.basis_ids();
+    let Some(tiling) = spec.tiling.as_mut() else {
+        return Ok(false);
+    };
+    if tiling.instances.len() != 1 || tiling.prototypes.len() != 1 {
+        return Ok(false);
+    }
+    let original_basis = tiling.instances[0].id;
+    let vertices = match &tiling.prototypes[0].shape {
+        PrototypeShape::SimplePolygon { vertices } if vertices.len() == 3 => vertices.clone(),
+        _ => return Ok(false),
+    };
+    let [p0, p1, p2] = [vertices[0], vertices[1], vertices[2]];
+    let prototype = PrototypeId(
+        tiling
+            .prototypes
+            .iter()
+            .map(|entry| entry.id.0)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or("prototype id exhausted")?,
+    );
+    let basis = BasisId(
+        tiling
+            .instances
+            .iter()
+            .map(|entry| entry.id.0)
+            .max()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or("basis id exhausted")?,
+    );
+    tiling.translation_a = p1 - p0;
+    tiling.translation_b = p2 - p0;
+    tiling.prototypes.push(crate::sim::tiling::TilePrototype {
+        id: prototype,
+        name: format!("basis_{}_complement", basis.0),
+        shape: PrototypeShape::SimplePolygon {
+            vertices: vec![p1, p1 + p2 - p0, p2],
+        },
+    });
+    tiling.instances.push(crate::sim::tiling::TileInstance {
+        id: basis,
+        prototype,
+        transform: crate::sim::tiling::RigidTransform::default(),
+    });
+
+    let tile_count = spec
+        .geometry
+        .tile_count()
+        .ok_or("geometry is too large to expand the triangle basis")?;
+    if previous_bases.len() == 1 {
+        for channel in &mut spec.channels {
+            if channel.initial.len() == tile_count {
+                channel.initial = channel
+                    .initial
+                    .iter()
+                    .flat_map(|value| [*value, *value])
+                    .collect();
+            }
+        }
+    }
+    for rule in &mut spec.rules.sets {
+        for kernel in &mut rule.kernels {
+            let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) =
+                &mut kernel.spatial
+            else {
+                continue;
+            };
+            let plane_len = definition.width * definition.height;
+            let template = definition
+                .planes
+                .get(&original_basis)
+                .cloned()
+                .or_else(|| definition.planes.values().next().cloned())
+                .unwrap_or(crate::sim::basis_kernel::BasisWeightPlane {
+                    values: vec![0.0; plane_len],
+                    mask: None,
+                });
+            definition.planes.insert(basis, template);
+        }
+    }
+    for output in spec
+        .channels
+        .iter()
+        .filter(|channel| !channel.frozen)
+        .map(|channel| channel.id)
+        .collect::<Vec<_>>()
+    {
+        let rule_set = spec
+            .rules
+            .binding(original_basis, output)
+            .map(|binding| binding.rule_set)
+            .or_else(|| spec.rules.defaults.get(&output).copied())
+            .ok_or("active channel has no default rule-set")?;
+        spec.rules.bindings.push(crate::sim::ruleset::RuleBinding {
+            basis,
+            output,
+            rule_set,
+        });
+    }
+    spec.rules
+        .validate(&spec.basis_ids(), &spec.channels)
+        .map_err(|errors| {
+            errors
+                .into_iter()
+                .map(|error| error.to_string())
+                .collect::<Vec<_>>()
+                .join("; ")
+        })?;
+    Ok(true)
 }
 
 #[cfg(test)]
@@ -2906,5 +3052,50 @@ mod tests {
             .drag_constrained_tiling_vertex(prototype, 2, crate::sim::tiling::Vec2::new(1.1, 1.1))
             .unwrap();
         crate::sim::tiling::validate_coverage(state.draft().tiling.as_ref().unwrap()).unwrap();
+    }
+
+    #[test]
+    fn blank_design_discards_the_loaded_tiling_and_restores_one_channel_and_kernel() {
+        let mut state = WorkbenchState::new(basis_fixture());
+        state.add_channel().unwrap();
+        assert!(state.draft().tiling.is_some());
+
+        state.new_blank_design().unwrap();
+
+        assert!(state.draft().tiling.is_none());
+        assert_eq!(state.draft().channels.len(), 1);
+        assert_eq!(state.draft().kernels.len(), 1);
+        assert!(state.draft().rules.is_empty());
+        state.undo().unwrap();
+        assert!(state.draft().tiling.is_some());
+        assert_eq!(state.draft().channels.len(), 2);
+    }
+
+    #[test]
+    fn seam_assist_completes_a_free_drawn_triangle_into_an_exact_periodic_cell() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        state.begin_new_basis_polygon();
+        for point in [
+            crate::sim::tiling::Vec2::new(-0.9, -0.7),
+            crate::sim::tiling::Vec2::new(1.1, -0.6),
+            crate::sim::tiling::Vec2::new(-0.2, 0.9),
+        ] {
+            state.push_tiling_vertex(point).unwrap();
+        }
+        state.finish_tiling_construction().unwrap();
+        assert!(
+            crate::sim::tiling::validate_coverage(state.draft().tiling.as_ref().unwrap()).is_err()
+        );
+
+        let summary = state.solve_tiling_seams().unwrap();
+
+        assert_eq!(summary.seams, 3);
+        assert_eq!(state.draft().basis_ids().len(), 2);
+        crate::sim::tiling::validate_coverage(state.draft().tiling.as_ref().unwrap()).unwrap();
+        state
+            .draft()
+            .rules
+            .validate(&state.draft().basis_ids(), &state.draft().channels)
+            .unwrap();
     }
 }

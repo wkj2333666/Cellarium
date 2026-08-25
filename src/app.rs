@@ -1134,6 +1134,15 @@ impl App {
                 return true;
             }
             match key.code {
+                KeyCode::Char('b') if key.modifiers.is_empty() => {
+                    self.workbench_notice = Some(match self.workbench.new_blank_design() {
+                        Ok(()) => "new blank design · choose Preset or Add basis and draw".into(),
+                        Err(error) => format!("new blank design: {error}"),
+                    });
+                    self.workbench_draft_scene_generation =
+                        self.workbench_draft_scene_generation.wrapping_add(1);
+                    return true;
+                }
                 KeyCode::Char('s') if key.modifiers.is_empty() => {
                     self.workbench_notice = Some(match self.workbench.solve_tiling_seams() {
                         Ok(summary) => format!(

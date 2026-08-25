@@ -521,7 +521,7 @@ fn c_s_pty_user_journey_survives_repeated_keyboard_and_mouse_operations() {
         }
     ));
     assert!(
-        contains(&output, b"a=d,d=A,q=1"),
+        contains(&output, b"a=d,d=A,q=2"),
         "entering Workbench must delete the previous Kitty image placement"
     );
 

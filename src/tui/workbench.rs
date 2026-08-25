@@ -33,6 +33,10 @@ fn toolbar_segments(
             ("[V] View", ToolbarAction::Ui(UiCommand::CyclePresentation)),
         ],
         WorkbenchSection::Tiling => vec![
+            (
+                "[B] New blank",
+                ToolbarAction::EditorKey(KeyCode::Char('b')),
+            ),
             ("[D] Shape", ToolbarAction::EditorKey(KeyCode::Char('d'))),
             ("[A] Add basis", ToolbarAction::Ui(UiCommand::ContextAdd)),
             ("[P] Preset", ToolbarAction::Ui(UiCommand::CyclePreset)),
@@ -891,12 +895,13 @@ pub fn draw_workbench(
                     "construction vertices: {}",
                     state.tiling_construction().len()
                 )));
+                lines.push(Line::from("B new blank design · P choose preset"));
                 lines.push(Line::from("D redraw selected · A draw a new basis"));
                 lines.push(Line::from(
                     "Click vertices · click first/Enter close · Esc cancel",
                 ));
                 lines.push(Line::from("Select: drag vertex · right remove"));
-                lines.push(Line::from("P preset · N basis · +/- regular sides"));
+                lines.push(Line::from("N basis · +/- regular sides"));
                 lines.push(Line::from(format!(
                     "S solve full-edge seams · linked seams: {}",
                     state.tiling_constraint_count()
@@ -1855,6 +1860,22 @@ mod tests {
         assert_eq!(
             toolbar_action_at(&state, 2),
             Some(ToolbarAction::Ui(UiCommand::SelectNext))
+        );
+    }
+
+    #[test]
+    fn tiling_toolbar_exposes_an_explicit_clickable_blank_design_action() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.select_section(WorkbenchSection::Tiling);
+        let text = toolbar_text(&state);
+        let blank = text.find("[B] New blank").unwrap() as u16 + 2;
+        assert_eq!(
+            toolbar_action_at(&state, blank),
+            Some(ToolbarAction::EditorKey(crossterm::event::KeyCode::Char(
+                'b'
+            )))
         );
     }
 

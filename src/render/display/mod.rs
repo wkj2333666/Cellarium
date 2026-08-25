@@ -460,9 +460,14 @@ impl KittySharedDisplay {
     fn invalidate_pending(&self) {
         self.epoch.fetch_add(1, Ordering::AcqRel);
         if let Ok(mut state) = self.state.lock() {
+            // `ready` has never been referenced by the terminal, so dropping it
+            // is safe. A retained frame has already had its POSIX shm name
+            // written to the PTY; Kitty owns the unlink from that point on.
+            // Keep those names alive even when the scene/placement is cleared,
+            // otherwise buffered graphics commands race the sender's Drop and
+            // Kitty reports EBADF/ENOENT into the application's stdin.
             state.ready = None;
             state.displayed_id = None;
-            state.retained.clear();
             state.pending_deletes.clear();
         }
         if let Ok(mut request) = self.last_graphics_request.lock() {
@@ -515,7 +520,6 @@ impl KittySharedDisplay {
         {
             state.failed = true;
             state.ready = None;
-            state.retained.clear();
         }
         if state.failed {
             if state.displayed_id.is_some() || !state.pending_deletes.is_empty() {
@@ -547,6 +551,24 @@ impl KittySharedDisplay {
             drop(state);
             return RenderStatus {
                 rendered: false,
+                fresh: false,
+            };
+        }
+        // POSIX shared-memory transfer is terminal-owned after the command is
+        // emitted. Do not enqueue a second name until Kitty has opened and
+        // unlinked the first one. Besides bounding memory to one in-flight
+        // transfer plus one latest ready frame, this prevents slow terminals
+        // from accumulating a PTY backlog whose names can outlive our timeout.
+        if !state.retained.is_empty() {
+            frame.render_widget(
+                GraphicsCommandWidget {
+                    command: (!cleanup_command.is_empty()).then_some(cleanup_command.as_str()),
+                    skip_area: true,
+                },
+                area,
+            );
+            return RenderStatus {
+                rendered: state.displayed_id.is_some(),
                 fresh: false,
             };
         }
@@ -819,11 +841,11 @@ impl PixelDisplay {
 
 #[cfg(unix)]
 fn kitty_delete_image_command(image_id: u32) -> String {
-    format!("\x1b_Ga=d,d=I,i={image_id},q=1\x1b\\")
+    format!("\x1b_Ga=d,d=I,i={image_id},q=2\x1b\\")
 }
 
 fn kitty_delete_all_images_command() -> &'static str {
-    "\x1b_Ga=d,d=A,q=1\x1b\\"
+    "\x1b_Ga=d,d=A,q=2\x1b\\"
 }
 
 fn picker_for_cell_size(
@@ -902,7 +924,7 @@ impl KittySharedFrame {
         let name = create_shared_memory(&rgb)?;
         let encoded_name = base64::engine::general_purpose::STANDARD.encode(name.as_bytes());
         let command = format!(
-            "\x1b_Ga=T,f=24,t=s,s={width},v={height},S={},i={image_id},p=1,c={columns},r={rows},C=1,q=1;{encoded_name}\x1b\\",
+            "\x1b_Ga=T,f=24,t=s,s={width},v={height},S={},i={image_id},p=1,c={columns},r={rows},C=1,q=2;{encoded_name}\x1b\\",
             rgb.len()
         );
         Ok(Self {
@@ -1867,8 +1889,8 @@ mod tests {
         assert!(frame.command.contains("c=12,r=4"));
         assert!(frame.command.contains("i=41,p=1"));
         assert!(frame.command.contains("C=1"));
-        assert!(frame.command.contains("q=1"));
-        assert!(!frame.command.contains("q=2"));
+        assert!(frame.command.contains("q=2"));
+        assert!(!frame.command.contains("q=1"));
         assert!(!frame.command.contains("a=d,d=I"));
         assert!(frame.command.len() < 256);
         assert_eq!(frame.read_pixels_for_test().unwrap(), [1, 2, 3, 4, 5, 6]);
@@ -1910,6 +1932,81 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
+    fn invalidating_graphics_never_unlinks_a_frame_already_sent_to_kitty() {
+        let display = KittySharedDisplay::new((8, 16));
+        let pixels = [1_u8, 2, 3, 255];
+        let sent = KittySharedFrame::new(&pixels, 1, 1, 1, 1, 41).unwrap();
+        let name = sent.name.clone();
+        display.state.lock().unwrap().retained.push_back(sent);
+
+        display.invalidate_pending();
+
+        let state = display.state.lock().unwrap();
+        assert_eq!(state.retained.len(), 1);
+        assert!(!state.retained[0].was_consumed_by_terminal());
+        drop(state);
+        assert_eq!(unsafe { libc::shm_unlink(name.as_ptr()) }, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn shared_display_allows_only_one_unconsumed_transfer_at_a_time() {
+        let display = KittySharedDisplay::new((8, 16));
+        let pixels = [1_u8, 2, 3, 255];
+        let in_flight = KittySharedFrame::new(&pixels, 1, 1, 1, 1, 41).unwrap();
+        let ready = KittySharedFrame::new(&pixels, 1, 1, 1, 1, 42).unwrap();
+        {
+            let mut state = display.state.lock().unwrap();
+            state.displayed_id = Some(41);
+            state.retained.push_back(in_flight);
+            state.ready = Some((0, ready));
+        }
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(1, 1)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                display.render(frame, ratatui::layout::Rect::new(0, 0, 1, 1));
+            })
+            .unwrap();
+
+        let state = display.state.lock().unwrap();
+        assert_eq!(state.displayed_id, Some(41));
+        assert_eq!(state.retained.len(), 1);
+        assert_eq!(
+            state.ready.as_ref().map(|(_, frame)| frame.image_id),
+            Some(42)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn timed_out_transfer_falls_back_without_unlinking_the_queued_name() {
+        let display = KittySharedDisplay::new((8, 16));
+        let pixels = [1_u8, 2, 3, 255];
+        let mut sent = KittySharedFrame::new(&pixels, 1, 1, 1, 1, 41).unwrap();
+        sent.created_at = Instant::now() - Duration::from_secs(3);
+        let name = sent.name.clone();
+        display.state.lock().unwrap().retained.push_back(sent);
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(1, 1)).unwrap();
+
+        terminal
+            .draw(|frame| {
+                display.render(frame, ratatui::layout::Rect::new(0, 0, 1, 1));
+            })
+            .unwrap();
+
+        let state = display.state.lock().unwrap();
+        assert!(state.failed);
+        assert_eq!(state.retained.len(), 1);
+        assert!(!state.retained[0].was_consumed_by_terminal());
+        drop(state);
+        assert_eq!(unsafe { libc::shm_unlink(name.as_ptr()) }, 0);
+    }
+
+    #[cfg(unix)]
+    #[test]
     fn shared_memory_failure_drops_future_frames_for_safe_half_block_fallback() {
         let display = KittySharedDisplay::new((8, 16));
         display.state.lock().unwrap().failed = true;
@@ -1941,7 +2038,7 @@ mod tests {
             .unwrap();
 
         let symbol = terminal.backend().buffer().cell((0, 0)).unwrap().symbol();
-        assert!(symbol.contains("a=d,d=I,i=41,q=1"));
+        assert!(symbol.contains("a=d,d=I,i=41,q=2"));
         assert_eq!(display.state.lock().unwrap().displayed_id, None);
     }
 
@@ -1967,7 +2064,7 @@ mod tests {
             .unwrap();
 
         let symbol = terminal.backend().buffer().cell((0, 0)).unwrap().symbol();
-        assert!(symbol.contains("a=d,d=A,q=1"));
+        assert!(symbol.contains("a=d,d=A,q=2"));
         assert!(
             symbol.ends_with('W'),
             "clearing a placement must preserve the text cell beneath it"
