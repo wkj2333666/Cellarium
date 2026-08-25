@@ -99,7 +99,7 @@ enum RasterSource {
         cells: Vec<f32>,
         camera: Camera,
     },
-    Basis(BasisStateScene),
+    Basis(Box<BasisStateScene>),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -285,7 +285,7 @@ impl AsyncRasterizer {
             .store(generation.priority, Ordering::Release);
         self.queue.submit(RasterRequest {
             generation: generation.priority,
-            source: RasterSource::Basis(scene),
+            source: RasterSource::Basis(Box::new(scene)),
             frame_width,
             frame_height,
             terminal_size,

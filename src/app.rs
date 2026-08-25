@@ -955,12 +955,11 @@ impl App {
                 {
                     self.workbench.kernel_resize_editor_select_all();
                 }
-                KeyCode::Char(character) => {
-                    if !self.workbench.kernel_resize_editor_insert(character) {
-                        self.workbench_notice = Some(
-                            "resize accepts width,height,anchor_x,anchor_y as integers".into(),
-                        );
-                    }
+                KeyCode::Char(character)
+                    if !self.workbench.kernel_resize_editor_insert(character) =>
+                {
+                    self.workbench_notice =
+                        Some("resize accepts width,height,anchor_x,anchor_y as integers".into());
                 }
                 _ => {}
             }
@@ -1771,7 +1770,7 @@ impl App {
             })
             .or_else(|| {
                 (self.remote_basis_ids == basis_ids && self.remote_channels == channels)
-                    .then(|| self.remote_basis_cells.as_deref())
+                    .then_some(self.remote_basis_cells.as_deref())
                     .flatten()
             });
         let initial;
@@ -1848,7 +1847,7 @@ impl App {
             })
             .or_else(|| {
                 (self.remote_basis_ids == basis_ids && self.remote_channels == channels)
-                    .then(|| self.remote_basis_cells.as_deref())
+                    .then_some(self.remote_basis_cells.as_deref())
                     .flatten()
             });
         let initial;
@@ -3268,12 +3267,8 @@ impl App {
                                 if self.workbench.kernel_tool()
                                     == crate::workbench::kernel_editor::KernelTool::Weights
                                     && let Some(selection) = scene.selection_in_pixel_rect_for_tool(
-                                        pointer.bounds[0],
-                                        pointer.bounds[1],
-                                        pointer.bounds[2],
-                                        pointer.bounds[3],
-                                        frame_size[0] as u32,
-                                        frame_size[1] as u32,
+                                        pointer.bounds,
+                                        [frame_size[0] as u32, frame_size[1] as u32],
                                         crate::workbench::kernel_editor::KernelTool::Weights,
                                     )
                                 {
@@ -3342,12 +3337,8 @@ impl App {
                             _ => {}
                         }
                         let Some(selection) = scene.selection_in_pixel_rect_for_tool(
-                            pointer.bounds[0],
-                            pointer.bounds[1],
-                            pointer.bounds[2],
-                            pointer.bounds[3],
-                            frame_size[0] as u32,
-                            frame_size[1] as u32,
+                            pointer.bounds,
+                            [frame_size[0] as u32, frame_size[1] as u32],
                             self.workbench.kernel_tool(),
                         ) else {
                             return false;

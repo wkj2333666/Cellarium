@@ -279,7 +279,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(generated.mask.as_ref().unwrap()[0], false);
+        assert!(!generated.mask.as_ref().unwrap()[0]);
         assert_eq!(generated.values[0], 0.0);
         assert!(generated.values[1..].iter().all(|value| *value == 1.0));
     }

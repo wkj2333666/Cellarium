@@ -503,14 +503,12 @@ impl PeriodicKernelScene {
 
     pub fn selection_in_pixel_rect_for_tool(
         &self,
-        left: u32,
-        top: u32,
-        right: u32,
-        bottom: u32,
-        width: u32,
-        height: u32,
+        bounds: [u32; 4],
+        size: [u32; 2],
         tool: KernelTool,
     ) -> Option<KernelSelection> {
+        let [left, top, right, bottom] = bounds;
+        let [width, height] = size;
         let right = right.max(left.saturating_add(1));
         let bottom = bottom.max(top.saturating_add(1));
         let center = [

@@ -268,8 +268,8 @@ fn project_to_constraints(
     let diagonal_scale = (0..count)
         .map(|index| gram[index][index].abs())
         .fold(1.0_f64, f64::max);
-    for index in 0..count {
-        gram[index][index] += diagonal_scale * 1e-13;
+    for (index, row) in gram.iter_mut().enumerate() {
+        row[index] += diagonal_scale * 1e-13;
     }
     for _ in 0..4 {
         let residual = rows.iter().map(|row| dot(row, values)).collect::<Vec<_>>();
@@ -306,10 +306,11 @@ fn solve_linear(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Result<Vec<f64>
         matrix.swap(column, pivot);
         rhs.swap(column, pivot);
         let divisor = matrix[column][column];
-        for entry in column..count {
-            matrix[column][entry] /= divisor;
+        for value in &mut matrix[column][column..] {
+            *value /= divisor;
         }
         rhs[column] /= divisor;
+        let pivot_row = matrix[column].clone();
         for row in 0..count {
             if row == column {
                 continue;
@@ -318,8 +319,8 @@ fn solve_linear(mut matrix: Vec<Vec<f64>>, mut rhs: Vec<f64>) -> Result<Vec<f64>
             if factor == 0.0 {
                 continue;
             }
-            for entry in column..count {
-                matrix[row][entry] -= factor * matrix[column][entry];
+            for (value, pivot_value) in matrix[row][column..].iter_mut().zip(&pivot_row[column..]) {
+                *value -= factor * pivot_value;
             }
             rhs[row] -= factor * rhs[column];
         }
