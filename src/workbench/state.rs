@@ -4,6 +4,7 @@ use super::numeric_editor::NumericEditor;
 use super::{ChannelView, DraftCommand, GrowthEditorState, History, HistoryError};
 use crate::sim::experiment_model::{
     ChannelId, ChannelSpec, DisplayColor, ExperimentSpec, KernelId, KernelSlot, RgbColor,
+    UpdateMode,
 };
 use crate::sim::kernel::KernelDefinition;
 use crate::sim::ruleset::{BindingKey, RuleKernel, RuleSet, RuleSetId};
@@ -75,12 +76,14 @@ pub struct WorkbenchState {
     channel_view: ChannelView,
     growth_editor: GrowthEditorState,
     growth_editing: bool,
+    growth_help_scroll: u16,
     selected_prototype: Option<PrototypeId>,
     kernel_view: super::kernel_editor::KernelView,
     kernel_selection: Option<KernelPoint>,
     periodic_kernel_selection: Option<KernelSelection>,
     kernel_paint_value: f32,
     numeric_editor: Option<NumericEditor>,
+    simulation_dt_editing: bool,
     color_editor: Option<String>,
     color_editor_replace_on_input: bool,
     tiling_tool: super::tiling_editor::TilingTool,
@@ -128,12 +131,14 @@ impl WorkbenchState {
             channel_view: ChannelView::Composite,
             growth_editor,
             growth_editing: false,
+            growth_help_scroll: 0,
             selected_prototype,
             kernel_view: super::kernel_editor::KernelView::default(),
             kernel_selection: None,
             periodic_kernel_selection: None,
             kernel_paint_value: 0.05,
             numeric_editor: None,
+            simulation_dt_editing: false,
             color_editor: None,
             color_editor_replace_on_input: false,
             tiling_tool: super::tiling_editor::TilingTool::Select,
@@ -323,9 +328,26 @@ impl WorkbenchState {
     }
     pub fn begin_numeric_editor(&mut self, editor: NumericEditor) {
         self.numeric_editor = Some(editor);
+        self.simulation_dt_editing = false;
+    }
+    pub fn begin_simulation_dt_editor(&mut self) {
+        self.numeric_editor = Some(NumericEditor::begin(
+            "simulation dt",
+            f64::from(self.draft.simulation_dt),
+            0.000_001..=10.0,
+        ));
+        self.simulation_dt_editing = true;
+    }
+    pub fn simulation_dt_editing(&self) -> bool {
+        self.simulation_dt_editing
     }
     pub fn take_numeric_editor(&mut self) -> Option<NumericEditor> {
+        self.simulation_dt_editing = false;
         self.numeric_editor.take()
+    }
+    pub fn restore_numeric_editor(&mut self, editor: NumericEditor, simulation_dt: bool) {
+        self.numeric_editor = Some(editor);
+        self.simulation_dt_editing = simulation_dt;
     }
     pub fn color_editor(&self) -> Option<&str> {
         self.color_editor.as_deref()
@@ -439,8 +461,13 @@ impl WorkbenchState {
     pub fn tiling_construction(&self) -> &[crate::sim::tiling::Vec2] {
         &self.tiling_construction
     }
-    pub fn push_tiling_vertex(&mut self, point: crate::sim::tiling::Vec2) {
+    pub fn push_tiling_vertex(&mut self, point: crate::sim::tiling::Vec2) -> Result<(), String> {
+        crate::sim::tiling::polygon::validate_open_path_append(&self.tiling_construction, point)?;
         self.tiling_construction.push(point);
+        Ok(())
+    }
+    pub fn pop_tiling_vertex(&mut self) -> Option<crate::sim::tiling::Vec2> {
+        self.tiling_construction.pop()
     }
     pub fn cancel_tiling_construction(&mut self) {
         self.tiling_construction.clear();
@@ -463,7 +490,12 @@ impl WorkbenchState {
         if self.tiling_new_basis {
             if next.tiling.is_none() {
                 let (translation_a, translation_b) =
-                    super::tiling_editor::infer_translation_lattice(&self.tiling_construction)?;
+                    super::tiling_editor::infer_translation_lattice(&self.tiling_construction)
+                        .unwrap_or_else(|_| {
+                            super::tiling_editor::provisional_translation_lattice(
+                                &self.tiling_construction,
+                            )
+                        });
                 next.tiling = Some(crate::sim::tiling::PeriodicTilingDraft {
                     translation_a,
                     translation_b,
@@ -621,6 +653,18 @@ impl WorkbenchState {
     pub fn stop_growth_editing(&mut self) {
         self.growth_editing = false;
     }
+    pub fn growth_help_scroll(&self) -> u16 {
+        self.growth_help_scroll
+    }
+    pub fn scroll_growth_help(&mut self, lines: i16) {
+        self.growth_help_scroll = if lines < 0 {
+            self.growth_help_scroll.saturating_sub(lines.unsigned_abs())
+        } else {
+            self.growth_help_scroll
+                .saturating_add(lines as u16)
+                .min(128)
+        };
+    }
     pub fn sync_growth_source(&mut self) {
         let source = self.growth_editor.buffer().as_str().to_string();
         let binding = BindingKey {
@@ -669,6 +713,69 @@ impl WorkbenchState {
             };
         }
     }
+    pub fn selected_growth_mode(&self) -> Option<UpdateMode> {
+        self.selected_rule_set
+            .and_then(|id| self.draft.rules.get(id))
+            .map(|rule| rule.growth.mode)
+            .or_else(|| {
+                self.draft
+                    .growth
+                    .iter()
+                    .find(|growth| growth.target == self.selected_channel)
+                    .map(|growth| growth.mode)
+            })
+    }
+    pub fn set_selected_growth_mode(&mut self, mode: UpdateMode) -> Result<(), HistoryError> {
+        let mut next = self.draft.clone();
+        let binding = BindingKey {
+            basis: self.selected_basis,
+            output: self.selected_channel,
+        };
+        if next.rules.binding(binding.basis, binding.output).is_some() {
+            let rule_set = next
+                .rules
+                .detach(binding)
+                .map_err(|error| HistoryError::Edit(error.to_string()))?;
+            next.rules
+                .get_mut(rule_set)
+                .ok_or_else(|| HistoryError::Edit("selected rule-set is missing".into()))?
+                .growth
+                .mode = mode;
+        } else {
+            next.growth
+                .iter_mut()
+                .find(|growth| growth.target == self.selected_channel)
+                .ok_or_else(|| HistoryError::Edit("selected growth program is missing".into()))?
+                .mode = mode;
+        }
+        self.execute(DraftCommand::ReplaceDraft(Box::new(next)))?;
+        self.refresh_rule_selection();
+        self.growth_editor =
+            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+        Ok(())
+    }
+    pub fn set_simulation_dt(&mut self, value: f32) -> Result<(), HistoryError> {
+        if !value.is_finite() || value <= 0.0 || value > 10.0 {
+            return Err(HistoryError::Edit(
+                "simulation dt must be finite and in (0, 10]".into(),
+            ));
+        }
+        let mut next = self.draft.clone();
+        next.simulation_dt = value;
+        self.execute(DraftCommand::ReplaceDraft(Box::new(next)))?;
+        Ok(())
+    }
+    pub fn toggle_selected_growth_mode(&mut self) -> Result<UpdateMode, HistoryError> {
+        let next = match self
+            .selected_growth_mode()
+            .unwrap_or(UpdateMode::DirectUpdate)
+        {
+            UpdateMode::GrowthRate => UpdateMode::DirectUpdate,
+            UpdateMode::DirectUpdate => UpdateMode::GrowthRate,
+        };
+        self.set_selected_growth_mode(next)?;
+        Ok(next)
+    }
     pub fn execute(&mut self, command: DraftCommand) -> Result<(), HistoryError> {
         self.history.execute(&mut self.draft, command)?;
         self.status = DraftStatus::Dirty;
@@ -701,6 +808,7 @@ impl WorkbenchState {
         self.draft = self.authoritative.clone();
         self.growth_editing = false;
         self.numeric_editor = None;
+        self.simulation_dt_editing = false;
         self.cancel_color_editor();
         self.history.clear();
         self.status = DraftStatus::Clean;
@@ -716,6 +824,7 @@ impl WorkbenchState {
         self.draft = normalized;
         self.growth_editing = false;
         self.numeric_editor = None;
+        self.simulation_dt_editing = false;
         self.cancel_color_editor();
         self.history.clear();
         self.status = DraftStatus::Clean;
@@ -740,6 +849,7 @@ impl WorkbenchState {
         self.finish_tiling_drag();
         self.growth_editing = false;
         self.numeric_editor = None;
+        self.simulation_dt_editing = false;
         self.cancel_color_editor();
     }
     pub fn focus_next(&mut self) {
@@ -1967,6 +2077,48 @@ mod tests {
     }
 
     #[test]
+    fn growth_mode_is_per_ruleset_detaches_shared_defaults_and_undoes() {
+        let mut state = WorkbenchState::new(basis_fixture());
+        let sibling_before = state.rule_for(BasisId(1), ChannelId(0)).unwrap().clone();
+        assert_eq!(
+            state.selected_growth_mode(),
+            Some(crate::sim::experiment_model::UpdateMode::GrowthRate),
+        );
+
+        state.toggle_selected_growth_mode().unwrap();
+
+        assert_eq!(
+            state.selected_growth_mode(),
+            Some(crate::sim::experiment_model::UpdateMode::DirectUpdate),
+        );
+        assert_eq!(
+            state.rule_for(BasisId(1), ChannelId(0)).unwrap(),
+            &sibling_before,
+            "changing one basis must not change a shared sibling",
+        );
+        assert!(state.growth_editor().signature().ends_with("-> Value"));
+
+        state.undo().unwrap();
+        assert_eq!(
+            state.selected_growth_mode(),
+            Some(crate::sim::experiment_model::UpdateMode::GrowthRate),
+        );
+    }
+
+    #[test]
+    fn simulation_dt_edit_is_validated_and_undoable() {
+        let mut state = WorkbenchState::new(basis_fixture());
+        assert!(state.set_simulation_dt(0.0).is_err());
+        assert!(state.set_simulation_dt(f32::NAN).is_err());
+
+        state.set_simulation_dt(0.025).unwrap();
+        assert_eq!(state.draft().simulation_dt, 0.025);
+
+        state.undo().unwrap();
+        assert_eq!(state.draft().simulation_dt, 0.1);
+    }
+
+    #[test]
     fn normalized_kernel_add_updates_only_selected_ruleset_and_growth_arity() {
         let mut state = WorkbenchState::new(basis_fixture());
         let sibling_before = state.rule_for(BasisId(1), ChannelId(0)).unwrap().clone();
@@ -2057,7 +2209,7 @@ mod tests {
             crate::sim::tiling::Vec2::new(1.8, 0.1),
             crate::sim::tiling::Vec2::new(1.5, 0.6),
         ] {
-            state.push_tiling_vertex(point);
+            state.push_tiling_vertex(point).unwrap();
         }
         state.finish_tiling_construction().unwrap();
         assert_eq!(state.draft().basis_ids().len(), 2);
@@ -2071,6 +2223,47 @@ mod tests {
     }
 
     #[test]
+    fn free_draw_rejects_a_vertex_that_overlaps_an_existing_vertex_immediately() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        state.begin_new_basis_polygon();
+        let point = crate::sim::tiling::Vec2::new(0.25, -0.5);
+
+        state.push_tiling_vertex(point).unwrap();
+        assert!(state.push_tiling_vertex(point).is_err());
+
+        assert_eq!(
+            state.tiling_construction(),
+            &[point],
+            "an invalid duplicate must never enter the in-progress path"
+        );
+    }
+
+    #[test]
+    fn free_draw_rejects_a_new_edge_that_crosses_the_open_path_immediately() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        state.begin_new_basis_polygon();
+        for point in [
+            crate::sim::tiling::Vec2::new(0.0, 0.0),
+            crate::sim::tiling::Vec2::new(1.0, 1.0),
+            crate::sim::tiling::Vec2::new(0.0, 1.0),
+        ] {
+            state.push_tiling_vertex(point).unwrap();
+        }
+
+        assert!(
+            state
+                .push_tiling_vertex(crate::sim::tiling::Vec2::new(1.0, 0.0))
+                .is_err()
+        );
+
+        assert_eq!(
+            state.tiling_construction().len(),
+            3,
+            "a crossing edge must be rejected before it enters the in-progress path"
+        );
+    }
+
+    #[test]
     fn free_draw_can_create_the_first_verified_translation_tiling_without_a_preset() {
         let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
         assert!(state.draft().tiling.is_none());
@@ -2081,7 +2274,7 @@ mod tests {
             crate::sim::tiling::Vec2::new(1.0, 1.0),
             crate::sim::tiling::Vec2::new(-1.0, 1.0),
         ] {
-            state.push_tiling_vertex(point);
+            state.push_tiling_vertex(point).unwrap();
         }
 
         state.finish_tiling_construction().unwrap();
@@ -2103,6 +2296,37 @@ mod tests {
     }
 
     #[test]
+    fn closing_the_first_polygon_does_not_require_it_to_tile_by_itself() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        state.begin_new_basis_polygon();
+        for point in [
+            crate::sim::tiling::Vec2::new(0.0, 0.0),
+            crate::sim::tiling::Vec2::new(2.0, 0.0),
+            crate::sim::tiling::Vec2::new(0.0, 1.0),
+        ] {
+            state.push_tiling_vertex(point).unwrap();
+        }
+
+        state.finish_tiling_construction().unwrap();
+
+        assert!(state.tiling_construction().is_empty());
+        assert_ne!(
+            state.tiling_tool(),
+            crate::workbench::tiling_editor::TilingTool::DrawPolygon
+        );
+        let tiling = state
+            .draft()
+            .tiling
+            .as_ref()
+            .expect("the closed polygon must be visible in the draft");
+        assert_eq!(tiling.prototypes.len(), 1);
+        assert!(
+            crate::sim::tiling::validate_coverage(tiling).is_err(),
+            "a half-cell is allowed to remain visibly incomplete until its neighbor is drawn"
+        );
+    }
+
+    #[test]
     fn free_draw_normalizes_the_opposite_screen_winding() {
         let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
         state.begin_new_basis_polygon();
@@ -2112,7 +2336,7 @@ mod tests {
             crate::sim::tiling::Vec2::new(1.0, 1.0),
             crate::sim::tiling::Vec2::new(1.0, -1.0),
         ] {
-            state.push_tiling_vertex(point);
+            state.push_tiling_vertex(point).unwrap();
         }
 
         state.finish_tiling_construction().unwrap();

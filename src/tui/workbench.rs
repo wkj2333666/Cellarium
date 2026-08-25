@@ -69,20 +69,31 @@ fn toolbar_segments(
             ),
             ("[0] Fit", ToolbarAction::EditorKey(KeyCode::Char('0'))),
         ],
-        WorkbenchSection::Growth => vec![(
-            if state.growth_editing() {
-                "[Esc] Finish source"
-            } else {
-                "[E] Edit source"
-            },
-            ToolbarAction::ToggleGrowthEditor,
-        )],
+        WorkbenchSection::Growth => vec![
+            (
+                if state.growth_editing() {
+                    "[Esc] Finish source"
+                } else {
+                    "[E] Edit source"
+                },
+                ToolbarAction::ToggleGrowthEditor,
+            ),
+            (
+                match state.selected_growth_mode() {
+                    Some(crate::sim::experiment_model::UpdateMode::GrowthRate) => "[M] Mode: Rate",
+                    _ => "[M] Mode: Value",
+                },
+                ToolbarAction::EditorKey(KeyCode::Char('m')),
+            ),
+        ],
         WorkbenchSection::Experiment => vec![
             (
-                "[Ctrl+Enter] Apply",
+                "[Ctrl+Enter] Apply & Run",
                 ToolbarAction::Ui(UiCommand::ApplyDraft),
             ),
             ("[Ctrl+R] Revert", ToolbarAction::Ui(UiCommand::RevertDraft)),
+            ("[D] Edit dt", ToolbarAction::EditorKey(KeyCode::Char('d'))),
+            ("[Ctrl+S] Save", ToolbarAction::Ui(UiCommand::SaveActive)),
         ],
     }
 }
@@ -193,6 +204,81 @@ fn growth_program_count(spec: &crate::sim::experiment_model::ExperimentSpec) -> 
     }
 }
 
+fn growth_inspector_texts(state: &crate::workbench::WorkbenchState) -> Vec<String> {
+    use crate::sim::experiment_model::UpdateMode;
+    let mode = state
+        .selected_growth_mode()
+        .unwrap_or(UpdateMode::DirectUpdate);
+    let mut lines = vec![
+        "Growth function".into(),
+        format!(
+            "target: basis {} / channel {}",
+            state.selected_basis().0,
+            state.selected_channel().0,
+        ),
+        state.growth_editor().signature().to_string(),
+        format!(
+            "mode [M]: {}",
+            match mode {
+                UpdateMode::GrowthRate => "Rate (Euler step)",
+                UpdateMode::DirectUpdate => "Value (direct step)",
+            }
+        ),
+        match mode {
+            UpdateMode::GrowthRate => "next = clamp(self + dt × result, 0, 1)".into(),
+            UpdateMode::DirectUpdate => "next = clamp(result, 0, 1)".into(),
+        },
+        format!("dt = {}", state.draft().simulation_dt),
+        "self = current target cell value".into(),
+        "result = final expression value".into(),
+        "clamp means: below lo → lo; above hi → hi".into(),
+        "".into(),
+        "Language".into(),
+        "final expression is the result (no trailing ;)".into(),
+        "let name = expression;".into(),
+        "if condition { expression } else { expression }".into(),
+        "numbers · true/false · pi · e · // comment".into(),
+        "+  -  *  /  ^".into(),
+        "==  !=  <  <=  >  >=  &&  ||  !".into(),
+        "".into(),
+        "Built-ins".into(),
+        "sqrt(x)  abs(x)  exp(x)  log(x)".into(),
+        "sin(x)  cos(x)  tanh(x)".into(),
+        "floor(x)  ceil(x)  round(x)  sign(x)".into(),
+        "min(a,b)  max(a,b)  step(edge,x)".into(),
+        "clamp(x, lo, hi)  smoothstep(lo, hi, x)".into(),
+        "mix(a, b, t)  gauss(x, mu, sigma)".into(),
+        "".into(),
+        "Kernel arguments are convolution results.".into(),
+    ];
+    if let Some(rule) = state
+        .selected_rule_set()
+        .and_then(|id| state.draft().rules.get(id))
+    {
+        lines.push(format!(
+            "inputs: {}",
+            rule.kernels
+                .iter()
+                .map(|kernel| kernel.symbol.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+        if !rule.growth.parameters.is_empty() {
+            lines.push(format!(
+                "parameters: {}",
+                rule.growth
+                    .parameters
+                    .iter()
+                    .map(|(name, value)| format!("{name}={value}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    lines.push("Wheel over this panel to scroll.".into());
+    lines
+}
+
 fn experiment_review_lines(state: &crate::workbench::WorkbenchState) -> Vec<String> {
     let active = state.authoritative();
     let draft = state.draft();
@@ -265,8 +351,8 @@ fn experiment_review_lines(state: &crate::workbench::WorkbenchState) -> Vec<Stri
     }
     lines.extend([
         "".into(),
-        "Apply restarts the runtime from the draft initial field.".into(),
-        "Ctrl+Enter Apply · Ctrl+R Revert · Ctrl+E/L Export/Load draft".into(),
+        "Apply & Run restarts the runtime from the draft initial field.".into(),
+        "Ctrl+Enter Apply & Run · Ctrl+R Revert · Ctrl+S Save workspace".into(),
     ]);
     lines
 }
@@ -816,20 +902,48 @@ pub fn draw_workbench(
                     lines.push(Line::from("Enter commit · Esc cancel"));
                 }
             }
-            WorkbenchSection::Growth => lines.push(Line::from("E edit Growth source")),
-            WorkbenchSection::Experiment => lines.push(Line::from("Review, then Apply")),
+            WorkbenchSection::Growth => {
+                lines.extend(growth_inspector_texts(state).into_iter().map(Line::from));
+            }
+            WorkbenchSection::Experiment => {
+                lines.push(Line::from(format!(
+                    "simulation dt: {} · D edit",
+                    state.draft().simulation_dt
+                )));
+                lines.push(Line::from("Ctrl+Enter Apply & Run"));
+                if let Some(editor) = state.numeric_editor() {
+                    lines.push(Line::from(format!(
+                        "{} = {}▌",
+                        editor.label(),
+                        editor.buffer()
+                    )));
+                    lines.push(Line::from("Enter commit · Esc cancel"));
+                }
+            }
         }
         lines.extend([
-            Line::from("Ctrl+Z/Y undo/redo · Ctrl+Enter Apply"),
-            Line::from("Ctrl+S active · Ctrl+E/L draft"),
+            Line::from("Ctrl+Z/Y undo/redo · Ctrl+Enter Apply & Run"),
+            Line::from("Ctrl+S workspace · Ctrl+E/L draft"),
             Line::from(app.workbench_notice().unwrap_or("")),
             Line::from("W leave Workbench · ? help"),
         ]);
         frame.render_widget(
             Paragraph::new(lines)
+                .scroll((
+                    if state.section() == WorkbenchSection::Growth {
+                        state.growth_help_scroll()
+                    } else {
+                        0
+                    },
+                    0,
+                ))
                 .wrap(Wrap { trim: false })
                 .block(panel(
-                    " Inspector ",
+                    if state.section() == WorkbenchSection::Growth {
+                        " Inspector · syntax "
+                    } else {
+                        " Inspector "
+                    },
                     state.focus() == WorkbenchFocus::Inspector,
                 )),
             inspector,
@@ -1493,6 +1607,24 @@ mod tests {
     }
 
     #[test]
+    fn growth_toolbar_and_inspector_explain_mode_rate_and_language() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.select_section(WorkbenchSection::Growth);
+
+        assert!(toolbar_text(&state).contains("[M] Mode: Rate"));
+        let text = growth_inspector_texts(&state).join("\n");
+        assert!(text.contains("next = clamp(self + dt × result, 0, 1)"));
+        assert!(text.contains("dt = 0.1"));
+        assert!(text.contains("final expression is the result"));
+        assert!(text.contains("if condition { expression } else { expression }"));
+        assert!(text.contains("gauss(x, mu, sigma)"));
+        assert!(text.contains("clamp(x, lo, hi)"));
+        assert!(text.contains("clamp means: below lo → lo; above hi → hi"));
+    }
+
+    #[test]
     fn experiment_review_reports_real_differences_and_apply_consequences() {
         let mut state = crate::workbench::WorkbenchState::new(
             crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
@@ -1523,12 +1655,12 @@ mod tests {
             "review was:\n{text}"
         );
         assert!(
-            text.contains("Apply restarts the runtime from the draft initial field"),
+            text.contains("Apply & Run restarts the runtime from the draft initial field"),
             "review was:\n{text}"
         );
         assert!(
-            text.contains("Ctrl+E/L Export/Load draft"),
-            "letter O is indistinguishable from zero in common terminal fonts:\n{text}"
+            text.contains("Ctrl+S Save workspace"),
+            "the primary persistent workspace action must be visible:\n{text}"
         );
     }
 

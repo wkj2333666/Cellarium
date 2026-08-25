@@ -71,8 +71,25 @@ case "$action" in
   key)
     [[ $# == 1 && $1 =~ ^[A-Za-z0-9_+:.=-]+$ ]] || usage
     key_name=$1
-    [[ $key_name == enter ]] && key_name=Return
-    [[ $key_name == esc ]] && key_name=Escape
+    case "$key_name" in
+      enter) key_name=Return ;;
+      esc) key_name=Escape ;;
+      backspace) key_name=BackSpace ;;
+      delete) key_name=Delete ;;
+      tab) key_name=Tab ;;
+      left) key_name=Left ;;
+      right) key_name=Right ;;
+      up) key_name=Up ;;
+      down) key_name=Down ;;
+      home) key_name=Home ;;
+      end) key_name=End ;;
+      pageup) key_name=Prior ;;
+      pagedown) key_name=Next ;;
+    esac
+    key_name=${key_name//+enter/+Return}
+    key_name=${key_name//+esc/+Escape}
+    key_name=${key_name//+backspace/+BackSpace}
+    key_name=${key_name//+delete/+Delete}
     activate_window
     xdotool key --clearmodifiers "$key_name"
     ;;

@@ -144,7 +144,7 @@ pub fn validate_polygon(vertices: &[Vec2]) -> Vec<GeometryIssue> {
             }
             let b0 = vertices[j];
             let b1 = vertices[(j + 1) % vertices.len()];
-            if segments_intersect(a0, a1, b0, b1) {
+            if segments_intersect_or_touch(a0, a1, b0, b1) {
                 issues.push(issue(
                     "self_intersection",
                     "polygon edges intersect",
@@ -166,6 +166,36 @@ pub fn validate_polygon(vertices: &[Vec2]) -> Vec<GeometryIssue> {
         }
     }
     issues
+}
+
+/// Validate one click before it becomes part of an open polygon path.
+/// Closing is a separate action: clicking the first handle never appends a
+/// duplicate endpoint.
+pub fn validate_open_path_append(vertices: &[Vec2], point: Vec2) -> Result<(), String> {
+    const EPS: f64 = 1e-12;
+    if !point.x.is_finite() || !point.y.is_finite() {
+        return Err("vertex coordinates must be finite".into());
+    }
+    if vertices.len() >= MAX_POLYGON_VERTICES {
+        return Err(format!(
+            "polygon may contain at most {MAX_POLYGON_VERTICES} vertices"
+        ));
+    }
+    if vertices
+        .iter()
+        .any(|existing| (point - *existing).length() <= EPS)
+    {
+        return Err("vertex overlaps an existing vertex; click the first handle to close".into());
+    }
+    let Some(last) = vertices.last().copied() else {
+        return Ok(());
+    };
+    for edge in vertices.windows(2).take(vertices.len().saturating_sub(2)) {
+        if segments_intersect_or_touch(edge[0], edge[1], last, point) {
+            return Err("new edge crosses or touches the open polygon path".into());
+        }
+    }
+    Ok(())
 }
 
 pub fn signed_area(vertices: &[Vec2]) -> f64 {
@@ -198,20 +228,26 @@ fn issue(code: &'static str, message: &str, vertex: Option<usize>) -> GeometryIs
     }
 }
 
-fn segments_intersect(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> bool {
-    let ab = b - a;
-    let ac = c - a;
-    let ad = d - a;
-    let cd = d - c;
-    let ca = a - c;
-    let cb = b - c;
-    let o1 = ab.cross(ac);
-    let o2 = ab.cross(ad);
-    let o3 = cd.cross(ca);
-    let o4 = cd.cross(cb);
-    let eps = 1e-12;
-    ((o1 > eps && o2 < -eps) || (o1 < -eps && o2 > eps))
-        && ((o3 > eps && o4 < -eps) || (o3 < -eps && o4 > eps))
+fn segments_intersect_or_touch(a: Vec2, b: Vec2, c: Vec2, d: Vec2) -> bool {
+    const EPS: f64 = 1e-12;
+    let orientation = |p: Vec2, q: Vec2, r: Vec2| (q - p).cross(r - p);
+    let on_segment = |p: Vec2, q: Vec2, r: Vec2| {
+        orientation(p, q, r).abs() <= EPS
+            && r.x >= p.x.min(q.x) - EPS
+            && r.x <= p.x.max(q.x) + EPS
+            && r.y >= p.y.min(q.y) - EPS
+            && r.y <= p.y.max(q.y) + EPS
+    };
+    let o1 = orientation(a, b, c);
+    let o2 = orientation(a, b, d);
+    let o3 = orientation(c, d, a);
+    let o4 = orientation(c, d, b);
+    ((o1 > EPS && o2 < -EPS) || (o1 < -EPS && o2 > EPS))
+        && ((o3 > EPS && o4 < -EPS) || (o3 < -EPS && o4 > EPS))
+        || on_segment(a, b, c)
+        || on_segment(a, b, d)
+        || on_segment(c, d, a)
+        || on_segment(c, d, b)
 }
 
 #[cfg(test)]

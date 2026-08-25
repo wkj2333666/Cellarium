@@ -297,6 +297,7 @@ struct KittySharedState {
     ready: Option<(u64, KittySharedFrame)>,
     displayed_id: Option<u32>,
     retained: VecDeque<KittySharedFrame>,
+    pending_deletes: VecDeque<(u32, u32)>,
     failed: bool,
     next_image_id: u32,
 }
@@ -320,6 +321,7 @@ impl KittySharedDisplay {
             ready: None,
             displayed_id: None,
             retained: VecDeque::new(),
+            pending_deletes: VecDeque::new(),
             failed: false,
             next_image_id: rand::random::<u32>().max(1),
         }));
@@ -385,6 +387,8 @@ impl KittySharedDisplay {
         if let Ok(mut state) = self.state.lock() {
             state.ready = None;
             state.displayed_id = None;
+            state.retained.clear();
+            state.pending_deletes.clear();
         }
         if let Ok(mut request) = self.last_graphics_request.lock() {
             *request = None;
@@ -409,9 +413,26 @@ impl KittySharedDisplay {
                 fresh: false,
             };
         };
+        let consumed = state
+            .retained
+            .iter()
+            .filter(|shared| shared.was_consumed_by_terminal())
+            .map(|shared| shared.image_id)
+            .collect::<Vec<_>>();
         state
             .retained
-            .retain(|shared| !shared.was_consumed_by_terminal());
+            .retain(|shared| !consumed.contains(&shared.image_id));
+        let mut cleanup_command = String::new();
+        state
+            .pending_deletes
+            .retain(|(replacement_id, previous_id)| {
+                if consumed.contains(replacement_id) {
+                    cleanup_command.push_str(&kitty_delete_image_command(*previous_id));
+                    false
+                } else {
+                    true
+                }
+            });
         if state
             .retained
             .front()
@@ -422,12 +443,17 @@ impl KittySharedDisplay {
             state.retained.clear();
         }
         if state.failed {
-            if let Some(image_id) = state.displayed_id.take() {
-                let command = kitty_delete_image_command(image_id);
+            if state.displayed_id.is_some() || !state.pending_deletes.is_empty() {
+                if let Some(image_id) = state.displayed_id.take() {
+                    cleanup_command.push_str(&kitty_delete_image_command(image_id));
+                }
+                for (_, image_id) in state.pending_deletes.drain(..) {
+                    cleanup_command.push_str(&kitty_delete_image_command(image_id));
+                }
                 drop(state);
                 frame.render_widget(
                     GraphicsCommandWidget {
-                        command: Some(&command),
+                        command: Some(&cleanup_command),
                         skip_area: true,
                     },
                     area,
@@ -452,7 +478,7 @@ impl KittySharedDisplay {
         let Some((ready_epoch, shared)) = state.ready.take() else {
             frame.render_widget(
                 GraphicsCommandWidget {
-                    command: None,
+                    command: (!cleanup_command.is_empty()).then_some(cleanup_command.as_str()),
                     skip_area: true,
                 },
                 area,
@@ -469,9 +495,10 @@ impl KittySharedDisplay {
             };
         }
         let image_id = shared.image_id;
-        let mut command = shared.command.clone();
+        let mut command = cleanup_command;
+        command.push_str(&shared.command);
         if let Some(previous_id) = state.displayed_id {
-            command.push_str(&kitty_delete_image_command(previous_id));
+            state.pending_deletes.push_back((image_id, previous_id));
         }
         frame.render_widget(
             GraphicsCommandWidget {
@@ -1422,7 +1449,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn shared_display_deletes_the_image_displayed_at_presentation_time() {
+    fn shared_display_keeps_previous_image_until_terminal_consumes_replacement() {
         let display = KittySharedDisplay::new((8, 16));
         let pixels = [1_u8, 2, 3, 255];
         let ready = KittySharedFrame::new(&pixels, 1, 1, 1, 1, 41).unwrap();
@@ -1443,8 +1470,22 @@ mod tests {
         let symbol = terminal.backend().buffer().cell((0, 0)).unwrap().symbol();
         assert!(symbol.contains("a=T"));
         assert!(symbol.contains("i=41"));
-        assert!(symbol.contains("a=d,d=I,i=99"));
+        assert!(
+            !symbol.contains("a=d,d=I,i=99"),
+            "the previous placement must remain visible while Kitty is still opening the replacement shared memory"
+        );
         assert_eq!(display.state.lock().unwrap().displayed_id, Some(41));
+
+        let retained_name = display.state.lock().unwrap().retained[0].name.clone();
+        assert_eq!(unsafe { libc::shm_unlink(retained_name.as_ptr()) }, 0);
+        terminal
+            .draw(|frame| {
+                display.render(frame, ratatui::layout::Rect::new(0, 0, 1, 1));
+            })
+            .unwrap();
+
+        let symbol = terminal.backend().buffer().cell((0, 0)).unwrap().symbol();
+        assert!(symbol.contains("a=d,d=I,i=99"));
     }
 
     #[cfg(unix)]

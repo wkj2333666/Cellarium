@@ -12,7 +12,11 @@ pub mod tiling_editor;
 
 pub use channel_editor::{ChannelView, add_channel, resolved_color};
 pub use command::DraftCommand;
-pub use experiment_editor::{DraftEnvelope, decode_draft, encode_draft, export_draft, load_draft};
+pub use experiment_editor::{
+    DraftEnvelope, WORKSPACE_FORMAT_VERSION, WorkspaceEnvelope, WorkspacePaths, decode_draft,
+    default_workspace_paths, encode_draft, export_draft, load_draft, load_workspace,
+    save_workspace,
+};
 pub use growth_editor::{GrowthEditorState, GrowthPlot};
 pub use history::{History, HistoryError};
 pub use state::{AppMode, DraftStatus, WorkbenchFocus, WorkbenchSection, WorkbenchState};

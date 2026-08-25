@@ -101,14 +101,58 @@ pub struct App {
     workbench_graphics_surface: GraphicsSurface,
     workbench_scene_transform: Option<SceneTransform>,
     workbench_transform_generation: u64,
+    workbench_placement_generation: u64,
     workbench_draft_scene_generation: u64,
     workbench_frame_generation: u64,
+    workspace_persistence: Option<WorkspacePersistence>,
+}
+
+struct WorkspacePersistence {
+    paths: crate::workbench::WorkspacePaths,
+    last_saved_draft: Option<ExperimentSpec>,
+    last_save_attempt: Instant,
+    restored_pending_remote_rebase: bool,
 }
 
 fn graphics_pointer_hit_radius(frame_size: [usize; 2], viewport: Rect) -> i32 {
     let cell_width = frame_size[0] as f64 / f64::from(viewport.width.max(1));
     let cell_height = frame_size[1] as f64 / f64::from(viewport.height.max(1));
     (((cell_width * 0.5).hypot(cell_height * 0.5)).ceil() as i32 + 3).clamp(12, 32)
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct GraphicsPointerCell {
+    center: [u32; 2],
+    bounds: [u32; 4],
+}
+
+fn graphics_pointer_cell(
+    frame_size: [usize; 2],
+    viewport: Rect,
+    column: u16,
+    row: u16,
+) -> GraphicsPointerCell {
+    let frame_width = frame_size[0].max(1) as u64;
+    let frame_height = frame_size[1].max(1) as u64;
+    let columns = u64::from(viewport.width.max(1));
+    let rows = u64::from(viewport.height.max(1));
+    let column = u64::from(column.min(viewport.width.saturating_sub(1)));
+    let row = u64::from(row.min(viewport.height.saturating_sub(1)));
+    let left = column * frame_width / columns;
+    let top = row * frame_height / rows;
+    let right = ((column + 1) * frame_width / columns)
+        .max(left + 1)
+        .min(frame_width);
+    let bottom = ((row + 1) * frame_height / rows)
+        .max(top + 1)
+        .min(frame_height);
+    GraphicsPointerCell {
+        center: [
+            ((left + right - 1) / 2) as u32,
+            ((top + bottom - 1) / 2) as u32,
+        ],
+        bounds: [left as u32, top as u32, right as u32, bottom as u32],
+    }
 }
 
 impl App {
@@ -174,8 +218,10 @@ impl App {
             workbench_graphics_surface: GraphicsSurface::new(),
             workbench_scene_transform: None,
             workbench_transform_generation: 0,
+            workbench_placement_generation: 0,
             workbench_draft_scene_generation: 0,
             workbench_frame_generation: 0,
+            workspace_persistence: None,
         }
     }
 
@@ -194,6 +240,90 @@ impl App {
     }
     pub fn workbench_notice(&self) -> Option<&str> {
         self.workbench_notice.as_deref()
+    }
+    fn enable_default_workspace(&mut self) -> Result<(), String> {
+        self.enable_workspace(crate::workbench::default_workspace_paths()?)
+    }
+    fn enable_workspace(&mut self, paths: crate::workbench::WorkspacePaths) -> Result<(), String> {
+        let restored = if paths.workbench.exists() {
+            Some(crate::workbench::load_workspace(&paths.workbench)?)
+        } else {
+            None
+        };
+        if let Some(workspace) = &restored {
+            self.workbench
+                .import_draft(workspace.draft.clone())
+                .map_err(|error| error.to_string())?;
+            // A restored design is intentionally rebased onto the runtime we
+            // just connected to.  A stale revision from a previous server
+            // process must not make a portable local design impossible to run.
+            self.workbench_base_revision = self.experiment_revision;
+            self.workbench_notice = Some(format!(
+                "restored workspace from {}",
+                paths.workbench.display()
+            ));
+        }
+        let restored_pending_remote_rebase = restored.is_some();
+        self.workspace_persistence = Some(WorkspacePersistence {
+            paths,
+            last_saved_draft: restored.map(|workspace| workspace.draft),
+            last_save_attempt: Instant::now(),
+            restored_pending_remote_rebase,
+        });
+        Ok(())
+    }
+    fn save_default_workspace_now(
+        &mut self,
+        save_runnable_experiment: bool,
+    ) -> Result<crate::workbench::WorkspacePaths, String> {
+        let paths = self
+            .workspace_persistence
+            .as_ref()
+            .map(|persistence| persistence.paths.clone())
+            .ok_or_else(|| "default workspace persistence is not enabled".to_string())?;
+        let draft = self.workbench.draft().clone();
+        let workspace = crate::workbench::WorkspaceEnvelope {
+            format_version: crate::workbench::WORKSPACE_FORMAT_VERSION,
+            active_revision: self.experiment_revision,
+            base_revision: self.workbench_base_revision,
+            active: self.workbench.authoritative().clone(),
+            draft: draft.clone(),
+        };
+        crate::workbench::save_workspace(&paths.workbench, &workspace)?;
+        if save_runnable_experiment {
+            if let Some(parent) = paths.experiment.parent() {
+                std::fs::create_dir_all(parent).map_err(|error| error.to_string())?;
+            }
+            crate::sim::experiment::save_experiment_model(
+                &paths.experiment,
+                self.workbench.authoritative(),
+            )
+            .map_err(|error| error.to_string())?;
+        }
+        if let Some(persistence) = self.workspace_persistence.as_mut() {
+            persistence.last_saved_draft = Some(draft);
+            persistence.last_save_attempt = Instant::now();
+        }
+        Ok(paths)
+    }
+    fn autosave_workspace_if_due(&mut self, now: Instant) {
+        let should_save = self
+            .workspace_persistence
+            .as_ref()
+            .is_some_and(|persistence| {
+                now.saturating_duration_since(persistence.last_save_attempt)
+                    >= Duration::from_millis(500)
+                    && persistence.last_saved_draft.as_ref() != Some(self.workbench.draft())
+            });
+        if !should_save {
+            return;
+        }
+        if let Some(persistence) = self.workspace_persistence.as_mut() {
+            persistence.last_save_attempt = now;
+        }
+        if let Err(error) = self.save_default_workspace_now(false) {
+            self.workbench_notice = Some(format!("workspace autosave failed: {error}"));
+        }
     }
     pub fn enter_workbench(&mut self) {
         if self.mode != AppMode::Workbench {
@@ -229,11 +359,13 @@ impl App {
             [f64::from(center[0]), f64::from(center[1])],
             f64::from(self.camera.zoom()),
         );
-        let changed = self.workbench_scene_transform.is_none_or(|transform| {
-            transform.terminal_rect != terminal_rect
-                || transform.pixel_size != pixel_size
-                || transform.camera != camera
+        let placement_changed = self.workbench_scene_transform.is_none_or(|transform| {
+            transform.terminal_rect != terminal_rect || transform.pixel_size != pixel_size
         });
+        let changed = placement_changed
+            || self
+                .workbench_scene_transform
+                .is_none_or(|transform| transform.camera != camera);
         if changed {
             self.workbench_transform_generation =
                 self.workbench_transform_generation.wrapping_add(1);
@@ -245,12 +377,17 @@ impl App {
             )
             .ok();
         }
+        if placement_changed {
+            self.workbench_placement_generation =
+                self.workbench_placement_generation.wrapping_add(1);
+        }
         let scene = SceneKey {
             section: self.workbench.section(),
             selected_basis: self.workbench.selected_basis(),
             selected_channel: self.workbench.selected_channel(),
             selected_kernel: self.workbench.selected_kernel(),
             display_mode,
+            placement_generation: self.workbench_placement_generation,
             transform_generation: self.workbench_transform_generation,
             draft_scene_generation: self.workbench_draft_scene_generation,
         };
@@ -275,11 +412,28 @@ impl App {
             mouse.kind,
             crossterm::event::MouseEventKind::Drag(crossterm::event::MouseButton::Left)
         );
-        if self.mode != AppMode::Workbench || (!left_down && !left_drag) {
+        if self.mode != AppMode::Workbench {
             return false;
         }
         let layout = crate::tui::workbench::workbench_layout(self.workbench_area);
         let point = ratatui::layout::Position::new(mouse.column, mouse.row);
+        if self.workbench.section() == WorkbenchSection::Growth
+            && layout.inspector.is_some_and(|area| area.contains(point))
+        {
+            let lines = match mouse.kind {
+                crossterm::event::MouseEventKind::ScrollUp => -3,
+                crossterm::event::MouseEventKind::ScrollDown => 3,
+                _ => 0,
+            };
+            if lines != 0 {
+                self.workbench.set_focus(WorkbenchFocus::Inspector);
+                self.workbench.scroll_growth_help(lines);
+                return true;
+            }
+        }
+        if !left_down && !left_drag {
+            return false;
+        }
         if left_down && layout.outline.contains(point) {
             self.workbench.set_focus(WorkbenchFocus::Outline);
             let inner = Rect::new(
@@ -492,10 +646,19 @@ impl App {
             UiCommand::ShapeIncrease => self.workbench.adjust_prototype_sides(1),
             UiCommand::ShapeDecrease => self.workbench.adjust_prototype_sides(-1),
             UiCommand::SaveActive => {
-                let path = Path::new("cellarium-active.ron");
-                crate::sim::experiment::save_experiment_model(path, &self.active_experiment())
-                    .map_err(|error| error.to_string())?;
-                self.workbench_notice = Some(format!("saved active to {}", path.display()));
+                if self.workspace_persistence.is_some() {
+                    let paths = self.save_default_workspace_now(true)?;
+                    self.workbench_notice = Some(format!(
+                        "saved workspace to {} · runnable experiment to {}",
+                        paths.workbench.display(),
+                        paths.experiment.display(),
+                    ));
+                } else {
+                    let path = Path::new("cellarium-active.ron");
+                    crate::sim::experiment::save_experiment_model(path, &self.active_experiment())
+                        .map_err(|error| error.to_string())?;
+                    self.workbench_notice = Some(format!("saved active to {}", path.display()));
+                }
                 Ok(())
             }
             UiCommand::ExportDraft => {
@@ -525,14 +688,30 @@ impl App {
             UiCommand::ApplyDraft => {
                 let request =
                     self.workbench_apply_request(self.experiment_revision.wrapping_add(1));
-                self.submit_draft(request).map(|_| ()).map_err(|rejected| {
-                    rejected
+                match self.submit_draft(request) {
+                    Ok(accepted) => {
+                        self.leave_workbench();
+                        self.workbench_notice = Some(match self.save_default_workspace_now(true) {
+                            Ok(paths) => format!(
+                                "running revision {} · saved {}",
+                                accepted.revision,
+                                paths.experiment.display(),
+                            ),
+                            Err(error) if self.workspace_persistence.is_some() => format!(
+                                "running revision {} · save failed: {error}",
+                                accepted.revision,
+                            ),
+                            Err(_) => format!("running revision {}", accepted.revision),
+                        });
+                        Ok(())
+                    }
+                    Err(rejected) => Err(rejected
                         .diagnostics
                         .into_iter()
                         .map(|d| d.message)
                         .collect::<Vec<_>>()
-                        .join("; ")
-                })
+                        .join("; ")),
+                }
             }
         };
         if result.is_ok() {
@@ -711,6 +890,39 @@ impl App {
                 self.workbench_draft_scene_generation.wrapping_add(1);
             return true;
         }
+        if self.workbench.section() == WorkbenchSection::Growth
+            && !self.workbench.growth_editing()
+            && key.modifiers.is_empty()
+            && key.code == KeyCode::Char('m')
+        {
+            match self.workbench.toggle_selected_growth_mode() {
+                Ok(crate::sim::experiment_model::UpdateMode::GrowthRate) => {
+                    self.workbench_notice = Some(format!(
+                        "Rate mode · next = clamp(self + {} × result, 0, 1)",
+                        self.workbench.draft().simulation_dt,
+                    ));
+                }
+                Ok(crate::sim::experiment_model::UpdateMode::DirectUpdate) => {
+                    self.workbench_notice = Some("Value mode · next = clamp(result, 0, 1)".into());
+                }
+                Err(error) => self.workbench_notice = Some(error.to_string()),
+            }
+            self.workbench_draft_scene_generation =
+                self.workbench_draft_scene_generation.wrapping_add(1);
+            return true;
+        }
+        if self.workbench.section() == WorkbenchSection::Experiment
+            && self.workbench.numeric_editor().is_none()
+            && key.modifiers.is_empty()
+            && key.code == KeyCode::Char('d')
+        {
+            self.workbench.begin_simulation_dt_editor();
+            self.workbench_notice =
+                Some("type simulation dt in (0, 10] · Enter commit · Esc cancel".into());
+            self.workbench_draft_scene_generation =
+                self.workbench_draft_scene_generation.wrapping_add(1);
+            return true;
+        }
         if key.code == KeyCode::Char('0')
             && key.modifiers.is_empty()
             && self.workbench.numeric_editor().is_none()
@@ -738,6 +950,25 @@ impl App {
             return true;
         }
         if self.workbench.section() == WorkbenchSection::Tiling {
+            if key.code == KeyCode::Char('z')
+                && key
+                    .modifiers
+                    .contains(crossterm::event::KeyModifiers::CONTROL)
+                && self.workbench.tiling_tool()
+                    == crate::workbench::tiling_editor::TilingTool::DrawPolygon
+                && !self.workbench.tiling_construction().is_empty()
+            {
+                let removed = self.workbench.tiling_construction().len();
+                self.workbench.pop_tiling_vertex();
+                let remaining = self.workbench.tiling_construction().len();
+                self.workbench_notice = Some(format!(
+                    "removed vertex {removed} · {remaining} {} remains",
+                    if remaining == 1 { "vertex" } else { "vertices" }
+                ));
+                self.workbench_draft_scene_generation =
+                    self.workbench_draft_scene_generation.wrapping_add(1);
+                return true;
+            }
             match key.code {
                 KeyCode::Char('d') => {
                     let next = if self.workbench.tiling_tool()
@@ -775,8 +1006,22 @@ impl App {
                 {
                     match self.workbench.finish_tiling_construction() {
                         Ok(()) => {
-                            self.workbench_notice =
-                                Some("polygon closed; validate seams before Apply".into())
+                            self.workbench_notice = Some(
+                                if self
+                                    .workbench
+                                    .draft()
+                                    .tiling
+                                    .as_ref()
+                                    .is_some_and(|tiling| {
+                                        crate::sim::tiling::validate_coverage(tiling).is_ok()
+                                    })
+                                {
+                                    "polygon closed · unit cell tiles exactly"
+                                } else {
+                                    "polygon closed · unit cell incomplete; add polygons or edit lattice"
+                                }
+                                .into(),
+                            )
                         }
                         Err(error) => self.workbench_notice = Some(error),
                     }
@@ -827,12 +1072,23 @@ impl App {
                     self.workbench_notice = Some("numeric edit cancelled".into());
                 }
                 KeyCode::Enter => {
+                    let simulation_dt = self.workbench.simulation_dt_editing();
                     let Some(editor) = self.workbench.take_numeric_editor() else {
                         return true;
                     };
                     match editor.commit() {
                         Ok(value) => {
-                            if let Some(selection) = self.workbench.periodic_kernel_selection() {
+                            if simulation_dt {
+                                if let Err(error) = self.workbench.set_simulation_dt(value as f32) {
+                                    self.workbench_notice = Some(error.to_string());
+                                } else {
+                                    self.workbench_notice = Some(format!(
+                                        "simulation dt = {value:.6} · Rate uses self + dt × result"
+                                    ));
+                                }
+                            } else if let Some(selection) =
+                                self.workbench.periodic_kernel_selection()
+                            {
                                 if let Err(error) =
                                     self.set_periodic_kernel_value(selection, value as f32)
                                 {
@@ -853,7 +1109,7 @@ impl App {
                         }
                         Err(error) => {
                             self.workbench_notice = Some(format!("invalid number: {error:?}"));
-                            self.workbench.begin_numeric_editor(editor);
+                            self.workbench.restore_numeric_editor(editor, simulation_dt);
                         }
                     }
                 }
@@ -1261,6 +1517,7 @@ impl App {
         self.experiment_model = normalized.clone();
         self.workbench.accept(normalized.clone());
         self.experiment_service = Some(service);
+        self.paused = false;
         self.experiment_revision =
             self.experiment_revision
                 .checked_add(1)
@@ -1278,6 +1535,29 @@ impl App {
             revision: self.experiment_revision,
             normalized_experiment: normalized,
         })
+    }
+
+    fn accept_remote_apply(&mut self, accepted: ApplyAccepted) {
+        self.experiment_revision = accepted.revision;
+        self.workbench_base_revision = accepted.revision;
+        self.experiment_model = accepted.normalized_experiment.clone();
+        self.workbench.accept(accepted.normalized_experiment);
+        self.paused = false;
+        self.leave_workbench();
+        self.workbench_notice = Some(match self.save_default_workspace_now(true) {
+            Ok(paths) => format!(
+                "running revision {} · saved {}",
+                accepted.revision,
+                paths.experiment.display(),
+            ),
+            Err(error) if self.workspace_persistence.is_some() => {
+                format!(
+                    "running revision {} · save failed: {error}",
+                    accepted.revision
+                )
+            }
+            Err(_) => format!("running revision {}", accepted.revision),
+        });
     }
 
     pub fn selected_kernel_name(&self) -> &str {
@@ -1435,6 +1715,25 @@ impl App {
     ) {
         self.experiment_revision = revision;
         self.experiment_model = experiment.clone();
+        let restored_draft = self.workspace_persistence.as_mut().and_then(|persistence| {
+            if !persistence.restored_pending_remote_rebase {
+                return None;
+            }
+            persistence.restored_pending_remote_rebase = false;
+            persistence.last_saved_draft.clone()
+        });
+        if let Some(restored_draft) = restored_draft {
+            // The server is authoritative for the active experiment, but a
+            // locally restored workspace is an explicit user design. Rebase
+            // that draft onto the newly connected server instead of silently
+            // replacing it during the initial ExperimentState handshake.
+            self.workbench.accept(experiment);
+            if let Err(error) = self.workbench.import_draft(restored_draft) {
+                self.workbench_notice = Some(format!("workspace restore failed: {error}"));
+            }
+            self.workbench_base_revision = revision;
+            return;
+        }
         // The initial authoritative model can arrive after the user has
         // already entered Workbench over a latent SSH connection. Never let
         // that late initialization erase a dirty draft or an active editor.
@@ -1931,12 +2230,8 @@ impl App {
                     )
                 })
                 .with_camera(self.workbench.tiling_camera());
-            let px = (u32::from(local.column) * frame_size[0] as u32
-                / u32::from(viewport.width.max(1)))
-            .min(frame_size[0].saturating_sub(1) as u32);
-            let py = (u32::from(local.row) * frame_size[1] as u32
-                / u32::from(viewport.height.max(1)))
-            .min(frame_size[1].saturating_sub(1) as u32);
+            let pointer = graphics_pointer_cell(frame_size, viewport, local.column, local.row);
+            let [px, py] = pointer.center;
             self.workbench.set_tiling_pointer(Some(scene.pixel_to_world(
                 px,
                 py,
@@ -2041,12 +2336,8 @@ impl App {
             let frame_size = self
                 .frame_size
                 .unwrap_or([viewport.width as usize, viewport.height as usize * 2]);
-            let px = (u32::from(local.column) * frame_size[0] as u32
-                / u32::from(viewport.width.max(1)))
-            .min(frame_size[0].saturating_sub(1) as u32);
-            let py = (u32::from(local.row) * frame_size[1] as u32
-                / u32::from(viewport.height.max(1)))
-            .min(frame_size[1].saturating_sub(1) as u32);
+            let pointer = graphics_pointer_cell(frame_size, viewport, local.column, local.row);
+            let [px, py] = pointer.center;
             match self.workbench.section() {
                 crate::workbench::WorkbenchSection::Tiling => {
                     let hit_radius = graphics_pointer_hit_radius(frame_size, viewport);
@@ -2085,7 +2376,25 @@ impl App {
                             let dy = first_y - py as i32;
                             if dx * dx + dy * dy <= hit_radius * hit_radius {
                                 match self.workbench.finish_tiling_construction() {
-                                    Ok(()) => self.workbench_notice = Some("polygon closed".into()),
+                                    Ok(()) => {
+                                        self.workbench_notice = Some(
+                                            if self
+                                                .workbench
+                                                .draft()
+                                                .tiling
+                                                .as_ref()
+                                                .is_some_and(|tiling| {
+                                                    crate::sim::tiling::validate_coverage(tiling)
+                                                        .is_ok()
+                                                })
+                                            {
+                                                "polygon closed · unit cell tiles exactly"
+                                            } else {
+                                                "polygon closed · unit cell incomplete; add polygons or edit lattice"
+                                            }
+                                            .into(),
+                                        )
+                                    }
                                     Err(error) => self.workbench_notice = Some(error),
                                 }
                                 self.workbench_draft_scene_generation =
@@ -2099,11 +2408,15 @@ impl App {
                             frame_size[0] as u32,
                             frame_size[1] as u32,
                         );
-                        self.workbench.push_tiling_vertex(point);
-                        self.workbench_notice = Some(format!(
-                            "vertex {} placed · click first/Enter close",
-                            self.workbench.tiling_construction().len()
-                        ));
+                        self.workbench_notice = Some(
+                            match self.workbench.push_tiling_vertex(point) {
+                                Ok(()) => format!(
+                                    "vertex {} placed · click the highlighted first point or press Enter to close",
+                                    self.workbench.tiling_construction().len()
+                                ),
+                                Err(error) => format!("vertex rejected: {error}"),
+                            },
+                        );
                         self.workbench_draft_scene_generation =
                             self.workbench_draft_scene_generation.wrapping_add(1);
                         return true;
@@ -2251,9 +2564,11 @@ impl App {
                         .with_selected(self.workbench.periodic_kernel_selection());
                         match action {
                             crate::input::MouseAction::Zoom { direction } => {
-                                if let Some(selection) = scene.selection_at_pixel(
-                                    px,
-                                    py,
+                                if let Some(selection) = scene.selection_in_pixel_rect(
+                                    pointer.bounds[0],
+                                    pointer.bounds[1],
+                                    pointer.bounds[2],
+                                    pointer.bounds[3],
                                     frame_size[0] as u32,
                                     frame_size[1] as u32,
                                 ) {
@@ -2321,9 +2636,11 @@ impl App {
                             }
                             _ => {}
                         }
-                        let Some(selection) = scene.selection_at_pixel(
-                            px,
-                            py,
+                        let Some(selection) = scene.selection_in_pixel_rect(
+                            pointer.bounds[0],
+                            pointer.bounds[1],
+                            pointer.bounds[2],
+                            pointer.bounds[3],
                             frame_size[0] as u32,
                             frame_size[1] as u32,
                         ) else {
@@ -2810,7 +3127,11 @@ impl RateMeter {
 pub fn run() -> std::io::Result<()> {
     let spec = SimulationSpec::lenia_orbium();
     let backend = SimulationBackend::cuda_or_cpu(spec.clone(), 256, 256);
-    run_app(App::with_backend(spec, 256, 256, backend))
+    let mut app = App::with_backend(spec, 256, 256, backend);
+    if let Err(error) = app.enable_default_workspace() {
+        app.workbench_notice = Some(format!("workspace restore unavailable: {error}"));
+    }
+    run_app(app)
 }
 
 pub fn run_with_save(path: impl AsRef<Path>) -> std::io::Result<()> {
@@ -3105,7 +3426,10 @@ pub fn run_connect_with_command(host: &str, ssh_command: Option<&str>) -> std::i
         .stdout
         .take()
         .ok_or_else(|| std::io::Error::other("SSH stdout was not piped"))?;
-    let app = App::new(SimulationSpec::lenia_orbium(), 256, 256);
+    let mut app = App::new(SimulationSpec::lenia_orbium(), 256, 256);
+    if let Err(error) = app.enable_default_workspace() {
+        app.workbench_notice = Some(format!("workspace restore unavailable: {error}"));
+    }
     let result = run_local_remote_viewer(app, stdin, stdout);
     if result.is_ok() {
         let _ = child.kill();
@@ -3282,7 +3606,7 @@ where
         crossterm::cursor::Hide
     )?;
     let display = crate::render::display::ViewportDisplay::detect();
-    if display.uses_async_output() {
+    let result = if display.uses_async_output() {
         let redraw_required = Arc::new(AtomicBool::new(false));
         let backend = AsyncTerminalBackend {
             inner: ratatui::backend::CrosstermBackend::new(AsyncTerminalWriter::new()),
@@ -3301,7 +3625,9 @@ where
         let backend = ratatui::backend::CrosstermBackend::new(std::io::stdout());
         let mut terminal = ratatui::Terminal::new(backend)?;
         run_remote_loop(&mut app, &mut terminal, display, writer, snapshot_rx, None)
-    }
+    };
+    let _ = app.save_default_workspace_now(false);
+    result
 }
 
 fn run_remote_loop<B, W>(
@@ -3330,6 +3656,7 @@ where
     let mut last_render = Instant::now() - render_interval;
     let mut last_viewport = None;
     loop {
+        app.autosave_workspace_if_due(Instant::now());
         if let Some(update) = snapshot_rx.take() {
             match update {
                 RemoteUpdate::Snapshot {
@@ -3350,11 +3677,7 @@ where
                     app.apply_remote_experiment_state(revision, experiment);
                 }
                 RemoteUpdate::ApplyAccepted(accepted) => {
-                    app.experiment_revision = accepted.revision;
-                    app.workbench_base_revision = accepted.revision;
-                    app.experiment_model = accepted.normalized_experiment.clone();
-                    app.workbench.accept(accepted.normalized_experiment);
-                    app.workbench_notice = Some(format!("applied revision {}", accepted.revision));
+                    app.accept_remote_apply(accepted);
                     if std::env::var_os("CELLARIUM_E2E_TRACE").is_some() {
                         eprintln!("E2E_APPLY_ACCEPTED");
                     }
@@ -3929,6 +4252,7 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
 
     loop {
         let now = Instant::now();
+        app.autosave_workspace_if_due(now);
         let elapsed = now - last_iteration;
         last_iteration = now;
 
@@ -4009,6 +4333,7 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
             app.handle_command(Command::Step);
         }
         if quit_requested {
+            let _ = app.save_default_workspace_now(false);
             if let Some(path) = save_path {
                 app.save_experiment(path).map_err(std::io::Error::other)?;
             }
@@ -4016,6 +4341,7 @@ fn run_loop<B: ratatui::backend::Backend<Error = std::io::Error>>(
         }
 
         if input_seen {
+            app.autosave_workspace_if_due(Instant::now());
             // Avoid blocking on a large synchronous terminal diff while a
             // drag/key burst is still arriving. The next iteration drains
             // more input before the next presentation.
@@ -4377,6 +4703,78 @@ mod tests {
                 .iter()
                 .any(|diagnostic| diagnostic.code == "revision_conflict")
         );
+    }
+
+    #[test]
+    fn successful_apply_is_apply_and_run_not_apply_and_stay_paused() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 2, 2);
+        app.paused = true;
+        app.enter_workbench();
+
+        app.handle_workbench_ui(UiCommand::ApplyDraft).unwrap();
+
+        assert_eq!(app.mode(), AppMode::Simulation);
+        assert!(!app.paused());
+        assert_eq!(app.active_revision(), 1);
+        assert_eq!(app.workbench_notice(), Some("running revision 1"));
+    }
+
+    #[test]
+    fn remote_apply_acceptance_switches_to_simulation_only_after_ack() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 2, 2);
+        app.enter_workbench();
+        let normalized = app.workbench().draft().clone();
+
+        app.accept_remote_apply(crate::sim::service::ApplyAccepted {
+            request_id: 7,
+            revision: 3,
+            normalized_experiment: normalized,
+        });
+
+        assert_eq!(app.mode(), AppMode::Simulation);
+        assert_eq!(app.active_revision(), 3);
+        assert_eq!(app.workbench_notice(), Some("running revision 3"));
+    }
+
+    #[test]
+    fn default_workspace_autosaves_restores_and_writes_a_runnable_experiment() {
+        let directory = std::env::temp_dir().join(format!(
+            "cellarium-app-workspace-{}-{}",
+            std::process::id(),
+            std::thread::current().name().unwrap_or("test")
+        ));
+        let paths = crate::workbench::WorkspacePaths::in_directory(&directory);
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 4, 4);
+        app.enable_workspace(paths.clone()).unwrap();
+        app.enter_workbench();
+        app.workbench_mut().add_channel().unwrap();
+
+        app.autosave_workspace_if_due(Instant::now() + Duration::from_secs(1));
+
+        let saved = crate::workbench::load_workspace(&paths.workbench).unwrap();
+        assert_eq!(saved.draft.channels.len(), 2);
+        let mut restored = App::new(SimulationSpec::lenia_orbium(), 4, 4);
+        restored.enable_workspace(paths.clone()).unwrap();
+        assert_eq!(restored.workbench().draft().channels.len(), 2);
+
+        let restored_dt = restored.workbench().draft().simulation_dt;
+        let remote_authoritative = ExperimentSpec::single_channel_lenia(4, 4);
+        restored.apply_remote_experiment_state(9, remote_authoritative.clone());
+        assert_eq!(restored.workbench().draft().simulation_dt, restored_dt);
+        assert_eq!(
+            restored.workbench().draft().channels.len(),
+            2,
+            "the first remote ExperimentState must not erase a restored local draft"
+        );
+        assert_eq!(restored.workbench().authoritative(), &remote_authoritative);
+        assert_eq!(restored.workbench_base_revision, 9);
+
+        restored.enter_workbench();
+        restored.handle_workbench_ui(UiCommand::ApplyDraft).unwrap();
+        let runnable = crate::sim::experiment::load_experiment_model(&paths.experiment).unwrap();
+        assert_eq!(runnable.channels.len(), 2);
+        assert_eq!(restored.mode(), AppMode::Simulation);
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -4908,7 +5306,8 @@ mod tests {
             .select_section(crate::workbench::WorkbenchSection::Tiling);
         app.workbench_mut().begin_new_basis_polygon();
         app.workbench_mut()
-            .push_tiling_vertex(crate::sim::tiling::Vec2::new(0.0, 0.0));
+            .push_tiling_vertex(crate::sim::tiling::Vec2::new(0.0, 0.0))
+            .unwrap();
         app.set_viewport(ratatui::layout::Rect::new(2, 2, 20, 10), [200, 100]);
         let mut tracker = crate::input::MouseTracker::new();
         let before = app.workbench_draft_scene_generation;
@@ -4923,6 +5322,58 @@ mod tests {
         assert_eq!(app.workbench().tiling_construction().len(), 1);
         assert!(app.workbench().tiling_pointer().is_some());
         assert_ne!(app.workbench_draft_scene_generation, before);
+    }
+
+    #[test]
+    fn ctrl_z_while_drawing_removes_the_last_uncommitted_polygon_vertex() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Tiling);
+        app.workbench_mut().begin_new_basis_polygon();
+        app.workbench_mut()
+            .push_tiling_vertex(crate::sim::tiling::Vec2::new(0.0, 0.0))
+            .unwrap();
+        app.workbench_mut()
+            .push_tiling_vertex(crate::sim::tiling::Vec2::new(1.0, 0.0))
+            .unwrap();
+
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('z'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )));
+        assert_eq!(app.workbench().tiling_construction().len(), 1);
+        assert_eq!(
+            app.workbench_notice(),
+            Some("removed vertex 2 · 1 vertex remains")
+        );
+    }
+
+    #[test]
+    fn enter_closes_a_valid_partial_unit_cell_and_explains_its_status() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Tiling);
+        app.workbench_mut().begin_new_basis_polygon();
+        for point in [
+            crate::sim::tiling::Vec2::new(0.0, 0.0),
+            crate::sim::tiling::Vec2::new(2.0, 0.0),
+            crate::sim::tiling::Vec2::new(0.0, 1.0),
+        ] {
+            app.workbench_mut().push_tiling_vertex(point).unwrap();
+        }
+
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+
+        assert!(app.workbench().tiling_construction().is_empty());
+        assert_eq!(
+            app.workbench_notice(),
+            Some("polygon closed · unit cell incomplete; add polygons or edit lattice")
+        );
     }
 
     #[test]
@@ -5230,6 +5681,92 @@ mod tests {
         assert!(!app.workbench().growth_editor().diagnostics().is_empty());
         assert_eq!(app.workbench().growth_editor().plot().data, valid);
         assert!(app.workbench().growth_editor().plot().stale);
+    }
+
+    #[test]
+    fn growth_mode_key_switches_rate_to_value_and_updates_the_signature() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Growth);
+        assert!(
+            app.workbench()
+                .growth_editor()
+                .signature()
+                .ends_with("-> Rate")
+        );
+
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('m'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+
+        assert_eq!(
+            app.workbench().selected_growth_mode(),
+            Some(crate::sim::experiment_model::UpdateMode::DirectUpdate),
+        );
+        assert!(
+            app.workbench()
+                .growth_editor()
+                .signature()
+                .ends_with("-> Value")
+        );
+        assert!(
+            app.workbench_notice()
+                .is_some_and(|notice| notice.contains("next = clamp(result, 0, 1)"))
+        );
+    }
+
+    #[test]
+    fn growth_help_scroll_wheel_is_consumed_only_inside_the_inspector() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Growth);
+        app.set_workbench_area(Rect::new(0, 0, 160, 40));
+        let before = app.workbench().growth_help_scroll();
+        let event = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollDown,
+            column: 150,
+            row: 10,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        assert!(app.handle_workbench_panel_mouse(event));
+        assert_eq!(app.workbench().growth_help_scroll(), before + 3);
+        assert_eq!(
+            app.workbench().status(),
+            crate::workbench::DraftStatus::Clean
+        );
+    }
+
+    #[test]
+    fn experiment_dt_editor_accepts_an_exact_positive_value() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Experiment);
+
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('d'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )));
+        for character in "0.025".chars() {
+            assert!(app.handle_workbench_editor_key(KeyEvent::new(
+                KeyCode::Char(character),
+                crossterm::event::KeyModifiers::NONE,
+            )));
+        }
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+
+        assert_eq!(app.workbench().draft().simulation_dt, 0.025);
     }
 
     #[test]

@@ -508,32 +508,37 @@ fn c_s_pty_user_journey_survives_repeated_keyboard_and_mouse_operations() {
     // The editor entry must be discoverable and must not require a mouse
     // click on the side panel: this is the same key a user sees in the
     // footer/help text.
+    let workbench_checkpoint = output.len();
     assert_eq!(unsafe { libc::write(master, b"w".as_ptr().cast(), 1) }, 1);
     assert!(pump_until(
         &mut child,
         master,
         &mut output,
         Instant::now() + Duration::from_secs(2),
-        |output| contains(output, b"Workbench") && contains(output, b"World")
+        |output| {
+            let fresh = &output[workbench_checkpoint.min(output.len())..];
+            contains(fresh, b"Workbench") && contains(fresh, b"Ctrl+Enter")
+        }
     ));
     assert!(
         contains(&output, b"a=d,d=A,q=1"),
         "entering Workbench must delete the previous Kitty image placement"
     );
 
-    // User-level Workbench journey: clicking the left outline must select a
-    // section, clicking the canvas must edit the draft, and keyboard section
-    // navigation must remain available after mouse interaction.
-    let experiment_click = b"\x1b[<0;8;7M";
+    // The full X11 agentic journey covers outline hit-testing with the real
+    // terminal's mouse encoder. This synthetic PTY journey keeps its scope on
+    // input-loop resilience: select Experiment through the documented key,
+    // then exercise repeated real SGR mouse gestures on the canvas.
+    let experiment_keys = b"ttttt";
     assert_eq!(
         unsafe {
             libc::write(
                 master,
-                experiment_click.as_ptr().cast(),
-                experiment_click.len(),
+                experiment_keys.as_ptr().cast(),
+                experiment_keys.len(),
             )
         },
-        experiment_click.len() as isize
+        experiment_keys.len() as isize
     );
     assert!(
         pump_until(
@@ -541,9 +546,9 @@ fn c_s_pty_user_journey_survives_repeated_keyboard_and_mouse_operations() {
             master,
             &mut output,
             Instant::now() + Duration::from_secs(5),
-            |output| contains(output, b"selected Experiment")
+            |output| contains(output, b"E2E_WORKBENCH_SECTION=Experiment")
         ),
-        "Workbench click did not select Experiment; tail={:?}",
+        "Workbench keys did not select Experiment; tail={:?}",
         String::from_utf8_lossy(&output[output.len().saturating_sub(1200)..])
     );
     assert_eq!(unsafe { libc::write(master, b"t".as_ptr().cast(), 1) }, 1);

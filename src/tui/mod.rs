@@ -36,11 +36,11 @@ fn workbench_footer_text(width: usize) -> String {
         &[
             "[W] simulate",
             "[?] help",
-            "[Ctrl+Enter] Apply",
+            "[Ctrl+Enter] Apply & Run",
             "[Click/T] section",
             "[Tab] focus",
             "[Ctrl+Z/Y] undo/redo",
-            "[Ctrl+S/E/O] files",
+            "[Ctrl+S] save",
         ],
     )
 }
@@ -816,7 +816,7 @@ mod tests {
         let segments = [
             "[界面/T] section",
             "[Tab] focus",
-            "[Ctrl+Enter] Apply",
+            "[Ctrl+Enter] Apply & Run",
             "[?] help",
         ];
         for width in 20..=240 {
@@ -844,7 +844,7 @@ mod tests {
         let footer = workbench_footer_text(90);
         assert!(footer.contains("[W] simulate"));
         assert!(footer.contains("[?] help"));
-        assert!(footer.contains("[Ctrl+Enter] Apply"));
+        assert!(footer.contains("[Ctrl+Enter] Apply & Run"));
         assert!(UnicodeWidthStr::width(footer.as_str()) <= 90);
     }
     use crate::sim::rule::SimulationSpec;

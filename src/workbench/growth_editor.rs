@@ -1,4 +1,5 @@
 use super::TextBuffer;
+use crate::sim::experiment_model::UpdateMode;
 use crate::sim::growth::{
     plot::{HeatmapData, PinnedInputs, PlotData, PlotRequest, sample_plot},
     typecheck::compile,
@@ -21,6 +22,7 @@ pub struct GrowthEditorState {
     plot: GrowthPlot,
     generation: u64,
     signature: String,
+    mode: UpdateMode,
 }
 impl GrowthEditorState {
     pub fn new(
@@ -37,6 +39,7 @@ impl GrowthEditorState {
             plot: GrowthPlot::default(),
             generation: 0,
             signature: signature.into(),
+            mode: UpdateMode::GrowthRate,
         };
         editor.refresh_now();
         editor
@@ -57,13 +60,24 @@ impl GrowthEditorState {
     pub fn signature(&self) -> &str {
         &self.signature
     }
+    pub fn mode(&self) -> UpdateMode {
+        self.mode
+    }
+    pub fn with_mode(mut self, mode: UpdateMode) -> Self {
+        self.mode = mode;
+        self
+    }
     pub fn plot_caption(&self) -> String {
+        let result = match self.mode {
+            UpdateMode::GrowthRate => "rate",
+            UpdateMode::DirectUpdate => "value",
+        };
         match self.symbols.kernel_inputs.as_slice() {
             [x, y, ..] => {
-                format!("plot · x={x} [0,1] · y={y} [0,1] · color=rate")
+                format!("plot · x={x} [0,1] · y={y} [0,1] · color={result}")
             }
-            [x] => format!("plot · x={x} [0,1] · y=rate"),
-            [] => "plot · x=self [0,1] · y=rate".into(),
+            [x] => format!("plot · x={x} [0,1] · y={result}"),
+            [] => format!("plot · x=self [0,1] · y={result}"),
         }
     }
     pub fn replace_source(&mut self, source: impl Into<String>) {
@@ -175,9 +189,17 @@ pub fn editor_for_basis(
         .map(|rule| rule.growth.source.as_str())
         .or_else(|| legacy.map(|growth| growth.source.as_str()))
         .unwrap_or("self");
+    let mode = normalized
+        .map(|rule| rule.growth.mode)
+        .or_else(|| legacy.map(|growth| growth.mode))
+        .unwrap_or(UpdateMode::DirectUpdate);
     let mut arguments = vec!["self: Scalar".to_string()];
     arguments.extend(inputs.iter().map(|symbol| format!("{symbol}: Scalar")));
-    let signature = format!("fn growth({}) -> Rate", arguments.join(", "));
+    let result = match mode {
+        UpdateMode::GrowthRate => "Rate",
+        UpdateMode::DirectUpdate => "Value",
+    };
+    let signature = format!("fn growth({}) -> {result}", arguments.join(", "));
     GrowthEditorState::new(
         source,
         ExternalSymbols {
@@ -187,6 +209,7 @@ pub fn editor_for_basis(
         parameters,
         signature,
     )
+    .with_mode(mode)
 }
 
 #[cfg(test)]

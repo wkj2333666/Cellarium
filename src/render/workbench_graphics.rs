@@ -105,19 +105,26 @@ pub struct SceneKey {
     pub selected_channel: crate::sim::experiment_model::ChannelId,
     pub selected_kernel: Option<crate::sim::experiment_model::KernelId>,
     pub display_mode: crate::render::display::DisplayProtocol,
+    pub placement_generation: u64,
     pub transform_generation: u64,
     pub draft_scene_generation: u64,
 }
 
 #[cfg(test)]
 impl SceneKey {
-    fn test(section: u8, transform_generation: u64, draft_scene_generation: u64) -> Self {
+    fn test(
+        section: u8,
+        placement_generation: u64,
+        transform_generation: u64,
+        draft_scene_generation: u64,
+    ) -> Self {
         Self {
             section: crate::workbench::WorkbenchSection::ALL[section as usize],
             selected_basis: crate::sim::tiling::BasisId(0),
             selected_channel: crate::sim::experiment_model::ChannelId(0),
             selected_kernel: None,
             display_mode: crate::render::display::DisplayProtocol::Kitty,
+            placement_generation,
             transform_generation,
             draft_scene_generation,
         }
@@ -182,7 +189,7 @@ impl GraphicsSurface {
                 || previous.selected_channel != scene.selected_channel
                 || previous.selected_kernel != scene.selected_kernel
                 || previous.display_mode != scene.display_mode
-                || previous.transform_generation != scene.transform_generation
+                || previous.placement_generation != scene.placement_generation
         }) {
             PlacementAction::DeleteBeforePresent
         } else {
@@ -361,7 +368,7 @@ mod tests {
     #[test]
     fn content_updates_keep_the_old_placement_until_the_new_frame_is_ready() {
         let mut surface = GraphicsSurface::new();
-        let first = SceneKey::test(1, 10, 5);
+        let first = SceneKey::test(1, 1, 10, 5);
         assert_eq!(surface.transition(first), PlacementAction::Present);
         assert_eq!(surface.present(frame(2, 2, 5)), Ok(PresentResult::Fresh));
         assert_eq!(surface.fresh_presentations(), 1);
@@ -369,7 +376,7 @@ mod tests {
         assert_eq!(surface.present(frame(2, 2, 5)), Ok(PresentResult::Stale));
         assert_eq!(surface.fresh_presentations(), 1);
 
-        let edited = SceneKey::test(1, 10, 6);
+        let edited = SceneKey::test(1, 1, 10, 6);
         assert_eq!(
             surface.transition(edited),
             PlacementAction::Present,
@@ -377,19 +384,28 @@ mod tests {
         );
         assert!(surface.needs_present());
 
-        let different_editor = SceneKey::test(2, 10, 6);
+        let mut other_surface = GraphicsSurface::new();
+        assert_eq!(other_surface.transition(first), PlacementAction::Present);
+        let different_editor = SceneKey::test(2, 1, 10, 6);
         assert_eq!(
-            surface.transition(different_editor),
+            other_surface.transition(different_editor),
             PlacementAction::DeleteBeforePresent,
             "switching editors must not expose an unrelated delayed graphics frame"
         );
 
-        let resized = SceneKey::test(1, 11, 6);
+        let zoomed = SceneKey::test(1, 1, 11, 6);
         assert_eq!(
-            surface.transition(resized),
-            PlacementAction::DeleteBeforePresent
+            surface.transition(zoomed),
+            PlacementAction::Present,
+            "camera changes must keep the old placement until the zoomed frame is ready"
         );
         assert!(surface.needs_present());
+        let resized = SceneKey::test(1, 2, 12, 6);
+        assert_eq!(
+            surface.transition(resized),
+            PlacementAction::DeleteBeforePresent,
+            "a placement geometry change must remove the image at its old terminal rectangle"
+        );
         assert_eq!(surface.leave_scene(), PlacementAction::DeleteOnly);
         assert_eq!(surface.leave_scene(), PlacementAction::Keep);
     }

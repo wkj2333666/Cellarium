@@ -434,19 +434,68 @@ impl PeriodicKernelScene {
             })
     }
 
+    /// Resolve a terminal mouse cell against the pixel-rendered polygons.
+    ///
+    /// Crossterm reports character-cell coordinates, while Kitty renders at
+    /// pixel resolution.  A small or oblique polygon can have its visible
+    /// centroid near one edge of that character cell even though the cell's
+    /// sampled center lies in a neighbor.  Prefer the rendered polygon whose
+    /// centroid lies inside the complete terminal-cell footprint, then fall
+    /// back to the footprint center for larger polygons.
+    pub fn selection_in_pixel_rect(
+        &self,
+        left: u32,
+        top: u32,
+        right: u32,
+        bottom: u32,
+        width: u32,
+        height: u32,
+    ) -> Option<KernelSelection> {
+        let right = right.max(left.saturating_add(1));
+        let bottom = bottom.max(top.saturating_add(1));
+        let center = [
+            (f64::from(left) + f64::from(right.saturating_sub(1))) * 0.5,
+            (f64::from(top) + f64::from(bottom.saturating_sub(1))) * 0.5,
+        ];
+        let cells = self.cells();
+        let transform = self.pixel_transform(width, height, world_bounds_for_cells(&cells));
+        let mut nearest = None;
+        for (selection, polygon, _, _) in cells {
+            let centroid = polygon.iter().fold(Vec2::ZERO, |sum, point| sum + *point)
+                * (1.0 / polygon.len() as f64);
+            let (x, y) = transform.world_to_pixel(centroid);
+            if x < left as i32 || y < top as i32 || x >= right as i32 || y >= bottom as i32 {
+                continue;
+            }
+            let distance = (f64::from(x) - center[0]).powi(2) + (f64::from(y) - center[1]).powi(2);
+            if nearest.is_none_or(|(_, best)| distance < best) {
+                nearest = Some((selection, distance));
+            }
+        }
+        nearest.map(|(selection, _)| selection).or_else(|| {
+            self.selection_at_pixel(
+                center[0].round() as u32,
+                center[1].round() as u32,
+                width,
+                height,
+            )
+        })
+    }
+
     pub fn pixel_for_selection(
         &self,
         selection: KernelSelection,
         width: u32,
         height: u32,
     ) -> Option<(u32, u32)> {
-        let (_, polygon, _, _) = self
-            .cells()
+        let cells = self.cells();
+        let transform = self.pixel_transform(width, height, world_bounds_for_cells(&cells));
+        let (_, polygon, _, _) = cells
             .into_iter()
             .find(|(candidate, _, _, _)| *candidate == selection)?;
         let center = polygon.iter().fold(Vec2::ZERO, |sum, point| sum + *point)
             * (1.0 / polygon.len() as f64);
-        let (x, y) = self.world_to_pixel(center, width, height);
+        let (x, y) = transform.world_to_pixel(center);
         (x >= 0 && y >= 0 && x < width as i32 && y < height as i32).then_some((x as u32, y as u32))
     }
 
@@ -563,11 +612,6 @@ impl PeriodicKernelScene {
             center: self.view_center(bounds),
             scale: self.pixel_scale(width, height, bounds),
         }
-    }
-
-    fn world_to_pixel(&self, point: Vec2, width: u32, height: u32) -> (i32, i32) {
-        self.pixel_transform(width, height, self.world_bounds())
-            .world_to_pixel(point)
     }
 
     fn pixel_to_world(&self, px: u32, py: u32, width: u32, height: u32) -> Vec2 {
@@ -1103,5 +1147,60 @@ mod tests {
             .pixel_for_selection(selection, 720, 540)
             .expect("non-central lattice cell must be reachable");
         assert_eq!(scene.selection_at_pixel(x, y, 720, 540), Some(selection));
+    }
+
+    #[test]
+    fn every_visible_hex_cell_is_reachable_after_terminal_mouse_quantization() {
+        let tiling = build_preset(TilingPreset::RegularHexagon, 1.0);
+        let built = ring_definition(13, 0.5, 0.15).build().unwrap();
+        let definition = PeriodicKernelDefinition {
+            width: built.width,
+            height: built.height,
+            anchor_x: built.anchor_x,
+            anchor_y: built.anchor_y,
+            planes: [(
+                BasisId(0),
+                BasisWeightPlane {
+                    values: built.values,
+                    mask: built.mask,
+                },
+            )]
+            .into(),
+        };
+        let scene = PeriodicKernelScene::new(tiling, definition, BasisId(0));
+        let (frame_width, frame_height) = (1310_u32, 920_u32);
+        let (terminal_width, terminal_height) = (131_u32, 46_u32);
+
+        for oy in -13_i16..=13 {
+            for ox in -13_i16..=13 {
+                let expected = KernelSelection {
+                    offset: [ox, oy],
+                    source_basis: BasisId(0),
+                };
+                let Some((center_x, center_y)) =
+                    scene.pixel_for_selection(expected, frame_width, frame_height)
+                else {
+                    continue;
+                };
+                let terminal_x = center_x * terminal_width / frame_width;
+                let terminal_y = center_y * terminal_height / frame_height;
+                let left = terminal_x * frame_width / terminal_width;
+                let top = terminal_y * frame_height / terminal_height;
+                let right = (terminal_x + 1) * frame_width / terminal_width;
+                let bottom = (terminal_y + 1) * frame_height / terminal_height;
+                assert_eq!(
+                    scene.selection_in_pixel_rect(
+                        left,
+                        top,
+                        right,
+                        bottom,
+                        frame_width,
+                        frame_height,
+                    ),
+                    Some(expected),
+                    "hex offset [{ox},{oy}] is visible at ({center_x},{center_y}) but terminal cell ({terminal_x},{terminal_y}) resolves to a different cell",
+                );
+            }
+        }
     }
 }

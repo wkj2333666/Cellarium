@@ -144,6 +144,31 @@ pub fn infer_translation_lattice(vertices: &[Vec2]) -> Result<(Vec2, Vec2), Stri
     )
 }
 
+/// Give an incomplete, multi-polygon unit cell a stable editable patch until
+/// enough polygons exist to infer or explicitly edit its exact lattice.
+pub fn provisional_translation_lattice(vertices: &[Vec2]) -> (Vec2, Vec2) {
+    let min_x = vertices
+        .iter()
+        .map(|point| point.x)
+        .fold(f64::INFINITY, f64::min);
+    let max_x = vertices
+        .iter()
+        .map(|point| point.x)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let min_y = vertices
+        .iter()
+        .map(|point| point.y)
+        .fold(f64::INFINITY, f64::min);
+    let max_y = vertices
+        .iter()
+        .map(|point| point.y)
+        .fold(f64::NEG_INFINITY, f64::max);
+    (
+        Vec2::new((max_x - min_x).max(1e-6), 0.0),
+        Vec2::new(0.0, (max_y - min_y).max(1e-6)),
+    )
+}
+
 #[derive(Clone, Debug)]
 pub struct TilingScene {
     pub draft: PeriodicTilingDraft,
@@ -595,6 +620,16 @@ impl GraphicsScene for TilingScene {
                     self.world_to_pixel(*point, width, height),
                     4,
                     [255, 245, 190, 255],
+                );
+            }
+            if self.construction.len() >= 3 {
+                draw_disc(
+                    &mut rgba,
+                    width,
+                    height,
+                    self.world_to_pixel(self.construction[0], width, height),
+                    7,
+                    [90, 255, 170, 255],
                 );
             }
             if let Some(pointer) = self.pointer {
