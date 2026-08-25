@@ -65,6 +65,19 @@ fn toolbar_segments(
                 },
                 ToolbarAction::EditorKey(KeyCode::Char('m')),
             ),
+            (
+                match state.kernel_sampling_metric() {
+                    crate::sim::kernel_sampling::KernelSamplingMetric::LatticeAffine => {
+                        "[Q] Metric: Affine"
+                    }
+                    crate::sim::kernel_sampling::KernelSamplingMetric::WorldEuclidean => {
+                        "[Q] Metric: World"
+                    }
+                },
+                ToolbarAction::EditorKey(KeyCode::Char('q')),
+            ),
+            ("[P] Gaussian", ToolbarAction::EditorKey(KeyCode::Char('p'))),
+            ("[G] Sigma", ToolbarAction::EditorKey(KeyCode::Char('g'))),
             ("[A] Add kernel", ToolbarAction::Ui(UiCommand::ContextAdd)),
             ("[Del] Remove", ToolbarAction::Ui(UiCommand::ContextDelete)),
             ("] Kernel", ToolbarAction::Ui(UiCommand::SelectNext)),
@@ -870,6 +883,37 @@ pub fn draw_workbench(
                                         .collect::<Vec<_>>()
                                         .join(", ")
                                 )));
+                                let active_values = definition
+                                    .planes
+                                    .values()
+                                    .flat_map(|plane| {
+                                        plane.values.iter().enumerate().filter_map(
+                                            move |(index, value)| {
+                                                plane
+                                                    .mask
+                                                    .as_ref()
+                                                    .is_none_or(|mask| mask[index])
+                                                    .then_some(*value)
+                                            },
+                                        )
+                                    })
+                                    .collect::<Vec<_>>();
+                                let sum = active_values.iter().copied().sum::<f32>();
+                                let absolute_sum =
+                                    active_values.iter().map(|value| value.abs()).sum::<f32>();
+                                let minimum = active_values
+                                    .iter()
+                                    .copied()
+                                    .reduce(f32::min)
+                                    .unwrap_or(0.0);
+                                let maximum = active_values
+                                    .iter()
+                                    .copied()
+                                    .reduce(f32::max)
+                                    .unwrap_or(0.0);
+                                lines.push(Line::from(format!(
+                                    "raw Σ={sum:.4} · |Σ|={absolute_sum:.4} · min={minimum:.4} · max={maximum:.4}",
+                                )));
                             }
                             crate::sim::ruleset::KernelSpatialDefinition::Raster(definition) => {
                                 lines.push(Line::from(format!(
@@ -919,6 +963,11 @@ pub fn draw_workbench(
                 lines.push(Line::from("A add kernel · Del remove · ] next kernel"));
                 lines.push(Line::from("S source channel · U output channel"));
                 lines.push(Line::from("R resize stencil/anchor"));
+                lines.push(Line::from(format!(
+                    "Q metric {:?} · G sigma {:.6} · P apply Gaussian",
+                    state.kernel_sampling_metric(),
+                    state.kernel_gaussian_sigma(),
+                )));
                 lines.push(Line::from("Channel count: Channels section A/Del"));
                 lines.push(Line::from(format!(
                     "paint value: {:.4}",
@@ -1899,5 +1948,7 @@ mod tests {
                 'm'
             )))
         );
+        assert!(text.contains("[Q] Metric: Affine"));
+        assert!(text.contains("[P] Gaussian"));
     }
 }

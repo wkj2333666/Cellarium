@@ -82,9 +82,12 @@ pub struct WorkbenchState {
     kernel_selection: Option<KernelPoint>,
     periodic_kernel_selection: Option<KernelSelection>,
     kernel_tool: KernelTool,
+    kernel_sampling_metric: crate::sim::kernel_sampling::KernelSamplingMetric,
     kernel_paint_value: f32,
     numeric_editor: Option<NumericEditor>,
     simulation_dt_editing: bool,
+    kernel_sigma_editing: bool,
+    kernel_gaussian_sigma: f64,
     kernel_resize_editor: Option<String>,
     kernel_resize_replace_on_input: bool,
     kernel_resize_confirmed: bool,
@@ -141,9 +144,13 @@ impl WorkbenchState {
             kernel_selection: None,
             periodic_kernel_selection: None,
             kernel_tool: KernelTool::Weights,
+            kernel_sampling_metric:
+                crate::sim::kernel_sampling::KernelSamplingMetric::LatticeAffine,
             kernel_paint_value: 0.05,
             numeric_editor: None,
             simulation_dt_editing: false,
+            kernel_sigma_editing: false,
+            kernel_gaussian_sigma: 1.0,
             kernel_resize_editor: None,
             kernel_resize_replace_on_input: false,
             kernel_resize_confirmed: false,
@@ -246,6 +253,22 @@ impl WorkbenchState {
             KernelTool::Support => KernelTool::Weights,
         };
     }
+    pub fn kernel_sampling_metric(&self) -> crate::sim::kernel_sampling::KernelSamplingMetric {
+        self.kernel_sampling_metric
+    }
+    pub fn cycle_kernel_sampling_metric(
+        &mut self,
+    ) -> crate::sim::kernel_sampling::KernelSamplingMetric {
+        self.kernel_sampling_metric = match self.kernel_sampling_metric {
+            crate::sim::kernel_sampling::KernelSamplingMetric::LatticeAffine => {
+                crate::sim::kernel_sampling::KernelSamplingMetric::WorldEuclidean
+            }
+            crate::sim::kernel_sampling::KernelSamplingMetric::WorldEuclidean => {
+                crate::sim::kernel_sampling::KernelSamplingMetric::LatticeAffine
+            }
+        };
+        self.kernel_sampling_metric
+    }
     pub fn selected_rule_kernel(&self) -> Option<&RuleKernel> {
         let rule_set = self.selected_rule_set?;
         let kernel = self.selected_kernel?;
@@ -346,6 +369,7 @@ impl WorkbenchState {
     pub fn begin_numeric_editor(&mut self, editor: NumericEditor) {
         self.numeric_editor = Some(editor);
         self.simulation_dt_editing = false;
+        self.kernel_sigma_editing = false;
     }
     pub fn begin_simulation_dt_editor(&mut self) {
         self.numeric_editor = Some(NumericEditor::begin(
@@ -354,17 +378,47 @@ impl WorkbenchState {
             0.000_001..=10.0,
         ));
         self.simulation_dt_editing = true;
+        self.kernel_sigma_editing = false;
     }
     pub fn simulation_dt_editing(&self) -> bool {
         self.simulation_dt_editing
     }
+    pub fn begin_kernel_sigma_editor(&mut self) {
+        self.numeric_editor = Some(NumericEditor::begin(
+            "Gaussian sigma",
+            self.kernel_gaussian_sigma,
+            0.000_001..=1_000_000.0,
+        ));
+        self.simulation_dt_editing = false;
+        self.kernel_sigma_editing = true;
+    }
+    pub fn kernel_sigma_editing(&self) -> bool {
+        self.kernel_sigma_editing
+    }
+    pub fn kernel_gaussian_sigma(&self) -> f64 {
+        self.kernel_gaussian_sigma
+    }
+    pub fn set_kernel_gaussian_sigma(&mut self, sigma: f64) -> Result<(), String> {
+        if !sigma.is_finite() || sigma <= 0.0 {
+            return Err("Gaussian sigma must be finite and positive".into());
+        }
+        self.kernel_gaussian_sigma = sigma;
+        Ok(())
+    }
     pub fn take_numeric_editor(&mut self) -> Option<NumericEditor> {
         self.simulation_dt_editing = false;
+        self.kernel_sigma_editing = false;
         self.numeric_editor.take()
     }
-    pub fn restore_numeric_editor(&mut self, editor: NumericEditor, simulation_dt: bool) {
+    pub fn restore_numeric_editor(
+        &mut self,
+        editor: NumericEditor,
+        simulation_dt: bool,
+        kernel_sigma: bool,
+    ) {
         self.numeric_editor = Some(editor);
         self.simulation_dt_editing = simulation_dt;
+        self.kernel_sigma_editing = kernel_sigma;
     }
     pub fn kernel_resize_editor(&self) -> Option<&str> {
         self.kernel_resize_editor.as_deref()
@@ -888,6 +942,7 @@ impl WorkbenchState {
         self.growth_editing = false;
         self.numeric_editor = None;
         self.simulation_dt_editing = false;
+        self.kernel_sigma_editing = false;
         self.cancel_kernel_resize_editor();
         self.cancel_color_editor();
         self.history.clear();
@@ -905,6 +960,7 @@ impl WorkbenchState {
         self.growth_editing = false;
         self.numeric_editor = None;
         self.simulation_dt_editing = false;
+        self.kernel_sigma_editing = false;
         self.cancel_kernel_resize_editor();
         self.cancel_color_editor();
         self.history.clear();
@@ -931,6 +987,7 @@ impl WorkbenchState {
         self.growth_editing = false;
         self.numeric_editor = None;
         self.simulation_dt_editing = false;
+        self.kernel_sigma_editing = false;
         self.cancel_color_editor();
     }
     pub fn focus_next(&mut self) {
@@ -1209,6 +1266,53 @@ impl WorkbenchState {
         self.execute(DraftCommand::ReplaceDraft(Box::new(next)))?;
         self.refresh_rule_selection();
         Ok(report)
+    }
+
+    pub fn generate_selected_periodic_kernel(
+        &mut self,
+        source_basis: BasisId,
+        generation: crate::sim::kernel_sampling::KernelGenerationSpec,
+    ) -> Result<(), HistoryError> {
+        let binding = BindingKey {
+            basis: self.selected_basis,
+            output: self.selected_channel,
+        };
+        let kernel = self
+            .selected_kernel
+            .ok_or_else(|| HistoryError::Edit("selected rule-set has no kernel".to_string()))?;
+        let mut next = self.draft.clone();
+        let tiling = next
+            .tiling
+            .clone()
+            .ok_or_else(|| HistoryError::Edit("periodic kernel needs a tiling".to_string()))?;
+        let rule_set = next
+            .rules
+            .detach(binding)
+            .map_err(|error| HistoryError::Edit(error.to_string()))?;
+        let target = next
+            .rules
+            .get_mut(rule_set)
+            .and_then(|rule| rule.kernels.iter_mut().find(|entry| entry.id == kernel))
+            .ok_or_else(|| HistoryError::Edit("selected rule kernel is missing".to_string()))?;
+        let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) =
+            &mut target.spatial
+        else {
+            return Err(HistoryError::Edit(
+                "selected kernel is not periodic".to_string(),
+            ));
+        };
+        let plane = crate::sim::kernel_sampling::generate_periodic_plane(
+            &tiling,
+            self.selected_basis,
+            source_basis,
+            definition,
+            &generation,
+        )
+        .map_err(HistoryError::Edit)?;
+        definition.planes.insert(source_basis, plane);
+        self.execute(DraftCommand::ReplaceDraft(Box::new(next)))?;
+        self.refresh_rule_selection();
+        Ok(())
     }
 
     pub fn set_channel_view(&mut self, view: ChannelView) {
@@ -2274,6 +2378,49 @@ mod tests {
             state.kernel_tool(),
             crate::workbench::kernel_editor::KernelTool::Weights
         );
+    }
+
+    #[test]
+    fn selected_periodic_kernel_can_apply_a_world_space_gaussian_undoably() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        state.cycle_tiling_preset().unwrap();
+        state.cycle_tiling_preset().unwrap();
+        state.cycle_tiling_preset().unwrap();
+        let before = state.selected_rule_kernel().unwrap().clone();
+
+        state
+            .generate_selected_periodic_kernel(
+                BasisId(0),
+                crate::sim::kernel_sampling::KernelGenerationSpec {
+                    metric: crate::sim::kernel_sampling::KernelSamplingMetric::WorldEuclidean,
+                    profile: crate::sim::kernel_sampling::KernelProfile::Gaussian { sigma: 1.0 },
+                    amplitude: 1.0,
+                    support_radius: None,
+                },
+            )
+            .unwrap();
+
+        let KernelSpatialDefinition::Periodic(definition) =
+            &state.selected_rule_kernel().unwrap().spatial
+        else {
+            panic!("hexagonal preset must use periodic kernels");
+        };
+        let weights = [
+            definition.weight([1, 0], BasisId(0)).unwrap(),
+            definition.weight([0, 1], BasisId(0)).unwrap(),
+            definition.weight([-1, 1], BasisId(0)).unwrap(),
+            definition.weight([-1, 0], BasisId(0)).unwrap(),
+            definition.weight([0, -1], BasisId(0)).unwrap(),
+            definition.weight([1, -1], BasisId(0)).unwrap(),
+        ];
+        assert!(
+            weights
+                .windows(2)
+                .all(|pair| (pair[0] - pair[1]).abs() < 1.0e-6)
+        );
+
+        state.undo().unwrap();
+        assert_eq!(state.selected_rule_kernel(), Some(&before));
     }
 
     #[test]

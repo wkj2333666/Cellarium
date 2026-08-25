@@ -12,6 +12,7 @@ pub mod expression;
 pub mod growth;
 pub mod kernel;
 pub mod kernel_file;
+pub mod kernel_sampling;
 pub mod lattice_file;
 pub mod parser;
 pub mod program;

@@ -1164,6 +1164,81 @@ impl App {
         }
         if self.workbench.section() == WorkbenchSection::Kernels
             && key.modifiers.is_empty()
+            && key.code == KeyCode::Char('q')
+        {
+            let metric = self.workbench.cycle_kernel_sampling_metric();
+            self.workbench_notice = Some(
+                match metric {
+                    crate::sim::kernel_sampling::KernelSamplingMetric::LatticeAffine => {
+                        "preset metric: Lattice/Affine · contours follow lattice coordinates"
+                    }
+                    crate::sim::kernel_sampling::KernelSamplingMetric::WorldEuclidean => {
+                        "preset metric: World/Euclidean · contours preserve rendered shape"
+                    }
+                }
+                .into(),
+            );
+            self.workbench_draft_scene_generation =
+                self.workbench_draft_scene_generation.wrapping_add(1);
+            return true;
+        }
+        if self.workbench.section() == WorkbenchSection::Kernels
+            && key.modifiers.is_empty()
+            && key.code == KeyCode::Char('g')
+        {
+            self.workbench.begin_kernel_sigma_editor();
+            self.workbench_notice = Some("type Gaussian sigma; Enter commit · Esc cancel".into());
+            return true;
+        }
+        if self.workbench.section() == WorkbenchSection::Kernels
+            && key.modifiers.is_empty()
+            && key.code == KeyCode::Char('p')
+        {
+            let source_basis = self
+                .workbench
+                .periodic_kernel_selection()
+                .map(|selection| selection.source_basis)
+                .or_else(|| {
+                    self.workbench.selected_rule_kernel().and_then(|kernel| {
+                        let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) =
+                            &kernel.spatial
+                        else {
+                            return None;
+                        };
+                        definition.planes.keys().next().copied()
+                    })
+                });
+            let result = source_basis
+                .ok_or_else(|| "selected kernel is not periodic".to_string())
+                .and_then(|source_basis| {
+                    self.workbench
+                        .generate_selected_periodic_kernel(
+                            source_basis,
+                            crate::sim::kernel_sampling::KernelGenerationSpec {
+                                metric: self.workbench.kernel_sampling_metric(),
+                                profile: crate::sim::kernel_sampling::KernelProfile::Gaussian {
+                                    sigma: self.workbench.kernel_gaussian_sigma(),
+                                },
+                                amplitude: 1.0,
+                                support_radius: None,
+                            },
+                        )
+                        .map_err(|error| error.to_string())
+                });
+            self.workbench_notice = Some(match result {
+                Ok(()) => format!(
+                    "Gaussian applied · {:?} · sigma {:.6} · raw weights preserved",
+                    self.workbench.kernel_sampling_metric(),
+                    self.workbench.kernel_gaussian_sigma(),
+                ),
+                Err(error) => error,
+            });
+            self.workbench_draft_scene_generation =
+                self.workbench_draft_scene_generation.wrapping_add(1);
+            return true;
+        }
+        if self.workbench.section() == WorkbenchSection::Kernels
+            && key.modifiers.is_empty()
             && matches!(key.code, KeyCode::Char('s') | KeyCode::Char('u'))
         {
             let result = match key.code {
@@ -1203,6 +1278,7 @@ impl App {
                 }
                 KeyCode::Enter => {
                     let simulation_dt = self.workbench.simulation_dt_editing();
+                    let kernel_sigma = self.workbench.kernel_sigma_editing();
                     let Some(editor) = self.workbench.take_numeric_editor() else {
                         return true;
                     };
@@ -1215,6 +1291,14 @@ impl App {
                                     self.workbench_notice = Some(format!(
                                         "simulation dt = {value:.6} · Rate uses self + dt × result"
                                     ));
+                                }
+                            } else if kernel_sigma {
+                                if let Err(error) = self.workbench.set_kernel_gaussian_sigma(value)
+                                {
+                                    self.workbench_notice = Some(error);
+                                } else {
+                                    self.workbench_notice =
+                                        Some(format!("Gaussian sigma = {value:.6}"));
                                 }
                             } else if let Some(selection) =
                                 self.workbench.periodic_kernel_selection()
@@ -1239,7 +1323,11 @@ impl App {
                         }
                         Err(error) => {
                             self.workbench_notice = Some(format!("invalid number: {error:?}"));
-                            self.workbench.restore_numeric_editor(editor, simulation_dt);
+                            self.workbench.restore_numeric_editor(
+                                editor,
+                                simulation_dt,
+                                kernel_sigma,
+                            );
                         }
                     }
                 }
@@ -5748,6 +5836,78 @@ mod tests {
             ),
             (29, 29, 14, 14),
         );
+    }
+
+    #[test]
+    fn kernel_world_metric_and_gaussian_preset_are_user_selectable() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut().cycle_tiling_preset().unwrap();
+        app.workbench_mut().cycle_tiling_preset().unwrap();
+        app.workbench_mut().cycle_tiling_preset().unwrap();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Kernels);
+
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('q'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.workbench().kernel_sampling_metric(),
+            crate::sim::kernel_sampling::KernelSamplingMetric::WorldEuclidean,
+        );
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('p'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+
+        let kernel = app.workbench().selected_rule_kernel().unwrap();
+        let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) = &kernel.spatial
+        else {
+            panic!("hexagonal preset must use periodic kernels");
+        };
+        let weights = [
+            definition
+                .weight([1, 0], crate::sim::tiling::BasisId(0))
+                .unwrap(),
+            definition
+                .weight([0, 1], crate::sim::tiling::BasisId(0))
+                .unwrap(),
+            definition
+                .weight([-1, 1], crate::sim::tiling::BasisId(0))
+                .unwrap(),
+            definition
+                .weight([1, -1], crate::sim::tiling::BasisId(0))
+                .unwrap(),
+        ];
+        assert!(
+            weights
+                .windows(2)
+                .all(|pair| (pair[0] - pair[1]).abs() < 1.0e-6)
+        );
+    }
+
+    #[test]
+    fn gaussian_sigma_has_an_exact_numeric_editor() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Kernels);
+
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('g'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('2'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert_eq!(app.workbench().numeric_editor().unwrap().buffer(), "2");
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert_eq!(app.workbench().kernel_gaussian_sigma(), 2.0);
     }
 
     #[test]
