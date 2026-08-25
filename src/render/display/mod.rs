@@ -448,7 +448,12 @@ impl KittySharedDisplay {
         if self.state.lock().map_or(true, |state| state.failed) {
             return;
         }
-        let epoch = self.epoch.load(Ordering::Acquire);
+        // A scene edit can arrive while the worker is still packing the
+        // previous frame. Give every accepted submission its own epoch so the
+        // worker cannot publish that obsolete frame after the newer edit.
+        // The currently displayed placement stays intact until the new epoch
+        // is ready, which provides flicker-free replacement.
+        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         self.queue.submit((image, size, epoch));
     }
 
@@ -731,7 +736,10 @@ impl PixelDisplay {
     }
 
     fn submit(&self, image: DynamicImage, size: ratatui::layout::Size, cell_size: (u16, u16)) {
-        let epoch = self.epoch.load(Ordering::Acquire);
+        // Encoding is asynchronous. Advancing the epoch per submission makes
+        // an already-running encoder result stale without clearing the image
+        // that is still visible in the terminal.
+        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
         self.queue.submit((image, size, cell_size, epoch));
     }
 
@@ -1149,32 +1157,15 @@ impl ViewportDisplay {
         area: ratatui::layout::Rect,
         framebuffer: &Framebuffer,
     ) -> bool {
-        if let Self::Pixel(pixel) = self {
-            let image = framebuffer_to_dynamic_image(framebuffer);
-            let size = ratatui::layout::Size::new(area.width, area.height);
-            pixel.submit(image, size, pixel.current_cell_size());
-            let status = pixel.render(frame, area);
-            if status.rendered {
-                return status.fresh;
-            }
-        }
-
-        #[cfg(unix)]
-        if let Self::KittyShared(display) = self {
-            let image = framebuffer_to_dynamic_image(framebuffer);
-            let size = ratatui::layout::Size::new(area.width, area.height);
-            display.submit(image, size);
-            let status = display.render(frame, area);
-            if status.rendered {
-                return status.fresh;
-            }
-        }
-
-        frame.render_widget(
-            ratatui::widgets::Paragraph::new(half_block::half_block_lines(framebuffer)),
+        let generation = framebuffer_fingerprint(framebuffer);
+        self.render_graphics_lazy(
+            frame,
             area,
-        );
-        true
+            generation,
+            framebuffer.width() as u32,
+            framebuffer.height() as u32,
+            || framebuffer_to_graphics_frame(framebuffer, generation),
+        )
     }
 
     pub fn render_graphics(
@@ -1183,11 +1174,38 @@ impl ViewportDisplay {
         area: ratatui::layout::Rect,
         graphics: &GraphicsFrame,
     ) -> bool {
+        self.render_graphics_lazy(
+            frame,
+            area,
+            graphics.generation,
+            graphics.width,
+            graphics.height,
+            || graphics.clone(),
+        )
+    }
+
+    /// Poll and present an editor scene while only invoking `rasterize` when
+    /// the pixel protocol actually needs a new generation. Workbench redraws
+    /// can greatly outnumber content edits; eagerly rebuilding a full-screen
+    /// RGBA buffer here would block input even though the request is
+    /// immediately deduplicated by the graphics worker.
+    pub fn render_graphics_lazy<F>(
+        &self,
+        frame: &mut ratatui::Frame,
+        area: ratatui::layout::Rect,
+        generation: u64,
+        width: u32,
+        height: u32,
+        rasterize: F,
+    ) -> bool
+    where
+        F: FnOnce() -> GraphicsFrame,
+    {
         let size = ratatui::layout::Size::new(area.width, area.height);
         let key = GraphicsRequestKey {
-            generation: graphics.generation,
-            width: graphics.width,
-            height: graphics.height,
+            generation,
+            width,
+            height,
             terminal_size: size,
             cell_size: self.current_cell_size().unwrap_or((1, 2)),
         };
@@ -1197,9 +1215,13 @@ impl ViewportDisplay {
             #[cfg(unix)]
             Self::KittyShared(display) => display.should_submit_graphics(key),
         };
+        let mut rasterize = Some(rasterize);
+        let mut graphics = None;
         if submit {
+            let produced = rasterize.take().expect("rasterizer is available")();
+            debug_assert_eq!((produced.width, produced.height), (width, height));
             let image =
-                ImageBuffer::from_raw(graphics.width, graphics.height, graphics.rgba.clone())
+                ImageBuffer::from_raw(produced.width, produced.height, produced.rgba.clone())
                     .map(DynamicImage::ImageRgba8);
             if let Some(image) = image {
                 match self {
@@ -1211,6 +1233,7 @@ impl ViewportDisplay {
                     Self::HalfBlock => {}
                 }
             }
+            graphics = Some(produced);
         }
         match self {
             Self::Pixel(display) => return display.render(frame, area).fresh,
@@ -1223,6 +1246,8 @@ impl ViewportDisplay {
             }
             Self::HalfBlock => {}
         }
+        let graphics =
+            graphics.unwrap_or_else(|| rasterize.take().expect("rasterizer was not consumed")());
         let mut framebuffer = Framebuffer::new(graphics.width as usize, graphics.height as usize);
         for y in 0..graphics.height as usize {
             for x in 0..graphics.width as usize {
@@ -1394,6 +1419,47 @@ pub fn framebuffer_to_dynamic_image(framebuffer: &Framebuffer) -> DynamicImage {
     .into()
 }
 
+pub(crate) fn framebuffer_to_graphics_frame(
+    framebuffer: &Framebuffer,
+    generation: u64,
+) -> GraphicsFrame {
+    let mut rgba = Vec::with_capacity(framebuffer.width() * framebuffer.height() * 4);
+    for y in 0..framebuffer.height() {
+        for x in 0..framebuffer.width() {
+            let pixel = framebuffer.get(x, y);
+            rgba.extend_from_slice(&[pixel.red, pixel.green, pixel.blue, 255]);
+        }
+    }
+    GraphicsFrame {
+        width: framebuffer.width() as u32,
+        height: framebuffer.height() as u32,
+        rgba,
+        generation,
+    }
+}
+
+fn framebuffer_fingerprint(framebuffer: &Framebuffer) -> u64 {
+    // FNV-1a is deterministic, dependency-free, and fast enough to avoid a
+    // much more expensive image encode for unchanged compatibility callers.
+    let mut hash = 0xcbf2_9ce4_8422_2325_u64;
+    for value in [framebuffer.width() as u64, framebuffer.height() as u64] {
+        for byte in value.to_le_bytes() {
+            hash ^= u64::from(byte);
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    for y in 0..framebuffer.height() {
+        for x in 0..framebuffer.width() {
+            let pixel = framebuffer.get(x, y);
+            for byte in [pixel.red, pixel.green, pixel.blue] {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+    }
+    hash
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1473,6 +1539,71 @@ mod tests {
                 ..request
             }
         ));
+    }
+
+    #[test]
+    fn unchanged_pixel_graphics_do_not_rasterize_the_scene_again() {
+        let display = ViewportDisplay::Pixel(PixelDisplay::new(
+            ratatui_image::picker::Picker::halfblocks(),
+        ));
+        let mut terminal =
+            ratatui::Terminal::new(ratatui::backend::TestBackend::new(2, 2)).unwrap();
+        let mut rasterizations = 0_u32;
+
+        terminal
+            .draw(|frame| {
+                display.render_graphics_lazy(frame, frame.area(), 7, 2, 2, || {
+                    rasterizations += 1;
+                    GraphicsFrame::new(2, 2, vec![0; 16], 7).unwrap()
+                });
+            })
+            .unwrap();
+        terminal
+            .draw(|frame| {
+                display.render_graphics_lazy(frame, frame.area(), 7, 2, 2, || {
+                    rasterizations += 1;
+                    GraphicsFrame::new(2, 2, vec![0; 16], 7).unwrap()
+                });
+            })
+            .unwrap();
+
+        assert_eq!(
+            rasterizations, 1,
+            "an unchanged Kitty/Sixel scene must poll presentation without rerasterizing RGBA"
+        );
+    }
+
+    #[test]
+    fn each_pixel_submission_invalidates_an_older_in_flight_frame() {
+        let display = PixelDisplay::new(ratatui_image::picker::Picker::halfblocks());
+        let image = DynamicImage::new_rgba8(2, 2);
+
+        display.submit(image.clone(), ratatui::layout::Size::new(2, 2), (1, 2));
+        let first = display.epoch.load(Ordering::Acquire);
+        display.submit(image, ratatui::layout::Size::new(2, 2), (1, 2));
+        let second = display.epoch.load(Ordering::Acquire);
+
+        assert!(
+            second > first,
+            "a newer scene must cancel an older encoder result"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn each_shared_memory_submission_invalidates_an_older_in_flight_frame() {
+        let display = KittySharedDisplay::new((8, 16));
+        let image = DynamicImage::new_rgba8(2, 2);
+
+        display.submit(image.clone(), ratatui::layout::Size::new(2, 2));
+        let first = display.epoch.load(Ordering::Acquire);
+        display.submit(image, ratatui::layout::Size::new(2, 2));
+        let second = display.epoch.load(Ordering::Acquire);
+
+        assert!(
+            second > first,
+            "a newer scene must cancel an older shm result"
+        );
     }
 
     #[test]

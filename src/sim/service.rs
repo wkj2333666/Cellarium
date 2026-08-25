@@ -343,6 +343,18 @@ impl ExperimentService {
     pub fn step(&mut self) -> Result<(), RuntimeError> {
         self.active.backend.step(&mut self.active.world)
     }
+
+    /// Restore the applied experiment's initial state without discarding its
+    /// basis layout, rules, or revision.
+    pub fn reset(&mut self) -> Result<(), ApplyRejected> {
+        let compiled = compile_or_reject(0, &self.active.spec)?;
+        let world =
+            world_from_spec(&self.active.spec).map_err(|error| reject(0, error.to_string()))?;
+        self.active.world = world;
+        self.active.backend = ExperimentBackend::preferred(compiled);
+        Ok(())
+    }
+
     pub fn tick(&self) -> u64 {
         self.active.backend.tick()
     }

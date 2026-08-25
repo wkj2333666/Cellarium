@@ -112,6 +112,7 @@ pub struct App {
     remote_basis_cells: Option<Vec<f32>>,
     remote_channels: usize,
     applied_input_sequence: u64,
+    simulation_scene_generation: u64,
     snapshot_rate: f64,
     graphics_rate: f64,
     experiment_model: ExperimentSpec,
@@ -232,6 +233,7 @@ impl App {
             remote_basis_cells: None,
             remote_channels: 1,
             applied_input_sequence: 0,
+            simulation_scene_generation: 0,
             snapshot_rate: 0.0,
             graphics_rate: 0.0,
             experiment_model,
@@ -1689,6 +1691,12 @@ impl App {
         self.tick()
             .wrapping_mul(1_000_003)
             .wrapping_add(self.applied_input_sequence)
+            .wrapping_mul(1_000_003)
+            .wrapping_add(self.simulation_scene_generation)
+    }
+
+    fn invalidate_simulation_scene(&mut self) {
+        self.simulation_scene_generation = self.simulation_scene_generation.wrapping_add(1);
     }
 
     pub fn set_remote_transport_rates(&mut self, snapshot: f64, graphics: f64) {
@@ -1752,6 +1760,17 @@ impl App {
     /// Render Channels against the current authoritative state when its layout
     /// matches the draft. Before the first Apply, fall back to the explicitly
     /// labelled initial-state preview without inventing rectangular noise.
+    pub fn workbench_runtime_matches_draft(&self) -> bool {
+        let draft = self.workbench.draft();
+        let basis_ids = draft.basis_ids();
+        let channels = draft.channels.len();
+        self.experiment_service.as_ref().is_some_and(|service| {
+            service.world().bases() == basis_ids.len() && service.world().channels() == channels
+        }) || (self.remote_basis_ids == basis_ids
+            && self.remote_channels == channels
+            && self.remote_basis_cells.is_some())
+    }
+
     pub fn workbench_basis_scene(
         &self,
         view: crate::workbench::ChannelView,
@@ -2028,7 +2047,15 @@ impl App {
                 self.world = World::new(grid.width as usize, grid.height as usize);
                 self.camera = Camera::new([grid.width as f32 / 2.0, grid.height as f32 / 2.0], 1.0);
             }
-            self.world.replace_cells(&first.initial);
+            // The legacy rectangular world has one value per lattice site.
+            // A basis-aware draft stores one value per polygon within each
+            // site, so copying that expanded plane here would panic before the
+            // authoritative ExperimentService can take over rendering and
+            // stepping. Keep the legacy mirror only for genuinely one-basis
+            // initial state.
+            if first.initial.len() == self.world.cells().len() {
+                self.world.replace_cells(&first.initial);
+            }
         }
         self.experiment_model = normalized.clone();
         self.workbench.accept(normalized.clone());
@@ -2046,6 +2073,7 @@ impl App {
                     }],
                 })?;
         self.workbench_base_revision = self.experiment_revision;
+        self.invalidate_simulation_scene();
         Ok(ApplyAccepted {
             request_id,
             revision: self.experiment_revision,
@@ -2489,6 +2517,7 @@ impl App {
                 } else {
                     self.backend = self.recreate_backend();
                 }
+                self.invalidate_simulation_scene();
             }
             Command::Conway => {
                 self.spec = SimulationSpec::conway();
@@ -2702,10 +2731,30 @@ impl App {
     }
 
     fn reset(&mut self) {
-        self.experiment_service = None;
+        if let Some(service) = &mut self.experiment_service {
+            match service.reset() {
+                Ok(()) => {
+                    self.backend_error = None;
+                    self.inspected = None;
+                    self.invalidate_simulation_scene();
+                }
+                Err(rejected) => {
+                    self.backend_error = Some(
+                        rejected
+                            .diagnostics
+                            .into_iter()
+                            .map(|diagnostic| diagnostic.message)
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    );
+                }
+            }
+            return;
+        }
         self.world.randomize(self.seed, initial_density(&self.spec));
         self.backend = self.recreate_backend();
         self.inspected = None;
+        self.invalidate_simulation_scene();
     }
 
     fn recreate_backend(&self) -> SimulationBackend {
@@ -2787,6 +2836,7 @@ impl App {
         {
             *cell = value;
         }
+        self.invalidate_simulation_scene();
     }
 
     pub fn paint_world(&mut self, world: [f32; 2], value: f32) {
@@ -2796,6 +2846,7 @@ impl App {
         if let Some(service) = &mut self.experiment_service {
             service.world_mut().set(0, x, y, value);
         }
+        self.invalidate_simulation_scene();
     }
 
     fn paint_world_segment(&mut self, from: [f32; 2], to: [f32; 2], value: f32) {
@@ -3346,6 +3397,23 @@ impl App {
                         match action {
                             crate::input::MouseAction::Inspect => {
                                 self.workbench.select_periodic_kernel(selection);
+                                if self.workbench.kernel_tool()
+                                    == crate::workbench::kernel_editor::KernelTool::Support
+                                {
+                                    let activated =
+                                        self.set_periodic_kernel_active(selection, true).is_ok();
+                                    self.workbench_notice = Some(if activated {
+                                        format!(
+                                            "activated offset [{},{}] · source basis {} · switch to Weights to set its value",
+                                            selection.offset[0],
+                                            selection.offset[1],
+                                            selection.source_basis.0,
+                                        )
+                                    } else {
+                                        "could not activate the selected support cell".into()
+                                    });
+                                    return activated;
+                                }
                                 self.workbench_notice =
                                     self.periodic_kernel_value(selection).map(|value| {
                                         format!(
@@ -3588,9 +3656,15 @@ impl App {
                 };
                 self.camera
                     .zoom_at(screen, frame_size[0], frame_size[1], factor);
+                if self.mode == AppMode::Simulation {
+                    self.invalidate_simulation_scene();
+                }
             }
             crate::input::MouseAction::Pan { dx, dy } => {
                 self.camera.pan_screen([dx * scale[0], dy * scale[1]]);
+                if self.mode == AppMode::Simulation {
+                    self.invalidate_simulation_scene();
+                }
             }
             crate::input::MouseAction::Inspect => self.inspect_world(world),
             crate::input::MouseAction::Paint | crate::input::MouseAction::Erase => {
@@ -5485,6 +5559,113 @@ mod tests {
     }
 
     #[test]
+    fn apply_and_run_accepts_a_multi_basis_tiling_without_touching_the_legacy_world() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 4, 4);
+        let mut draft = ExperimentSpec::single_channel_lenia(4, 4);
+        draft.tiling = Some(crate::sim::tiling::build_preset(
+            crate::sim::tiling::TilingPreset::EquilateralTriangles,
+            1.0,
+        ));
+        draft.channels[0].initial = vec![0.0; 4 * 4 * 2];
+
+        app.submit_draft(ApplyRequest {
+            request_id: 1,
+            base_revision: 0,
+            draft,
+        })
+        .unwrap();
+
+        let service = app.experiment_service.as_ref().unwrap();
+        assert_eq!(service.world().bases(), 2);
+        assert_eq!(service.world().cells().len(), 4 * 4 * 2);
+        assert!(app.simulation_basis_scene(1).is_some());
+        assert_eq!(app.world.cells().len(), 4 * 4);
+    }
+
+    #[test]
+    fn reset_preserves_the_applied_multi_basis_experiment() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 4, 4);
+        let mut draft = ExperimentSpec::single_channel_lenia(4, 4);
+        draft.tiling = Some(crate::sim::tiling::build_preset(
+            crate::sim::tiling::TilingPreset::EquilateralTriangles,
+            1.0,
+        ));
+        draft.channels[0].initial = vec![0.0; 4 * 4 * 2];
+        draft.channels[0].initial[0] = 0.25;
+        draft.channels[0].initial[1] = 0.75;
+        app.submit_draft(ApplyRequest {
+            request_id: 1,
+            base_revision: 0,
+            draft,
+        })
+        .unwrap();
+        app.experiment_service
+            .as_mut()
+            .unwrap()
+            .world_mut()
+            .set_basis(0, 0, 0, 0, 1.0);
+
+        app.handle_command(Command::Reset);
+
+        let service = app.experiment_service.as_ref().unwrap();
+        assert_eq!(service.world().bases(), 2);
+        assert_eq!(service.world().get_basis(0, 0, 0, 0), 0.25);
+        assert_eq!(service.world().get_basis(0, 0, 0, 1), 0.75);
+        assert_eq!(app.tick(), 0);
+        assert!(app.simulation_basis_scene(2).is_some());
+    }
+
+    #[test]
+    fn paused_basis_paint_invalidates_the_simulation_scene() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 4, 4);
+        let mut draft = ExperimentSpec::single_channel_lenia(4, 4);
+        draft.tiling = Some(crate::sim::tiling::build_preset(
+            crate::sim::tiling::TilingPreset::EquilateralTriangles,
+            1.0,
+        ));
+        draft.channels[0].initial = vec![0.0; 4 * 4 * 2];
+        app.submit_draft(ApplyRequest {
+            request_id: 1,
+            base_revision: 0,
+            draft,
+        })
+        .unwrap();
+        app.paused = true;
+        let before = app.render_generation();
+
+        app.paint_basis_cell(
+            BasisSceneHit {
+                x: 1,
+                y: 1,
+                basis: BasisId(0),
+            },
+            1.0,
+        );
+
+        assert_ne!(app.render_generation(), before);
+    }
+
+    #[test]
+    fn direct_simulation_zoom_invalidates_the_pixel_scene() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 4, 4);
+        app.set_viewport(ratatui::layout::Rect::new(0, 0, 80, 40), [80, 80]);
+        let before = app.render_generation();
+        let mut tracker = crate::input::MouseTracker::new();
+
+        assert!(app.handle_mouse(
+            crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::ScrollUp,
+                column: 40,
+                row: 20,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            },
+            &mut tracker,
+        ));
+
+        assert_ne!(app.render_generation(), before);
+    }
+
+    #[test]
     fn channels_scene_uses_runtime_basis_state_in_true_hex_geometry() {
         let mut app = App::new(SimulationSpec::lenia_orbium(), 4, 4);
         let mut draft = ExperimentSpec::single_channel_lenia(4, 4);
@@ -6395,6 +6576,58 @@ mod tests {
     }
 
     #[test]
+    fn support_tool_primary_click_activates_the_clicked_periodic_cell() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut().cycle_tiling_preset().unwrap();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Kernels);
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('m'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        let selection = crate::workbench::kernel_editor::KernelSelection {
+            offset: [-13, -13],
+            source_basis: crate::sim::tiling::BasisId(0),
+        };
+        let tiling = app.workbench().draft().tiling.clone().unwrap();
+        let definition = match &app.workbench().selected_rule_kernel().unwrap().spatial {
+            crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) => {
+                definition.clone()
+            }
+            _ => panic!("preset did not create a periodic kernel"),
+        };
+        assert_eq!(
+            definition.is_active(selection.offset, selection.source_basis),
+            Some(false),
+        );
+        let scene = crate::workbench::kernel_editor::PeriodicKernelScene::new(
+            tiling,
+            definition,
+            app.workbench().selected_basis(),
+        );
+        let (px, py) = scene
+            .pixel_for_selection(selection, 800, 800)
+            .expect("inactive corner cell is visible");
+        app.set_viewport(Rect::new(0, 0, 100, 100), [800, 800]);
+        let event = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: u16::try_from(px * 100 / 800).unwrap(),
+            row: u16::try_from(py * 100 / 800).unwrap(),
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        assert!(app.handle_mouse(event, &mut crate::input::MouseTracker::new()));
+        let active = match &app.workbench().selected_rule_kernel().unwrap().spatial {
+            crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) => {
+                definition.is_active(selection.offset, selection.source_basis)
+            }
+            _ => None,
+        };
+        assert_eq!(active, Some(true), "Support click must match its UI label");
+    }
+
+    #[test]
     fn kernel_resize_editor_changes_periodic_dimensions_and_anchor_exactly() {
         let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
         app.enter_workbench();
@@ -6843,6 +7076,24 @@ mod tests {
                     blue: 0xCC,
                 }
             )
+        );
+    }
+
+    #[test]
+    fn channel_preview_stops_tracking_runtime_frames_after_draft_layout_changes() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        let request = app.workbench_apply_request(1);
+        app.submit_draft(request).unwrap();
+        app.enter_workbench();
+        assert!(app.workbench_runtime_matches_draft());
+
+        app.workbench_mut().add_channel().unwrap();
+
+        assert!(!app.workbench_runtime_matches_draft());
+        assert!(
+            app.workbench_basis_scene(crate::workbench::ChannelView::Composite, 7)
+                .is_some()
         );
     }
 

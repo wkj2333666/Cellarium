@@ -595,7 +595,11 @@ pub fn draw_workbench(
         }
         WorkbenchSection::World => "Left paint · right erase · middle pan · wheel zoom".into(),
         WorkbenchSection::Channels => {
-            "Add/remove channels · visibility · color · composite view".into()
+            if app.workbench_runtime_matches_draft() {
+                "Preview: running state · add/remove · visibility · color · composite view".into()
+            } else {
+                "Preview: draft initialization · Apply & Run to create live state".into()
+            }
         }
         WorkbenchSection::Experiment => "Review changes; Ctrl+Enter applies explicitly".into(),
     };
@@ -647,14 +651,24 @@ pub fn draw_workbench(
     frame.render_widget(Paragraph::new(header_lines), canvas_header);
     if matches!(state.section(), WorkbenchSection::World) {
         let (width, height) = display.framebuffer_size(graphics_area);
-        let mut graphics = app
-            .workbench_initial_basis_scene(state.channel_view(), scene_generation)
-            .map(|scene| scene.render_frame(width as u32, height as u32))
-            .unwrap_or_else(|| {
-                initial_field_graphics(state, *app.camera(), width as u32, height as u32)
-            });
-        graphics.generation = scene_generation;
-        display.render_graphics(frame, graphics_area, &graphics);
+        let basis_scene = app.workbench_initial_basis_scene(state.channel_view(), scene_generation);
+        let camera = *app.camera();
+        display.render_graphics_lazy(
+            frame,
+            graphics_area,
+            scene_generation,
+            width as u32,
+            height as u32,
+            || {
+                let mut graphics = basis_scene
+                    .map(|scene| scene.render_frame(width as u32, height as u32))
+                    .unwrap_or_else(|| {
+                        initial_field_graphics(state, camera, width as u32, height as u32)
+                    });
+                graphics.generation = scene_generation;
+                graphics
+            },
+        );
     } else if state.section() == WorkbenchSection::Tiling {
         if let Some(tiling) = &state.draft().tiling {
             let scene = crate::workbench::tiling_editor::TilingScene::new(tiling.clone());
@@ -665,17 +679,35 @@ pub fn draw_workbench(
                 .with_construction(state.tiling_construction().to_vec())
                 .with_pointer(state.tiling_pointer());
             let (width, height) = display.framebuffer_size(graphics_area);
-            let mut graphics = scene.render_rgba(width as u32, height as u32);
-            graphics.generation = scene_generation;
-            display.render_graphics(frame, graphics_area, &graphics);
+            display.render_graphics_lazy(
+                frame,
+                graphics_area,
+                scene_generation,
+                width as u32,
+                height as u32,
+                || {
+                    let mut graphics = scene.render_rgba(width as u32, height as u32);
+                    graphics.generation = scene_generation;
+                    graphics
+                },
+            );
         } else if state.is_drawing_new_basis() || !state.tiling_construction().is_empty() {
             let scene = crate::workbench::tiling_editor::TilingScene::empty(state.tiling_camera())
                 .with_construction(state.tiling_construction().to_vec())
                 .with_pointer(state.tiling_pointer());
             let (width, height) = display.framebuffer_size(graphics_area);
-            let mut graphics = scene.render_rgba(width as u32, height as u32);
-            graphics.generation = scene_generation;
-            display.render_graphics(frame, graphics_area, &graphics);
+            display.render_graphics_lazy(
+                frame,
+                graphics_area,
+                scene_generation,
+                width as u32,
+                height as u32,
+                || {
+                    let mut graphics = scene.render_rgba(width as u32, height as u32);
+                    graphics.generation = scene_generation;
+                    graphics
+                },
+            );
         } else {
             frame.render_widget(
                 Paragraph::new(canvas_lines.into_iter().map(Line::from).collect::<Vec<_>>())
@@ -698,17 +730,35 @@ pub fn draw_workbench(
             .with_view(state.kernel_view())
             .with_selected(state.periodic_kernel_selection());
             let (width, height) = display.framebuffer_size(graphics_area);
-            let mut graphics = scene.render_rgba(width as u32, height as u32);
-            graphics.generation = scene_generation;
-            display.render_graphics(frame, graphics_area, &graphics);
+            display.render_graphics_lazy(
+                frame,
+                graphics_area,
+                scene_generation,
+                width as u32,
+                height as u32,
+                || {
+                    let mut graphics = scene.render_rgba(width as u32, height as u32);
+                    graphics.generation = scene_generation;
+                    graphics
+                },
+            );
         } else if let Some(definition) = state.selected_raster_kernel_definition() {
             let scene = crate::workbench::kernel_editor::KernelScene::new(definition.clone())
                 .with_view(state.kernel_view())
                 .with_selected(state.kernel_selection());
             let (width, height) = display.framebuffer_size(graphics_area);
-            let mut graphics = scene.render_rgba(width as u32, height as u32);
-            graphics.generation = scene_generation;
-            display.render_graphics(frame, graphics_area, &graphics);
+            display.render_graphics_lazy(
+                frame,
+                graphics_area,
+                scene_generation,
+                width as u32,
+                height as u32,
+                || {
+                    let mut graphics = scene.render_rgba(width as u32, height as u32);
+                    graphics.generation = scene_generation;
+                    graphics
+                },
+            );
         }
     } else if state.section() == WorkbenchSection::Growth {
         let source_height = canvas_inner.height.saturating_sub(graphics_area.height);
@@ -762,22 +812,47 @@ pub fn draw_workbench(
         );
         let scene = crate::workbench::growth_graph::GrowthScene::from_editor(state.growth_editor());
         let (width, height) = display.framebuffer_size(graphics_area);
-        let mut graphics = scene.render_rgba(width as u32, height as u32);
-        graphics.generation = scene_generation;
-        display.render_graphics(frame, graphics_area, &graphics);
-    } else if state.section() == WorkbenchSection::Channels {
-        let (width, height) = display.framebuffer_size(graphics_area);
-        let runtime_generation =
-            scene_generation.wrapping_add(app.render_generation().rotate_left(23));
-        let mut graphics = authoritative_channel_graphics(
-            app,
-            state,
+        display.render_graphics_lazy(
+            frame,
+            graphics_area,
+            scene_generation,
             width as u32,
             height as u32,
-            runtime_generation,
+            || {
+                let mut graphics = scene.render_rgba(width as u32, height as u32);
+                graphics.generation = scene_generation;
+                graphics
+            },
         );
-        graphics.generation = runtime_generation;
-        display.render_graphics(frame, graphics_area, &graphics);
+    } else if state.section() == WorkbenchSection::Channels {
+        let (width, height) = display.framebuffer_size(graphics_area);
+        let preview_generation = if app.workbench_runtime_matches_draft() {
+            scene_generation.wrapping_add(app.render_generation().rotate_left(23))
+        } else {
+            // A changed basis/channel layout has no compatible running state
+            // yet. Its draft initialization is static; tying it to the old
+            // simulation tick would continuously cancel the asynchronous
+            // encoder before any frame could reach Kitty.
+            scene_generation
+        };
+        display.render_graphics_lazy(
+            frame,
+            graphics_area,
+            preview_generation,
+            width as u32,
+            height as u32,
+            || {
+                let mut graphics = authoritative_channel_graphics(
+                    app,
+                    state,
+                    width as u32,
+                    height as u32,
+                    preview_generation,
+                );
+                graphics.generation = preview_generation;
+                graphics
+            },
+        );
     } else {
         frame.render_widget(
             Paragraph::new(canvas_lines.into_iter().map(Line::from).collect::<Vec<_>>())

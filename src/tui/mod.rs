@@ -1,5 +1,7 @@
 use crate::app::App;
-use crate::render::display::{AsyncRasterizer, RasterGeneration, ViewportDisplay};
+use crate::render::display::{
+    AsyncRasterizer, RasterGeneration, ViewportDisplay, framebuffer_to_graphics_frame,
+};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
@@ -46,8 +48,14 @@ fn workbench_footer_text(width: usize) -> String {
 }
 
 pub fn draw(frame: &mut ratatui::Frame, app: &mut App, display: &ViewportDisplay) -> bool {
-    let generation = app.applied_input_sequence();
-    draw_impl(frame, app, display, None, generation, generation)
+    draw_impl(
+        frame,
+        app,
+        display,
+        None,
+        app.applied_input_sequence(),
+        app.render_generation(),
+    )
 }
 
 pub fn draw_remote(
@@ -142,6 +150,31 @@ fn draw_impl(
                     *app.camera(),
                     rasterizer,
                     generation,
+                )
+            }
+        } else if display.protocol().is_pixel_protocol() {
+            if let Some(scene) = basis_scene {
+                display.render_graphics_lazy(
+                    frame,
+                    viewport,
+                    content_generation,
+                    frame_width as u32,
+                    frame_height as u32,
+                    || scene.render_frame(frame_width as u32, frame_height as u32),
+                )
+            } else {
+                display.render_graphics_lazy(
+                    frame,
+                    viewport,
+                    content_generation,
+                    frame_width as u32,
+                    frame_height as u32,
+                    || {
+                        framebuffer_to_graphics_frame(
+                            app.render_framebuffer(frame_width, frame_height),
+                            content_generation,
+                        )
+                    },
                 )
             }
         } else {
