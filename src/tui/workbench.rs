@@ -1463,7 +1463,7 @@ fn authoritative_channel_graphics(
     let columns = (channel_count as f64).sqrt().ceil().max(1.0) as usize;
     let rows = channel_count.div_ceil(columns).max(1);
     let mut rgba = vec![0_u8; width as usize * height as usize * 4];
-    for pixel in rgba.chunks_exact_mut(4) {
+    for pixel in rgba.as_chunks_mut::<4>().0 {
         pixel.copy_from_slice(&[
             crate::render::channels::OUTSIDE_DOMAIN.red,
             crate::render::channels::OUTSIDE_DOMAIN.green,

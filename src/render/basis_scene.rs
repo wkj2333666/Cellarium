@@ -210,7 +210,7 @@ impl BasisStateScene {
         let width = width.max(1);
         let height = height.max(1);
         let mut rgba = vec![0; width as usize * height as usize * 4];
-        for pixel in rgba.chunks_exact_mut(4) {
+        for pixel in rgba.as_chunks_mut::<4>().0 {
             pixel.copy_from_slice(&[
                 OUTSIDE_DOMAIN.red,
                 OUTSIDE_DOMAIN.green,
