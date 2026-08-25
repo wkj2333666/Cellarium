@@ -448,12 +448,13 @@ impl KittySharedDisplay {
         if self.state.lock().map_or(true, |state| state.failed) {
             return;
         }
-        // A scene edit can arrive while the worker is still packing the
-        // previous frame. Give every accepted submission its own epoch so the
-        // worker cannot publish that obsolete frame after the newer edit.
-        // The currently displayed placement stays intact until the new epoch
-        // is ready, which provides flicker-free replacement.
-        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel).wrapping_add(1);
+        // `LatestWorkQueue` replaces work that has not started yet. Do not
+        // invalidate the frame already being encoded for every newer
+        // snapshot: when packing is slower than the snapshot rate, doing so
+        // makes every completed frame stale and permanently starves Kitty.
+        // The epoch is advanced only by `invalidate_pending`, where publishing
+        // an in-flight frame from the previous scene would actually be wrong.
+        let epoch = self.epoch.load(Ordering::Acquire);
         self.queue.submit((image, size, epoch));
     }
 
@@ -1613,7 +1614,7 @@ mod tests {
 
     #[cfg(unix)]
     #[test]
-    fn each_shared_memory_submission_invalidates_an_older_in_flight_frame() {
+    fn shared_memory_submission_keeps_the_active_encoder_epoch() {
         let display = KittySharedDisplay::new((8, 16));
         let image = DynamicImage::new_rgba8(2, 2);
 
@@ -1622,9 +1623,9 @@ mod tests {
         display.submit(image, ratatui::layout::Size::new(2, 2));
         let second = display.epoch.load(Ordering::Acquire);
 
-        assert!(
-            second > first,
-            "a newer scene must cancel an older shm result"
+        assert_eq!(
+            second, first,
+            "queued snapshots must not starve the shm frame already being encoded"
         );
     }
 
