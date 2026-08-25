@@ -559,7 +559,10 @@ fn c_s_pty_user_journey_survives_repeated_keyboard_and_mouse_operations() {
         Instant::now() + Duration::from_secs(5),
         |output| contains(output, b"E2E_WORKBENCH_SECTION=World")
     ));
-    let canvas_click = b"\x1b[<0;35;10M";
+    // Click the visual center of the 80x24 canvas. With true polygon-domain
+    // hit testing, clicks in the dark outside-domain margin are intentionally
+    // ignored instead of wrapping into an unrelated periodic cell.
+    let canvas_click = b"\x1b[<0;40;12M";
     assert_eq!(
         unsafe { libc::write(master, canvas_click.as_ptr().cast(), canvas_click.len()) },
         canvas_click.len() as isize
