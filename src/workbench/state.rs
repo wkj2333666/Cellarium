@@ -1052,6 +1052,84 @@ impl WorkbenchState {
         self.refresh_rule_selection();
         Ok(())
     }
+
+    pub fn set_selected_kernel_active(
+        &mut self,
+        offset: [i16; 2],
+        source_basis: BasisId,
+        active: bool,
+    ) -> Result<(), HistoryError> {
+        let binding = BindingKey {
+            basis: self.selected_basis,
+            output: self.selected_channel,
+        };
+        let kernel = self
+            .selected_kernel
+            .ok_or_else(|| HistoryError::Edit("selected rule-set has no kernel".to_string()))?;
+        let mut next = self.draft.clone();
+        let rule_set = next
+            .rules
+            .detach(binding)
+            .map_err(|error| HistoryError::Edit(error.to_string()))?;
+        let target = next
+            .rules
+            .get_mut(rule_set)
+            .and_then(|rule| rule.kernels.iter_mut().find(|entry| entry.id == kernel))
+            .ok_or_else(|| HistoryError::Edit("selected rule kernel is missing".to_string()))?;
+        let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) =
+            &mut target.spatial
+        else {
+            return Err(HistoryError::Edit(
+                "selected kernel is not periodic".to_string(),
+            ));
+        };
+        definition
+            .set_active(offset, source_basis, active)
+            .map_err(|error| HistoryError::Edit(error.to_string()))?;
+        self.execute(DraftCommand::ReplaceDraft(Box::new(next)))?;
+        self.refresh_rule_selection();
+        Ok(())
+    }
+
+    pub fn resize_selected_periodic_kernel(
+        &mut self,
+        width: usize,
+        height: usize,
+        anchor_x: usize,
+        anchor_y: usize,
+    ) -> Result<crate::sim::basis_kernel::ResizeReport, HistoryError> {
+        let binding = BindingKey {
+            basis: self.selected_basis,
+            output: self.selected_channel,
+        };
+        let kernel = self
+            .selected_kernel
+            .ok_or_else(|| HistoryError::Edit("selected rule-set has no kernel".to_string()))?;
+        let mut next = self.draft.clone();
+        let rule_set = next
+            .rules
+            .detach(binding)
+            .map_err(|error| HistoryError::Edit(error.to_string()))?;
+        let target = next
+            .rules
+            .get_mut(rule_set)
+            .and_then(|rule| rule.kernels.iter_mut().find(|entry| entry.id == kernel))
+            .ok_or_else(|| HistoryError::Edit("selected rule kernel is missing".to_string()))?;
+        let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) =
+            &mut target.spatial
+        else {
+            return Err(HistoryError::Edit(
+                "selected kernel is not periodic".to_string(),
+            ));
+        };
+        let report = definition
+            .resize(width, height, anchor_x, anchor_y)
+            .map_err(|error| HistoryError::Edit(error.to_string()))?;
+        self.execute(DraftCommand::ReplaceDraft(Box::new(next)))?;
+        self.refresh_rule_selection();
+        Ok(report)
+    }
+
     pub fn set_channel_view(&mut self, view: ChannelView) {
         self.channel_view = view;
     }
@@ -2035,6 +2113,66 @@ mod tests {
             state.rule_for(BasisId(0), ChannelId(0)).unwrap(),
             &sibling_before
         );
+    }
+
+    #[test]
+    fn periodic_support_edit_is_reversible_and_clears_the_weight() {
+        let mut state = WorkbenchState::new(basis_fixture());
+        state
+            .set_selected_kernel_weight([0, 0], BasisId(0), 0.25)
+            .unwrap();
+
+        state
+            .set_selected_kernel_active([0, 0], BasisId(0), false)
+            .unwrap();
+
+        let KernelSpatialDefinition::Periodic(definition) =
+            &state.selected_rule_kernel().unwrap().spatial
+        else {
+            panic!("basis fixture should use a periodic kernel");
+        };
+        assert_eq!(definition.is_active([0, 0], BasisId(0)), Some(false));
+        assert_eq!(definition.raw_weight([0, 0], BasisId(0)), Some(0.0));
+
+        state.undo().unwrap();
+        let KernelSpatialDefinition::Periodic(definition) =
+            &state.selected_rule_kernel().unwrap().spatial
+        else {
+            panic!("basis fixture should use a periodic kernel");
+        };
+        assert_eq!(definition.weight([0, 0], BasisId(0)), Some(0.25));
+    }
+
+    #[test]
+    fn periodic_resize_is_one_reversible_draft_change() {
+        let mut state = WorkbenchState::new(basis_fixture());
+
+        state.resize_selected_periodic_kernel(3, 3, 1, 1).unwrap();
+
+        let KernelSpatialDefinition::Periodic(definition) =
+            &state.selected_rule_kernel().unwrap().spatial
+        else {
+            panic!("basis fixture should use a periodic kernel");
+        };
+        assert_eq!(
+            (
+                definition.width,
+                definition.height,
+                definition.anchor_x,
+                definition.anchor_y,
+            ),
+            (3, 3, 1, 1),
+        );
+        assert_eq!(definition.weight([0, 0], BasisId(0)), Some(1.0));
+        assert_eq!(definition.is_active([1, 0], BasisId(0)), Some(false));
+
+        state.undo().unwrap();
+        let KernelSpatialDefinition::Periodic(definition) =
+            &state.selected_rule_kernel().unwrap().spatial
+        else {
+            panic!("basis fixture should use a periodic kernel");
+        };
+        assert_eq!((definition.width, definition.height), (1, 1));
     }
 
     #[test]
