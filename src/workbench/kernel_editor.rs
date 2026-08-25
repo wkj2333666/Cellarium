@@ -20,6 +20,13 @@ pub struct KernelSelection {
     pub source_basis: BasisId,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum KernelTool {
+    #[default]
+    Weights,
+    Support,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct KernelView {
     /// View center in normalized kernel coordinates.
@@ -434,6 +441,18 @@ impl PeriodicKernelScene {
             })
     }
 
+    pub fn selection_at_pixel_for_tool(
+        &self,
+        px: u32,
+        py: u32,
+        width: u32,
+        height: u32,
+        tool: KernelTool,
+    ) -> Option<KernelSelection> {
+        self.selection_at_pixel(px, py, width, height)
+            .filter(|selection| self.tool_accepts(*selection, tool))
+    }
+
     /// Resolve a terminal mouse cell against the pixel-rendered polygons.
     ///
     /// Crossterm reports character-cell coordinates, while Kitty renders at
@@ -478,6 +497,51 @@ impl PeriodicKernelScene {
                 center[1].round() as u32,
                 width,
                 height,
+            )
+        })
+    }
+
+    pub fn selection_in_pixel_rect_for_tool(
+        &self,
+        left: u32,
+        top: u32,
+        right: u32,
+        bottom: u32,
+        width: u32,
+        height: u32,
+        tool: KernelTool,
+    ) -> Option<KernelSelection> {
+        let right = right.max(left.saturating_add(1));
+        let bottom = bottom.max(top.saturating_add(1));
+        let center = [
+            (f64::from(left) + f64::from(right.saturating_sub(1))) * 0.5,
+            (f64::from(top) + f64::from(bottom.saturating_sub(1))) * 0.5,
+        ];
+        let cells = self.cells();
+        let transform = self.pixel_transform(width, height, world_bounds_for_cells(&cells));
+        let mut nearest = None;
+        for (selection, polygon, _, _) in cells {
+            if !self.tool_accepts(selection, tool) {
+                continue;
+            }
+            let centroid = polygon.iter().fold(Vec2::ZERO, |sum, point| sum + *point)
+                * (1.0 / polygon.len() as f64);
+            let (x, y) = transform.world_to_pixel(centroid);
+            if x < left as i32 || y < top as i32 || x >= right as i32 || y >= bottom as i32 {
+                continue;
+            }
+            let distance = (f64::from(x) - center[0]).powi(2) + (f64::from(y) - center[1]).powi(2);
+            if nearest.is_none_or(|(_, best)| distance < best) {
+                nearest = Some((selection, distance));
+            }
+        }
+        nearest.map(|(selection, _)| selection).or_else(|| {
+            self.selection_at_pixel_for_tool(
+                center[0].round() as u32,
+                center[1].round() as u32,
+                width,
+                height,
+                tool,
             )
         })
     }
@@ -622,6 +686,14 @@ impl PeriodicKernelScene {
             (f64::from(py) - transform.height * 0.5) / transform.scale + transform.center.y,
         )
     }
+
+    fn tool_accepts(&self, selection: KernelSelection, tool: KernelTool) -> bool {
+        tool == KernelTool::Support
+            || self
+                .definition
+                .is_active(selection.offset, selection.source_basis)
+                .unwrap_or(false)
+    }
 }
 
 fn world_bounds_for_cells(cells: &[PeriodicKernelCell]) -> (Vec2, Vec2) {
@@ -678,6 +750,24 @@ impl GraphicsScene for PeriodicKernelScene {
                 [8, 8, 8, 255]
             };
             draw_world_polygon(&mut rgba, width, height, transform, &polygon, color);
+            if !active && polygon.len() >= 4 {
+                draw_pixel_line(
+                    &mut rgba,
+                    width,
+                    height,
+                    transform.world_to_pixel(polygon[0]),
+                    transform.world_to_pixel(polygon[polygon.len() / 2]),
+                    [58, 62, 70, 255],
+                );
+                draw_pixel_line(
+                    &mut rgba,
+                    width,
+                    height,
+                    transform.world_to_pixel(polygon[1]),
+                    transform.world_to_pixel(polygon[(polygon.len() / 2 + 1) % polygon.len()]),
+                    [58, 62, 70, 255],
+                );
+            }
             let edge = if self.selected == Some(selection) {
                 [255, 255, 255, 255]
             } else if selection.offset == [0, 0] && selection.source_basis == self.target_basis {
@@ -1147,6 +1237,40 @@ mod tests {
             .pixel_for_selection(selection, 720, 540)
             .expect("non-central lattice cell must be reachable");
         assert_eq!(scene.selection_at_pixel(x, y, 720, 540), Some(selection));
+    }
+
+    #[test]
+    fn inactive_periodic_cell_is_hittable_only_by_the_support_tool() {
+        let tiling = build_preset(TilingPreset::RegularHexagon, 1.0);
+        let definition = PeriodicKernelDefinition {
+            width: 1,
+            height: 1,
+            anchor_x: 0,
+            anchor_y: 0,
+            planes: [(
+                BasisId(0),
+                BasisWeightPlane {
+                    values: vec![0.0],
+                    mask: Some(vec![false]),
+                },
+            )]
+            .into(),
+        };
+        let scene = PeriodicKernelScene::new(tiling, definition, BasisId(0));
+        let selection = KernelSelection {
+            offset: [0, 0],
+            source_basis: BasisId(0),
+        };
+        let (x, y) = scene.pixel_for_selection(selection, 640, 480).unwrap();
+
+        assert_eq!(
+            scene.selection_at_pixel_for_tool(x, y, 640, 480, KernelTool::Weights),
+            None,
+        );
+        assert_eq!(
+            scene.selection_at_pixel_for_tool(x, y, 640, 480, KernelTool::Support),
+            Some(selection),
+        );
     }
 
     #[test]

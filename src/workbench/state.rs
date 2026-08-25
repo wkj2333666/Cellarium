@@ -1,5 +1,5 @@
 use super::growth_editor::editor_for_basis;
-use super::kernel_editor::{KernelPoint, KernelSelection};
+use super::kernel_editor::{KernelPoint, KernelSelection, KernelTool};
 use super::numeric_editor::NumericEditor;
 use super::{ChannelView, DraftCommand, GrowthEditorState, History, HistoryError};
 use crate::sim::experiment_model::{
@@ -81,9 +81,13 @@ pub struct WorkbenchState {
     kernel_view: super::kernel_editor::KernelView,
     kernel_selection: Option<KernelPoint>,
     periodic_kernel_selection: Option<KernelSelection>,
+    kernel_tool: KernelTool,
     kernel_paint_value: f32,
     numeric_editor: Option<NumericEditor>,
     simulation_dt_editing: bool,
+    kernel_resize_editor: Option<String>,
+    kernel_resize_replace_on_input: bool,
+    kernel_resize_confirmed: bool,
     color_editor: Option<String>,
     color_editor_replace_on_input: bool,
     tiling_tool: super::tiling_editor::TilingTool,
@@ -136,9 +140,13 @@ impl WorkbenchState {
             kernel_view: super::kernel_editor::KernelView::default(),
             kernel_selection: None,
             periodic_kernel_selection: None,
+            kernel_tool: KernelTool::Weights,
             kernel_paint_value: 0.05,
             numeric_editor: None,
             simulation_dt_editing: false,
+            kernel_resize_editor: None,
+            kernel_resize_replace_on_input: false,
+            kernel_resize_confirmed: false,
             color_editor: None,
             color_editor_replace_on_input: false,
             tiling_tool: super::tiling_editor::TilingTool::Select,
@@ -228,6 +236,15 @@ impl WorkbenchState {
     pub fn select_periodic_kernel(&mut self, selection: KernelSelection) {
         self.periodic_kernel_selection = Some(selection);
         self.kernel_selection = None;
+    }
+    pub fn kernel_tool(&self) -> KernelTool {
+        self.kernel_tool
+    }
+    pub fn cycle_kernel_tool(&mut self) {
+        self.kernel_tool = match self.kernel_tool {
+            KernelTool::Weights => KernelTool::Support,
+            KernelTool::Support => KernelTool::Weights,
+        };
     }
     pub fn selected_rule_kernel(&self) -> Option<&RuleKernel> {
         let rule_set = self.selected_rule_set?;
@@ -348,6 +365,68 @@ impl WorkbenchState {
     pub fn restore_numeric_editor(&mut self, editor: NumericEditor, simulation_dt: bool) {
         self.numeric_editor = Some(editor);
         self.simulation_dt_editing = simulation_dt;
+    }
+    pub fn kernel_resize_editor(&self) -> Option<&str> {
+        self.kernel_resize_editor.as_deref()
+    }
+    pub fn begin_selected_kernel_resize_editor(&mut self) -> Result<(), String> {
+        let kernel = self
+            .selected_rule_kernel()
+            .ok_or_else(|| "no selected kernel".to_string())?;
+        let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) = &kernel.spatial
+        else {
+            return Err("selected kernel is not periodic".into());
+        };
+        self.kernel_resize_editor = Some(format!(
+            "{},{},{},{}",
+            definition.width, definition.height, definition.anchor_x, definition.anchor_y
+        ));
+        self.kernel_resize_replace_on_input = true;
+        self.kernel_resize_confirmed = false;
+        Ok(())
+    }
+    pub fn cancel_kernel_resize_editor(&mut self) {
+        self.kernel_resize_editor = None;
+        self.kernel_resize_replace_on_input = false;
+        self.kernel_resize_confirmed = false;
+    }
+    pub fn kernel_resize_editor_select_all(&mut self) {
+        if self.kernel_resize_editor.is_some() {
+            self.kernel_resize_replace_on_input = true;
+            self.kernel_resize_confirmed = false;
+        }
+    }
+    pub fn kernel_resize_editor_insert(&mut self, character: char) -> bool {
+        if !(character.is_ascii_digit() || character == ',' || character.is_ascii_whitespace()) {
+            return false;
+        }
+        let Some(buffer) = self.kernel_resize_editor.as_mut() else {
+            return false;
+        };
+        if self.kernel_resize_replace_on_input {
+            buffer.clear();
+            self.kernel_resize_replace_on_input = false;
+        }
+        buffer.push(character);
+        self.kernel_resize_confirmed = false;
+        true
+    }
+    pub fn kernel_resize_editor_backspace(&mut self) {
+        if let Some(buffer) = self.kernel_resize_editor.as_mut() {
+            if self.kernel_resize_replace_on_input {
+                buffer.clear();
+                self.kernel_resize_replace_on_input = false;
+            } else {
+                buffer.pop();
+            }
+            self.kernel_resize_confirmed = false;
+        }
+    }
+    pub fn kernel_resize_confirmed(&self) -> bool {
+        self.kernel_resize_confirmed
+    }
+    pub fn confirm_kernel_resize(&mut self) {
+        self.kernel_resize_confirmed = true;
     }
     pub fn color_editor(&self) -> Option<&str> {
         self.color_editor.as_deref()
@@ -809,6 +888,7 @@ impl WorkbenchState {
         self.growth_editing = false;
         self.numeric_editor = None;
         self.simulation_dt_editing = false;
+        self.cancel_kernel_resize_editor();
         self.cancel_color_editor();
         self.history.clear();
         self.status = DraftStatus::Clean;
@@ -825,6 +905,7 @@ impl WorkbenchState {
         self.growth_editing = false;
         self.numeric_editor = None;
         self.simulation_dt_editing = false;
+        self.cancel_kernel_resize_editor();
         self.cancel_color_editor();
         self.history.clear();
         self.status = DraftStatus::Clean;
@@ -2173,6 +2254,26 @@ mod tests {
             panic!("basis fixture should use a periodic kernel");
         };
         assert_eq!((definition.width, definition.height), (1, 1));
+    }
+
+    #[test]
+    fn kernel_tool_defaults_to_weights_and_cycles_to_support() {
+        let mut state = WorkbenchState::new(basis_fixture());
+
+        assert_eq!(
+            state.kernel_tool(),
+            crate::workbench::kernel_editor::KernelTool::Weights
+        );
+        state.cycle_kernel_tool();
+        assert_eq!(
+            state.kernel_tool(),
+            crate::workbench::kernel_editor::KernelTool::Support
+        );
+        state.cycle_kernel_tool();
+        assert_eq!(
+            state.kernel_tool(),
+            crate::workbench::kernel_editor::KernelTool::Weights
+        );
     }
 
     #[test]

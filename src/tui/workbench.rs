@@ -58,11 +58,19 @@ fn toolbar_segments(
             ("[F] Freeze", ToolbarAction::Ui(UiCommand::ToggleFrozen)),
         ],
         WorkbenchSection::Kernels => vec![
+            (
+                match state.kernel_tool() {
+                    crate::workbench::kernel_editor::KernelTool::Weights => "[M] Tool: Weights",
+                    crate::workbench::kernel_editor::KernelTool::Support => "[M] Tool: Support",
+                },
+                ToolbarAction::EditorKey(KeyCode::Char('m')),
+            ),
             ("[A] Add kernel", ToolbarAction::Ui(UiCommand::ContextAdd)),
             ("[Del] Remove", ToolbarAction::Ui(UiCommand::ContextDelete)),
             ("] Kernel", ToolbarAction::Ui(UiCommand::SelectNext)),
             ("[S] Source", ToolbarAction::EditorKey(KeyCode::Char('s'))),
             ("[U] Output", ToolbarAction::EditorKey(KeyCode::Char('u'))),
+            ("[R] Resize", ToolbarAction::EditorKey(KeyCode::Char('r'))),
             (
                 "[E/Enter] Exact",
                 ToolbarAction::EditorKey(KeyCode::Char('e')),
@@ -591,6 +599,26 @@ pub fn draw_workbench(
                 Style::default().fg(Color::White),
             ),
         ]));
+    } else if let Some(buffer) = state.kernel_resize_editor() {
+        header_lines.truncate(1);
+        header_lines.push(Line::from(vec![
+            Span::styled(
+                "Resize width,height,anchor_x,anchor_y = ",
+                Style::default()
+                    .fg(Color::Rgb(255, 220, 130))
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                buffer.to_string(),
+                Style::default()
+                    .fg(Color::Rgb(255, 255, 255))
+                    .bg(Color::Rgb(55, 85, 145)),
+            ),
+            Span::styled(
+                "▌  Enter commit · Esc cancel",
+                Style::default().fg(Color::White),
+            ),
+        ]));
     }
     frame.render_widget(Paragraph::new(header_lines), canvas_header);
     if matches!(state.section(), WorkbenchSection::World) {
@@ -869,13 +897,28 @@ pub fn draw_workbench(
                         kernel.definition.normalization,
                     )));
                 }
-                lines.push(Line::from(
-                    "Canvas: click polygon · drag paint · right zero",
-                ));
-                lines.push(Line::from("Cell wheel ±0.05 · Shift ±0.005 · Ctrl ±0.5"));
-                lines.push(Line::from("Empty wheel zoom · middle pan · E exact value"));
+                match state.kernel_tool() {
+                    crate::workbench::kernel_editor::KernelTool::Weights => {
+                        lines.push(Line::from(
+                            "Weights: left/drag paint · right zero · inactive is locked",
+                        ));
+                        lines.push(Line::from("Active wheel ±0.05 · Shift ±0.005 · Ctrl ±0.5"));
+                        lines.push(Line::from(
+                            "Inactive/empty wheel zoom · middle pan · E exact value",
+                        ));
+                    }
+                    crate::workbench::kernel_editor::KernelTool::Support => {
+                        lines.push(Line::from(
+                            "Support: left/drag activate · right/drag deactivate",
+                        ));
+                        lines.push(Line::from(
+                            "Deactivation clears weight · wheel zoom · middle pan",
+                        ));
+                    }
+                }
                 lines.push(Line::from("A add kernel · Del remove · ] next kernel"));
                 lines.push(Line::from("S source channel · U output channel"));
+                lines.push(Line::from("R resize stencil/anchor"));
                 lines.push(Line::from("Channel count: Channels section A/Del"));
                 lines.push(Line::from(format!(
                     "paint value: {:.4}",
@@ -892,6 +935,28 @@ pub fn draw_workbench(
                         "selected: offset [{},{}] · source basis {}",
                         selection.offset[0], selection.offset[1], selection.source_basis.0,
                     )));
+                    if let Some(kernel) = state.selected_rule_kernel()
+                        && let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) =
+                            &kernel.spatial
+                    {
+                        let active = definition
+                            .is_active(selection.offset, selection.source_basis)
+                            .unwrap_or(false);
+                        lines.push(Line::from(format!(
+                            "active: {}",
+                            if active { "yes" } else { "no" }
+                        )));
+                        lines.push(Line::from(if active {
+                            format!(
+                                "weight: {:.6}",
+                                definition
+                                    .raw_weight(selection.offset, selection.source_basis)
+                                    .unwrap_or(0.0)
+                            )
+                        } else {
+                            "weight: —".to_string()
+                        }));
+                    }
                 }
                 if let Some(editor) = state.numeric_editor() {
                     lines.push(Line::from(format!(
@@ -1797,7 +1862,11 @@ mod tests {
         );
         state.select_section(WorkbenchSection::Kernels);
         let text = toolbar_text(&state);
-        for (label, key) in [("[S] Source", 's'), ("[U] Output", 'u')] {
+        for (label, key) in [
+            ("[S] Source", 's'),
+            ("[U] Output", 'u'),
+            ("[R] Resize", 'r'),
+        ] {
             assert!(text.contains(label), "kernel toolbar was {text:?}");
             let column = text.find(label).unwrap() as u16 + 2;
             assert_eq!(
@@ -1807,5 +1876,28 @@ mod tests {
                 )))
             );
         }
+    }
+
+    #[test]
+    fn kernel_toolbar_exposes_the_current_weights_or_support_tool() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.select_section(WorkbenchSection::Kernels);
+
+        assert!(toolbar_text(&state).contains("[M] Tool: Weights"));
+        state.cycle_kernel_tool();
+        let text = toolbar_text(&state);
+        assert!(
+            text.contains("[M] Tool: Support"),
+            "kernel toolbar was {text:?}"
+        );
+        let column = text.find("[M] Tool: Support").unwrap() as u16 + 2;
+        assert_eq!(
+            toolbar_action_at(&state, column),
+            Some(ToolbarAction::EditorKey(crossterm::event::KeyCode::Char(
+                'm'
+            )))
+        );
     }
 }

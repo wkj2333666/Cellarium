@@ -845,6 +845,101 @@ impl App {
         if self.mode != AppMode::Workbench {
             return false;
         }
+        if self.workbench.kernel_resize_editor().is_some() {
+            match key.code {
+                KeyCode::Esc => {
+                    self.workbench.cancel_kernel_resize_editor();
+                    self.workbench_notice = Some("kernel resize cancelled".into());
+                }
+                KeyCode::Enter => {
+                    let source = self
+                        .workbench
+                        .kernel_resize_editor()
+                        .unwrap_or_default()
+                        .to_string();
+                    let parsed = source
+                        .split(',')
+                        .map(|part| part.trim().parse::<usize>())
+                        .collect::<Result<Vec<_>, _>>();
+                    let result = match parsed {
+                        Ok(parts) if parts.len() == 4 => {
+                            let kernel = self.workbench.selected_rule_kernel().ok_or_else(|| {
+                                "selected kernel disappeared while resizing".to_string()
+                            });
+                            kernel.and_then(|kernel| {
+                                let crate::sim::ruleset::KernelSpatialDefinition::Periodic(
+                                    definition,
+                                ) = &kernel.spatial
+                                else {
+                                    return Err("selected kernel is not periodic".into());
+                                };
+                                let mut preview = definition.clone();
+                                preview
+                                    .resize(parts[0], parts[1], parts[2], parts[3])
+                                    .map_err(|error| error.to_string())
+                            })
+                        }
+                        Ok(_) => Err(
+                            "enter width,height,anchor_x,anchor_y (four comma-separated integers)"
+                                .into(),
+                        ),
+                        Err(error) => Err(format!("invalid kernel resize number: {error}")),
+                    };
+                    match result {
+                        Ok(report)
+                            if !report.discarded_active_nonzero.is_empty()
+                                && !self.workbench.kernel_resize_confirmed() =>
+                        {
+                            self.workbench.confirm_kernel_resize();
+                            self.workbench_notice = Some(format!(
+                                "resize discards {} active non-zero weights · Enter again to confirm",
+                                report.discarded_active_nonzero.len(),
+                            ));
+                        }
+                        Ok(_) => {
+                            let parts = source
+                                .split(',')
+                                .map(|part| part.trim().parse::<usize>().unwrap())
+                                .collect::<Vec<_>>();
+                            match self.workbench.resize_selected_periodic_kernel(
+                                parts[0], parts[1], parts[2], parts[3],
+                            ) {
+                                Ok(_) => {
+                                    self.workbench.cancel_kernel_resize_editor();
+                                    self.workbench_notice = Some(format!(
+                                        "periodic stencil {}×{} · anchor {},{}",
+                                        parts[0], parts[1], parts[2], parts[3],
+                                    ));
+                                }
+                                Err(error) => self.workbench_notice = Some(error.to_string()),
+                            }
+                        }
+                        Err(error) => self.workbench_notice = Some(error),
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.workbench.kernel_resize_editor_backspace();
+                }
+                KeyCode::Char('a')
+                    if key
+                        .modifiers
+                        .contains(crossterm::event::KeyModifiers::CONTROL) =>
+                {
+                    self.workbench.kernel_resize_editor_select_all();
+                }
+                KeyCode::Char(character) => {
+                    if !self.workbench.kernel_resize_editor_insert(character) {
+                        self.workbench_notice = Some(
+                            "resize accepts width,height,anchor_x,anchor_y as integers".into(),
+                        );
+                    }
+                }
+                _ => {}
+            }
+            self.workbench_draft_scene_generation =
+                self.workbench_draft_scene_generation.wrapping_add(1);
+            return true;
+        }
         if self.workbench.color_editor().is_some() {
             match key.code {
                 KeyCode::Esc => {
@@ -906,6 +1001,21 @@ impl App {
                     self.workbench_notice = Some("Value mode · next = clamp(result, 0, 1)".into());
                 }
                 Err(error) => self.workbench_notice = Some(error.to_string()),
+            }
+            self.workbench_draft_scene_generation =
+                self.workbench_draft_scene_generation.wrapping_add(1);
+            return true;
+        }
+        if self.workbench.section() == WorkbenchSection::Kernels
+            && key.modifiers.is_empty()
+            && key.code == KeyCode::Char('r')
+        {
+            match self.workbench.begin_selected_kernel_resize_editor() {
+                Ok(()) => {
+                    self.workbench_notice =
+                        Some("resize: width,height,anchor_x,anchor_y · Enter commit".into());
+                }
+                Err(error) => self.workbench_notice = Some(error),
             }
             self.workbench_draft_scene_generation =
                 self.workbench_draft_scene_generation.wrapping_add(1);
@@ -1031,6 +1141,26 @@ impl App {
                 }
                 _ => {}
             }
+        }
+        if self.workbench.section() == WorkbenchSection::Kernels
+            && key.modifiers.is_empty()
+            && key.code == KeyCode::Char('m')
+        {
+            self.workbench.cycle_kernel_tool();
+            self.workbench_notice = Some(
+                match self.workbench.kernel_tool() {
+                    crate::workbench::kernel_editor::KernelTool::Weights => {
+                        "Weights tool · left/drag paint · right zero · wheel adjust"
+                    }
+                    crate::workbench::kernel_editor::KernelTool::Support => {
+                        "Support tool · left activate · right deactivate"
+                    }
+                }
+                .into(),
+            );
+            self.workbench_draft_scene_generation =
+                self.workbench_draft_scene_generation.wrapping_add(1);
+            return true;
         }
         if self.workbench.section() == WorkbenchSection::Kernels
             && key.modifiers.is_empty()
@@ -1264,6 +1394,20 @@ impl App {
     ) -> Result<(), String> {
         self.workbench
             .set_selected_kernel_weight(selection.offset, selection.source_basis, value)
+            .map_err(|error| error.to_string())?;
+        self.workbench.select_periodic_kernel(selection);
+        self.workbench_draft_scene_generation =
+            self.workbench_draft_scene_generation.wrapping_add(1);
+        Ok(())
+    }
+
+    fn set_periodic_kernel_active(
+        &mut self,
+        selection: crate::workbench::kernel_editor::KernelSelection,
+        active: bool,
+    ) -> Result<(), String> {
+        self.workbench
+            .set_selected_kernel_active(selection.offset, selection.source_basis, active)
             .map_err(|error| error.to_string())?;
         self.workbench.select_periodic_kernel(selection);
         self.workbench_draft_scene_generation =
@@ -2564,14 +2708,18 @@ impl App {
                         .with_selected(self.workbench.periodic_kernel_selection());
                         match action {
                             crate::input::MouseAction::Zoom { direction } => {
-                                if let Some(selection) = scene.selection_in_pixel_rect(
-                                    pointer.bounds[0],
-                                    pointer.bounds[1],
-                                    pointer.bounds[2],
-                                    pointer.bounds[3],
-                                    frame_size[0] as u32,
-                                    frame_size[1] as u32,
-                                ) {
+                                if self.workbench.kernel_tool()
+                                    == crate::workbench::kernel_editor::KernelTool::Weights
+                                    && let Some(selection) = scene.selection_in_pixel_rect_for_tool(
+                                        pointer.bounds[0],
+                                        pointer.bounds[1],
+                                        pointer.bounds[2],
+                                        pointer.bounds[3],
+                                        frame_size[0] as u32,
+                                        frame_size[1] as u32,
+                                        crate::workbench::kernel_editor::KernelTool::Weights,
+                                    )
+                                {
                                     let step = if event
                                         .modifiers
                                         .contains(crossterm::event::KeyModifiers::CONTROL)
@@ -2636,13 +2784,14 @@ impl App {
                             }
                             _ => {}
                         }
-                        let Some(selection) = scene.selection_in_pixel_rect(
+                        let Some(selection) = scene.selection_in_pixel_rect_for_tool(
                             pointer.bounds[0],
                             pointer.bounds[1],
                             pointer.bounds[2],
                             pointer.bounds[3],
                             frame_size[0] as u32,
                             frame_size[1] as u32,
+                            self.workbench.kernel_tool(),
                         ) else {
                             return false;
                         };
@@ -2662,15 +2811,27 @@ impl App {
                                 return true;
                             }
                             crate::input::MouseAction::Paint => {
-                                return self
-                                    .set_periodic_kernel_value(
-                                        selection,
-                                        self.workbench.kernel_paint_value(),
-                                    )
-                                    .is_ok();
+                                return match self.workbench.kernel_tool() {
+                                    crate::workbench::kernel_editor::KernelTool::Weights => self
+                                        .set_periodic_kernel_value(
+                                            selection,
+                                            self.workbench.kernel_paint_value(),
+                                        )
+                                        .is_ok(),
+                                    crate::workbench::kernel_editor::KernelTool::Support => {
+                                        self.set_periodic_kernel_active(selection, true).is_ok()
+                                    }
+                                };
                             }
                             crate::input::MouseAction::Erase => {
-                                return self.set_periodic_kernel_value(selection, 0.0).is_ok();
+                                return match self.workbench.kernel_tool() {
+                                    crate::workbench::kernel_editor::KernelTool::Weights => {
+                                        self.set_periodic_kernel_value(selection, 0.0).is_ok()
+                                    }
+                                    crate::workbench::kernel_editor::KernelTool::Support => {
+                                        self.set_periodic_kernel_active(selection, false).is_ok()
+                                    }
+                                };
                             }
                             crate::input::MouseAction::Pan { .. }
                             | crate::input::MouseAction::Zoom { .. } => unreachable!(),
@@ -5513,6 +5674,79 @@ mod tests {
             app.workbench().numeric_editor().unwrap().buffer(),
             "-0",
             "numeric input must receive zero instead of triggering the kernel fit shortcut",
+        );
+    }
+
+    #[test]
+    fn kernel_m_key_switches_between_weights_and_support_tools() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Kernels);
+
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('m'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert_eq!(
+            app.workbench().kernel_tool(),
+            crate::workbench::kernel_editor::KernelTool::Support,
+        );
+        assert_eq!(
+            app.workbench_notice(),
+            Some("Support tool · left activate · right deactivate"),
+        );
+    }
+
+    #[test]
+    fn kernel_resize_editor_changes_periodic_dimensions_and_anchor_exactly() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut().cycle_tiling_preset().unwrap();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Kernels);
+        assert!(matches!(
+            app.workbench()
+                .selected_rule_kernel()
+                .map(|kernel| &kernel.spatial),
+            Some(crate::sim::ruleset::KernelSpatialDefinition::Periodic(_)),
+        ));
+
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('r'),
+            crossterm::event::KeyModifiers::NONE,
+        )));
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Char('a'),
+            crossterm::event::KeyModifiers::CONTROL,
+        )));
+        for character in "29,29,14,14".chars() {
+            assert!(app.handle_workbench_editor_key(KeyEvent::new(
+                KeyCode::Char(character),
+                crossterm::event::KeyModifiers::NONE,
+            )));
+        }
+        assert_eq!(app.workbench().kernel_resize_editor(), Some("29,29,14,14"),);
+        assert!(app.handle_workbench_editor_key(KeyEvent::new(
+            KeyCode::Enter,
+            crossterm::event::KeyModifiers::NONE,
+        )));
+
+        let Some(kernel) = app.workbench().selected_rule_kernel() else {
+            panic!("selected kernel disappeared");
+        };
+        let crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) = &kernel.spatial
+        else {
+            panic!("kernel stopped being periodic");
+        };
+        assert_eq!(
+            (
+                definition.width,
+                definition.height,
+                definition.anchor_x,
+                definition.anchor_y,
+            ),
+            (29, 29, 14, 14),
         );
     }
 
