@@ -8,7 +8,9 @@ use crate::sim::experiment_model::{
 };
 use crate::sim::kernel::KernelDefinition;
 use crate::sim::ruleset::{BindingKey, RuleKernel, RuleSet, RuleSetId};
-use crate::sim::tiling::{BasisId, PrototypeId, PrototypeShape, TilingPreset, build_preset};
+use crate::sim::tiling::{
+    BasisId, PrototypeId, PrototypeShape, SeamConstraint, TilingPreset, build_preset,
+};
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum AppMode {
@@ -61,6 +63,13 @@ pub enum DraftStatus {
     Invalid,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct SeamSolveSummary {
+    pub seams: usize,
+    pub max_displacement: f64,
+    pub max_residual: f64,
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkbenchState {
     authoritative: ExperimentSpec,
@@ -100,6 +109,7 @@ pub struct WorkbenchState {
     tiling_pointer: Option<crate::sim::tiling::Vec2>,
     tiling_new_basis: bool,
     tiling_drag_active: bool,
+    tiling_constraints: Vec<SeamConstraint>,
 }
 impl WorkbenchState {
     pub fn new(spec: ExperimentSpec) -> Self {
@@ -163,6 +173,7 @@ impl WorkbenchState {
             tiling_pointer: None,
             tiling_new_basis: false,
             tiling_drag_active: false,
+            tiling_constraints: Vec::new(),
         }
     }
     pub fn draft(&self) -> &ExperimentSpec {
@@ -574,6 +585,107 @@ impl WorkbenchState {
     pub fn set_tiling_pointer(&mut self, pointer: Option<crate::sim::tiling::Vec2>) {
         self.tiling_pointer = pointer;
     }
+    pub fn tiling_constraint_count(&self) -> usize {
+        self.tiling_constraints.len()
+    }
+    pub fn clear_tiling_constraints(&mut self) {
+        self.tiling_constraints.clear();
+    }
+    pub fn solve_tiling_seams(&mut self) -> Result<SeamSolveSummary, String> {
+        let tiling = self
+            .draft
+            .tiling
+            .as_ref()
+            .ok_or_else(|| "draw or choose at least one polygon first".to_string())?;
+        let scale = tiling
+            .translation_a
+            .length()
+            .max(tiling.translation_b.length())
+            .max(1e-6);
+        let proposals = crate::sim::tiling::propose_full_edge_seams(tiling, scale * 0.2)?;
+        let edge_count = tiling
+            .instances
+            .iter()
+            .map(|instance| {
+                tiling
+                    .prototypes
+                    .iter()
+                    .find(|prototype| prototype.id == instance.prototype)
+                    .ok_or_else(|| "basis references a missing prototype".to_string())
+                    .and_then(|prototype| {
+                        crate::sim::tiling::polygon::prototype_vertices(&prototype.shape)
+                            .map(|vertices| vertices.len())
+                            .map_err(|issues| {
+                                issues
+                                    .into_iter()
+                                    .map(|issue| issue.message)
+                                    .collect::<Vec<_>>()
+                                    .join("; ")
+                            })
+                    })
+            })
+            .collect::<Result<Vec<_>, _>>()?
+            .into_iter()
+            .sum::<usize>();
+        if proposals.len() * 2 != edge_count {
+            return Err(format!(
+                "found {} complete seam pairs for {edge_count} edges; move matching full edges closer, then solve again",
+                proposals.len()
+            ));
+        }
+        let constraints = proposals
+            .into_iter()
+            .map(|proposal| proposal.constraint)
+            .collect::<Vec<_>>();
+        let solved = crate::sim::tiling::solve_edge_constraints(tiling, &constraints, None)
+            .map_err(|error| error.0)?;
+        let summary = SeamSolveSummary {
+            seams: constraints.len(),
+            max_displacement: solved.max_displacement,
+            max_residual: solved.max_seam_residual,
+        };
+        let mut next = self.draft.clone();
+        next.tiling = Some(solved.draft);
+        self.replace_draft(next)
+            .map_err(|error| error.to_string())?;
+        self.tiling_constraints = constraints;
+        Ok(summary)
+    }
+    pub fn drag_constrained_tiling_vertex(
+        &mut self,
+        prototype: PrototypeId,
+        vertex: usize,
+        local_target: crate::sim::tiling::Vec2,
+    ) -> Result<SeamSolveSummary, String> {
+        if self.tiling_constraints.is_empty() {
+            return Err("solve seams before using linked vertex dragging".into());
+        }
+        let tiling = self
+            .draft
+            .tiling
+            .as_ref()
+            .ok_or_else(|| "tiling draft is missing".to_string())?;
+        let solved = crate::sim::tiling::solve_edge_constraints(
+            tiling,
+            &self.tiling_constraints,
+            Some(crate::sim::tiling::DragTarget {
+                prototype,
+                vertex,
+                to: local_target,
+            }),
+        )
+        .map_err(|error| error.0)?;
+        let summary = SeamSolveSummary {
+            seams: self.tiling_constraints.len(),
+            max_displacement: solved.max_displacement,
+            max_residual: solved.max_seam_residual,
+        };
+        let mut next = self.draft.clone();
+        next.tiling = Some(solved.draft);
+        self.import_tiling_drag_draft(next)
+            .map_err(|error| error.to_string())?;
+        Ok(summary)
+    }
     pub fn set_tiling_tool(&mut self, tool: super::tiling_editor::TilingTool) {
         self.tiling_tool = tool;
         if tool != super::tiling_editor::TilingTool::DrawPolygon {
@@ -766,6 +878,7 @@ impl WorkbenchState {
         self.tiling_pointer = None;
         self.tiling_tool = super::tiling_editor::TilingTool::Select;
         self.tiling_new_basis = false;
+        self.tiling_constraints.clear();
         self.refresh_rule_selection();
         self.growth_editor =
             editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
@@ -916,6 +1029,7 @@ impl WorkbenchState {
     }
     pub fn undo(&mut self) -> Result<(), HistoryError> {
         self.finish_tiling_drag();
+        self.tiling_constraints.clear();
         self.history.undo(&mut self.draft)?;
         self.refresh_rule_selection();
         self.growth_editor =
@@ -929,6 +1043,7 @@ impl WorkbenchState {
     }
     pub fn redo(&mut self) -> Result<(), HistoryError> {
         self.finish_tiling_drag();
+        self.tiling_constraints.clear();
         self.history.redo(&mut self.draft)?;
         self.refresh_rule_selection();
         self.growth_editor =
@@ -938,6 +1053,7 @@ impl WorkbenchState {
     }
     pub fn revert(&mut self) {
         self.finish_tiling_drag();
+        self.tiling_constraints.clear();
         self.draft = self.authoritative.clone();
         self.growth_editing = false;
         self.numeric_editor = None;
@@ -955,6 +1071,7 @@ impl WorkbenchState {
     }
     pub fn accept(&mut self, normalized: ExperimentSpec) {
         self.finish_tiling_drag();
+        self.tiling_constraints.clear();
         self.authoritative = normalized.clone();
         self.draft = normalized;
         self.growth_editing = false;
@@ -1419,6 +1536,7 @@ impl WorkbenchState {
         };
         self.selected_channel = id;
         self.replace_draft(next)?;
+        self.tiling_constraints.clear();
         self.refresh_rule_selection();
         self.selected_kernel = selected_kernel.or(self.selected_kernel);
         Ok(())
@@ -1937,6 +2055,7 @@ impl WorkbenchState {
             })?;
         self.selected_basis = bases.first().copied().unwrap_or(BasisId(0));
         self.replace_draft(next)?;
+        self.tiling_constraints.clear();
         self.refresh_rule_selection();
         self.growth_editor =
             editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
@@ -2744,5 +2863,25 @@ mod tests {
         state.select_next_prototype();
         assert_eq!(state.selected_basis(), BasisId(1));
         assert_eq!(state.tiling_prototype(), Some(PrototypeId(1)));
+    }
+
+    #[test]
+    fn seam_assist_solves_and_keeps_later_vertex_drags_edge_to_edge() {
+        let mut state = WorkbenchState::new(basis_fixture());
+        state.cycle_tiling_preset().unwrap();
+        let mut rough = state.draft().clone();
+        rough.tiling.as_mut().unwrap().translation_a.x += 0.02;
+        state.replace_draft(rough).unwrap();
+
+        let summary = state.solve_tiling_seams().unwrap();
+        assert_eq!(summary.seams, 2);
+        assert_eq!(state.tiling_constraint_count(), 2);
+        crate::sim::tiling::validate_coverage(state.draft().tiling.as_ref().unwrap()).unwrap();
+
+        let prototype = state.draft().tiling.as_ref().unwrap().prototypes[0].id;
+        state
+            .drag_constrained_tiling_vertex(prototype, 2, crate::sim::tiling::Vec2::new(1.1, 1.1))
+            .unwrap();
+        crate::sim::tiling::validate_coverage(state.draft().tiling.as_ref().unwrap()).unwrap();
     }
 }

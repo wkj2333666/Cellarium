@@ -6,6 +6,7 @@
 
 pub mod arrangement;
 pub mod compile;
+pub mod constraints;
 pub mod copies;
 pub mod coverage;
 pub mod half_edge;
@@ -14,12 +15,14 @@ pub mod polygon;
 pub mod predicates;
 pub mod presets;
 pub mod snap;
+pub mod solver;
 
 pub use arrangement::{
     ArrangementFace, AtomicEdge, HalfEdgeId, NeighborPlacement, PeriodicArrangement, ShapeEdgeRef,
     VertexId,
 };
 pub use compile::{CompiledTiling, compile_tiling};
+pub use constraints::{SeamConstraint, SeamProposal, propose_full_edge_seams};
 pub use copies::{Aabb, GeometryBudget, LatticeCopyBounds};
 pub use coverage::{
     CoverageReport, TilingDiagnostic, TilingValidationReport, validate_coverage,
@@ -33,3 +36,4 @@ pub use model::{
 pub use predicates::{SegmentRelation, segment_relation};
 pub use presets::{TilingPreset, build_preset};
 pub use snap::{SnapResult, snap_edge};
+pub use solver::{DragTarget, SolveDiagnostic, SolvedTiling, solve_edge_constraints};

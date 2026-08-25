@@ -1,6 +1,6 @@
 use super::{GeometryBudget, PeriodicArrangement, PeriodicTilingDraft, TileId, Vec2};
 
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, Hash, Ord, PartialEq, PartialOrd)]
 pub struct EdgeRef {
     pub tile: TileId,
     pub edge: u16,

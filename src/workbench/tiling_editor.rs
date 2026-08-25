@@ -434,7 +434,7 @@ impl TilingScene {
         }
     }
 
-    fn prototype_local_point(&self, prototype: PrototypeId, world: Vec2) -> Vec2 {
+    pub fn prototype_local_point(&self, prototype: PrototypeId, world: Vec2) -> Vec2 {
         let instance = self
             .selected_basis
             .and_then(|selected| {

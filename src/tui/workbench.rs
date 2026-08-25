@@ -36,6 +36,10 @@ fn toolbar_segments(
             ("[D] Shape", ToolbarAction::EditorKey(KeyCode::Char('d'))),
             ("[A] Add basis", ToolbarAction::Ui(UiCommand::ContextAdd)),
             ("[P] Preset", ToolbarAction::Ui(UiCommand::CyclePreset)),
+            (
+                "[S] Solve seams",
+                ToolbarAction::EditorKey(KeyCode::Char('s')),
+            ),
             ("[N] Next basis", ToolbarAction::Ui(UiCommand::ShapeNext)),
             ("[+] Sides", ToolbarAction::Ui(UiCommand::ShapeIncrease)),
             ("[-] Sides", ToolbarAction::Ui(UiCommand::ShapeDecrease)),
@@ -799,6 +803,10 @@ pub fn draw_workbench(
                 ));
                 lines.push(Line::from("Select: drag vertex · right remove"));
                 lines.push(Line::from("P preset · N basis · +/- regular sides"));
+                lines.push(Line::from(format!(
+                    "S solve full-edge seams · linked seams: {}",
+                    state.tiling_constraint_count()
+                )));
                 lines.push(Line::from("Wheel zoom · middle pan"));
                 lines.push(Line::from(""));
                 lines.extend(tiling_inspector_texts(state).into_iter().map(Line::from));
@@ -1140,6 +1148,10 @@ fn tiling_inspector_texts(state: &crate::workbench::WorkbenchState) -> Vec<Strin
         format!(
             "b=({:.3}, {:.3})",
             tiling.translation_b.x, tiling.translation_b.y
+        ),
+        format!(
+            "linked full-edge seams: {}",
+            state.tiling_constraint_count()
         ),
     ];
     match crate::sim::tiling::validate_coverage(tiling) {

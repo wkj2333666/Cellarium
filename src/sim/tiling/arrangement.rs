@@ -2,9 +2,7 @@ use std::collections::{BTreeMap, BTreeSet};
 
 use super::{
     Aabb, BasisId, GeometryBudget, LatticeCopyBounds, PeriodicTilingDraft, SegmentRelation,
-    TilingDiagnostic, Vec2,
-    polygon::instance_polygon,
-    predicates::{point_on_segment, segment_relation},
+    TilingDiagnostic, Vec2, polygon::instance_polygon, predicates::segment_relation,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -168,14 +166,21 @@ impl PeriodicArrangement {
                                 ));
                             }
                         }
-                        SegmentRelation::TEndpoint | SegmentRelation::CollinearOverlap => {
-                            add_split_if_on(&mut split_parameters[left_index], *left, right_start);
-                            add_split_if_on(&mut split_parameters[left_index], *left, right_end);
-                            if matches!(
-                                segment_relation(left.start, left.end, right_start, right_end),
-                                SegmentRelation::CollinearOverlap
-                            ) && (left.end - left.start).dot(right_end - right_start) > 0.0
-                            {
+                        SegmentRelation::TEndpoint => {
+                            let key = ordered_relation_key(left.source, right.source, offset);
+                            if relation_diagnostics.insert(("t_junction", key)) {
+                                diagnostics.push(diagnostic_at(
+                                    "t_junction",
+                                    format!(
+                                        "edge endpoint meets the interior of another edge between {:?} and {:?} at offset {:?}",
+                                        left.source, right.source, offset
+                                    ),
+                                    edge_path(left.source),
+                                ));
+                            }
+                        }
+                        SegmentRelation::CollinearOverlap => {
+                            if (left.end - left.start).dot(right_end - right_start) > 0.0 {
                                 let key = ordered_relation_key(left.source, right.source, offset);
                                 if relation_diagnostics
                                     .insert(("incompatible_collinear_overlap", key))
@@ -195,7 +200,7 @@ impl PeriodicArrangement {
         }
         if diagnostics
             .iter()
-            .any(|diagnostic| diagnostic.code == "proper_crossing")
+            .any(|diagnostic| matches!(diagnostic.code, "proper_crossing" | "t_junction"))
         {
             return Err(diagnostics);
         }
@@ -411,16 +416,6 @@ fn edge_aabb(edge: ShapeEdge) -> Aabb {
     }
 }
 
-fn add_split_if_on(parameters: &mut Vec<f64>, edge: ShapeEdge, point: Vec2) {
-    if !point_on_segment(point, edge.start, edge.end) {
-        return;
-    }
-    let parameter = edge_parameter(edge, point);
-    if parameter > 1e-12 && parameter < 1.0 - 1e-12 {
-        parameters.push(parameter);
-    }
-}
-
 fn snap_to_edge_endpoints(point: Vec2, edge: ShapeEdge, draft: &PeriodicTilingDraft) -> Vec2 {
     if points_close(point, edge.start, draft) {
         edge.start
@@ -428,15 +423,6 @@ fn snap_to_edge_endpoints(point: Vec2, edge: ShapeEdge, draft: &PeriodicTilingDr
         edge.end
     } else {
         point
-    }
-}
-
-fn edge_parameter(edge: ShapeEdge, point: Vec2) -> f64 {
-    let direction = edge.end - edge.start;
-    if direction.x.abs() >= direction.y.abs() {
-        (point.x - edge.start.x) / direction.x
-    } else {
-        (point.y - edge.start.y) / direction.y
     }
 }
 
@@ -639,25 +625,11 @@ mod tests {
     }
 
     #[test]
-    fn long_t_seam_splits_and_neighbors_both_short_faces() {
-        let arrangement =
+    fn t_junction_is_rejected_in_strict_edge_to_edge_mode() {
+        let errors =
             PeriodicArrangement::build(&t_junction_fixture(), GeometryBudget::authoritative())
-                .unwrap();
-        let long = arrangement
-            .atomic_edges
-            .iter()
-            .filter(|edge| edge.source.basis == TileId(0) && edge.source.edge == 1)
-            .collect::<Vec<_>>();
-        assert_eq!(long.len(), 2);
-        assert_eq!(long[0].interval, [0.0, 0.5]);
-        assert_eq!(long[1].interval, [0.5, 1.0]);
-        let targets = arrangement
-            .neighbor_ring(TileId(0))
-            .into_iter()
-            .map(|neighbor| neighbor.target_basis)
-            .collect::<std::collections::BTreeSet<_>>();
-        assert!(targets.contains(&TileId(1)));
-        assert!(targets.contains(&TileId(2)));
+                .unwrap_err();
+        assert!(errors.iter().any(|error| error.code == "t_junction"));
     }
 
     #[test]
@@ -719,10 +691,14 @@ mod tests {
         );
 
         let face_budget = GeometryBudget {
-            max_faces: 2,
+            max_faces: 1,
             ..GeometryBudget::authoritative()
         };
-        let errors = PeriodicArrangement::build(&t_junction_fixture(), face_budget).unwrap_err();
+        let errors = PeriodicArrangement::build(
+            &build_preset(TilingPreset::OctagonSquare, 1.0),
+            face_budget,
+        )
+        .unwrap_err();
         assert!(errors.iter().any(|error| error.code == "budget_faces"));
     }
 }

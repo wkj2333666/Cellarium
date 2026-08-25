@@ -122,47 +122,11 @@ pub fn compile_tiling(draft: &PeriodicTilingDraft) -> Result<CompiledTiling, Vec
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::sim::tiling::{
-        PrototypeId, PrototypeShape, RigidTransform, TileInstance, TilePrototype, TilingMode,
-        validate_coverage,
-    };
-
-    fn polygon(id: u32, vertices: &[[f64; 2]]) -> TilePrototype {
-        TilePrototype {
-            id: PrototypeId(id),
-            name: format!("polygon-{id}"),
-            shape: PrototypeShape::SimplePolygon {
-                vertices: vertices
-                    .iter()
-                    .map(|point| Vec2::new(point[0], point[1]))
-                    .collect(),
-            },
-        }
-    }
-
-    fn t_fixture() -> PeriodicTilingDraft {
-        PeriodicTilingDraft {
-            translation_a: Vec2::new(2.0, 0.0),
-            translation_b: Vec2::new(0.0, 2.0),
-            prototypes: vec![
-                polygon(0, &[[0.0, 0.0], [1.0, 0.0], [1.0, 2.0], [0.0, 2.0]]),
-                polygon(1, &[[1.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0]]),
-                polygon(2, &[[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0]]),
-            ],
-            instances: (0..3)
-                .map(|id| TileInstance {
-                    id: TileId(id),
-                    prototype: PrototypeId(id),
-                    transform: RigidTransform::default(),
-                })
-                .collect(),
-            mode: TilingMode::Topological,
-        }
-    }
+    use crate::sim::tiling::{TilingPreset, build_preset, validate_coverage};
 
     #[test]
     fn validated_atomic_arrangement_compiles_deterministically_to_csr() {
-        let draft = t_fixture();
+        let draft = build_preset(TilingPreset::OctagonSquare, 1.0);
         let report = validate_coverage(&draft).unwrap();
         let first = compile_tiling(&draft).unwrap();
         let second = compile_tiling(&draft).unwrap();
@@ -187,6 +151,5 @@ mod tests {
             .map(|target| first.tile_ids[*target])
             .collect::<std::collections::BTreeSet<_>>();
         assert!(targets.contains(&TileId(1)));
-        assert!(targets.contains(&TileId(2)));
     }
 }

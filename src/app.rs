@@ -1080,6 +1080,18 @@ impl App {
                 return true;
             }
             match key.code {
+                KeyCode::Char('s') if key.modifiers.is_empty() => {
+                    self.workbench_notice = Some(match self.workbench.solve_tiling_seams() {
+                        Ok(summary) => format!(
+                            "solved {} complete seams · moved ≤ {:.4} · residual {:.2e} · linked drag active",
+                            summary.seams, summary.max_displacement, summary.max_residual,
+                        ),
+                        Err(error) => format!("seam solve: {error}"),
+                    });
+                    self.workbench_draft_scene_generation =
+                        self.workbench_draft_scene_generation.wrapping_add(1);
+                    return true;
+                }
                 KeyCode::Char('d') => {
                     let next = if self.workbench.tiling_tool()
                         == crate::workbench::tiling_editor::TilingTool::DrawPolygon
@@ -2735,6 +2747,7 @@ impl App {
                         }
                         _ => {}
                     }
+                    let mut linked_drag = false;
                     let applied = match action {
                         crate::input::MouseAction::Inspect => false,
                         crate::input::MouseAction::Paint => self
@@ -2751,7 +2764,25 @@ impl App {
                             })
                             .map(|(prototype, vertex)| {
                                 let to = scene.pixel_to_world(px, py, frame_size[0] as u32, frame_size[1] as u32);
-                                scene.apply_gesture(crate::workbench::tiling_editor::TilingGesture::MoveVertex { prototype, vertex, to }).is_ok()
+                                if self.workbench.tiling_constraint_count() > 0 {
+                                    linked_drag = true;
+                                    let local = scene.prototype_local_point(prototype, to);
+                                    match self.workbench.drag_constrained_tiling_vertex(prototype, vertex, local) {
+                                        Ok(summary) => {
+                                            self.workbench_notice = Some(format!(
+                                                "linked seam drag · residual {:.2e}",
+                                                summary.max_residual,
+                                            ));
+                                            true
+                                        }
+                                        Err(error) => {
+                                            self.workbench_notice = Some(format!("linked drag: {error}"));
+                                            false
+                                        }
+                                    }
+                                } else {
+                                    scene.apply_gesture(crate::workbench::tiling_editor::TilingGesture::MoveVertex { prototype, vertex, to }).is_ok()
+                                }
                             })
                             .unwrap_or(false),
                         crate::input::MouseAction::Erase => scene
@@ -2767,7 +2798,13 @@ impl App {
                         crate::input::MouseAction::Pan { .. }
                         | crate::input::MouseAction::Zoom { .. } => unreachable!(),
                     };
-                    if applied && scene.draft != *self.workbench.draft().tiling.as_ref().unwrap() {
+                    if applied
+                        && !linked_drag
+                        && scene.draft != *self.workbench.draft().tiling.as_ref().unwrap()
+                    {
+                        if matches!(action, crate::input::MouseAction::Erase) {
+                            self.workbench.clear_tiling_constraints();
+                        }
                         let mut draft = self.workbench.draft().clone();
                         draft.tiling = Some(scene.draft);
                         let _ = if matches!(action, crate::input::MouseAction::Paint) {

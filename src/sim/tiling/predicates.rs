@@ -61,10 +61,6 @@ pub fn segment_relation(a0: Vec2, a1: Vec2, b0: Vec2, b1: Vec2) -> SegmentRelati
     }
 }
 
-pub(crate) fn point_on_segment(point: Vec2, start: Vec2, end: Vec2) -> bool {
-    sign(start, end, point) == Ordering::Equal && in_bounds(point, start, end)
-}
-
 fn sign(a: Vec2, b: Vec2, c: Vec2) -> Ordering {
     orient2d(
         Coord { x: a.x, y: a.y },

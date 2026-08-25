@@ -200,20 +200,6 @@ mod tests {
         }
     }
 
-    fn t_fixture() -> PeriodicTilingDraft {
-        PeriodicTilingDraft {
-            translation_a: Vec2::new(2.0, 0.0),
-            translation_b: Vec2::new(0.0, 2.0),
-            prototypes: vec![
-                polygon(0, &[[0.0, 0.0], [1.0, 0.0], [1.0, 2.0], [0.0, 2.0]]),
-                polygon(1, &[[1.0, 0.0], [2.0, 0.0], [2.0, 1.0], [1.0, 1.0]]),
-                polygon(2, &[[1.0, 1.0], [2.0, 1.0], [2.0, 2.0], [1.0, 2.0]]),
-            ],
-            instances: vec![instance(0), instance(1), instance(2)],
-            mode: TilingMode::Topological,
-        }
-    }
-
     #[test]
     fn exact_once_fixtures_have_unit_multiplicity_and_torus_euler_zero() {
         for draft in [
@@ -221,7 +207,6 @@ mod tests {
             build_preset(TilingPreset::EquilateralTriangles, 1.0),
             build_preset(TilingPreset::RegularHexagon, 1.0),
             build_preset(TilingPreset::OctagonSquare, 1.0),
-            t_fixture(),
         ] {
             let report = validate_periodic_tiling(&draft, GeometryBudget::authoritative()).unwrap();
             assert_eq!(report.coverage_multiplicity, 1);
@@ -326,10 +311,6 @@ mod tests {
                 "octagon-square",
                 include_str!("../../../tests/fixtures/tiling/octagon_square.ron"),
             ),
-            (
-                "T junction",
-                include_str!("../../../tests/fixtures/tiling/t_junction.ron"),
-            ),
         ];
         for (name, source) in VALID {
             let draft: PeriodicTilingDraft = ron::from_str(source).unwrap();
@@ -357,5 +338,11 @@ mod tests {
             let draft: PeriodicTilingDraft = ron::from_str(source).unwrap();
             assert!(validate_coverage(&draft).is_err(), "{name}");
         }
+        let t_junction: PeriodicTilingDraft = ron::from_str(include_str!(
+            "../../../tests/fixtures/tiling/t_junction.ron"
+        ))
+        .unwrap();
+        let errors = validate_coverage(&t_junction).unwrap_err();
+        assert!(errors.iter().any(|error| error.code == "t_junction"));
     }
 }
