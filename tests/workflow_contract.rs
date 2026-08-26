@@ -62,14 +62,16 @@ fn linux_release_uses_an_old_glibc_baseline_for_server_compatibility() {
 }
 
 #[test]
-fn release_is_staged_as_a_draft_after_quality_gates() {
+fn release_is_published_as_stable_after_quality_gates() {
     assert!(RELEASE.contains("cargo fmt --all -- --check"));
     assert!(RELEASE.contains("cargo test --locked --all-targets"));
     assert!(RELEASE.contains("cargo test --locked --no-default-features --all-targets"));
     assert!(RELEASE.contains("cargo clippy --locked --all-targets -- -D warnings"));
     assert!(RELEASE.contains("needs: [version, quality]"));
-    assert!(RELEASE.contains("--verify-tag --generate-notes --draft"));
-    assert!(!RELEASE.contains("name: Publish GitHub Release"));
+    assert!(RELEASE.contains("name: Publish GitHub Release"));
+    assert!(RELEASE.contains("--verify-tag --generate-notes"));
+    assert!(!RELEASE.contains("--draft"));
+    assert!(!RELEASE.contains("--prerelease"));
 }
 
 #[test]

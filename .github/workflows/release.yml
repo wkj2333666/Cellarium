@@ -140,7 +140,7 @@ jobs:
           retention-days: 7
 
   release:
-    name: Stage draft GitHub Release
+    name: Publish GitHub Release
     needs: build
     runs-on: ubuntu-latest
     permissions:
@@ -160,4 +160,4 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        run: gh release create "$GITHUB_REF_NAME" cellarium-* SHA256SUMS --verify-tag --generate-notes --draft
+        run: gh release create "$GITHUB_REF_NAME" cellarium-* SHA256SUMS --verify-tag --generate-notes

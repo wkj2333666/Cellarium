@@ -853,7 +853,9 @@ pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
         .ok_or_else(|| io::Error::other("startup simulation did not render graphics"))?;
     let bright = startup
         .rgba
-        .chunks_exact(4)
+        .as_chunks::<4>()
+        .0
+        .iter()
         .enumerate()
         .filter(|(_, pixel)| pixel[0].max(pixel[1]).max(pixel[2]) > 80)
         .map(|(index, _)| {
@@ -1039,7 +1041,9 @@ pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
         .map(|graphics| {
             graphics
                 .rgba
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|pixel| pixel[0] == 255 && pixel[1] == 190 && pixel[2] == 70)
                 .count()
         })
