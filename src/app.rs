@@ -1778,11 +1778,20 @@ impl App {
         let draft = self.workbench.draft();
         let basis_ids = draft.basis_ids();
         let channels = draft.channels.len();
-        self.experiment_service.as_ref().is_some_and(|service| {
-            service.world().bases() == basis_ids.len() && service.world().channels() == channels
-        }) || (self.remote_basis_ids == basis_ids
-            && self.remote_channels == channels
-            && self.remote_basis_cells.is_some())
+        let same_structure = draft.geometry == self.experiment_model.geometry
+            && draft.tiling == self.experiment_model.tiling
+            && basis_ids == self.experiment_model.basis_ids()
+            && draft.channels.iter().map(|channel| channel.id).eq(self
+                .experiment_model
+                .channels
+                .iter()
+                .map(|channel| channel.id));
+        same_structure
+            && (self.experiment_service.as_ref().is_some_and(|service| {
+                service.world().bases() == basis_ids.len() && service.world().channels() == channels
+            }) || (self.remote_basis_ids == basis_ids
+                && self.remote_channels == channels
+                && self.remote_basis_cells.is_some()))
     }
 
     pub fn workbench_basis_scene(
@@ -1794,18 +1803,14 @@ impl App {
         let basis_ids = draft.basis_ids();
         let channels = draft.channels.len();
         let runtime = self
-            .experiment_service
-            .as_ref()
-            .and_then(|service| {
-                (service.world().bases() == basis_ids.len()
-                    && service.world().channels() == channels)
-                    .then_some(service.world().cells())
+            .workbench_runtime_matches_draft()
+            .then(|| {
+                self.experiment_service
+                    .as_ref()
+                    .map(|service| service.world().cells())
+                    .or(self.remote_basis_cells.as_deref())
             })
-            .or_else(|| {
-                (self.remote_basis_ids == basis_ids && self.remote_channels == channels)
-                    .then_some(self.remote_basis_cells.as_deref())
-                    .flatten()
-            });
+            .flatten();
         let initial;
         let cells = if let Some(runtime) = runtime {
             runtime
@@ -7115,6 +7120,27 @@ mod tests {
         assert!(
             app.workbench_basis_scene(crate::workbench::ChannelView::Composite, 7)
                 .is_some()
+        );
+    }
+
+    #[test]
+    fn channel_preview_rejects_equal_cardinality_but_different_tiling_geometry() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut().cycle_tiling_preset().unwrap(); // square
+        let request = app.workbench_apply_request(1);
+        app.submit_draft(request).unwrap();
+        app.enter_workbench();
+        assert!(app.workbench_runtime_matches_draft());
+
+        app.workbench_mut().cycle_tiling_preset().unwrap(); // triangles
+        app.workbench_mut().cycle_tiling_preset().unwrap(); // hexagon
+        assert_eq!(app.workbench().draft().basis_ids().len(), 1);
+        assert_eq!(app.experiment_model.basis_ids().len(), 1);
+
+        assert!(
+            !app.workbench_runtime_matches_draft(),
+            "runtime square cells must not be interpreted through an unapplied hexagonal draft"
         );
     }
 
