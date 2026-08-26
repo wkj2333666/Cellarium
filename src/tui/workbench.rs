@@ -23,6 +23,28 @@ pub enum ToolbarAction {
     ToggleGrowthEditor,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolbarItem {
+    pub label: String,
+    pub action: ToolbarAction,
+    /// Coordinates are relative to the toolbar's top-left corner.
+    pub rect: Rect,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolbarRow {
+    pub text: String,
+    pub items: Vec<ToolbarItem>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ToolbarLayout {
+    pub rows: Vec<ToolbarRow>,
+    pub height: u16,
+}
+
+const MAX_TOOLBAR_ROWS: u16 = 4;
+
 fn workbench_scene_presence(state: &crate::workbench::WorkbenchState) -> ScenePresence {
     match state.section() {
         WorkbenchSection::Experiment => ScenePresence::Text,
@@ -169,6 +191,73 @@ pub fn toolbar_text(state: &crate::workbench::WorkbenchState) -> String {
         .join("  ")
 }
 
+pub fn toolbar_layout(state: &crate::workbench::WorkbenchState, width: u16) -> ToolbarLayout {
+    if width == 0 {
+        return ToolbarLayout {
+            rows: Vec::new(),
+            height: 0,
+        };
+    }
+    let mut rows = vec![ToolbarRow {
+        text: String::new(),
+        items: Vec::new(),
+    }];
+    for (label, action) in toolbar_segments(state) {
+        let label_width = label.chars().count().min(usize::from(width)) as u16;
+        let row = rows.last_mut().expect("toolbar has a row");
+        let spacing = if row.text.is_empty() { 0 } else { 2 };
+        if !row.text.is_empty()
+            && row.text.chars().count() + spacing + usize::from(label_width) > usize::from(width)
+        {
+            if rows.len() >= usize::from(MAX_TOOLBAR_ROWS) {
+                break;
+            }
+            rows.push(ToolbarRow {
+                text: String::new(),
+                items: Vec::new(),
+            });
+        }
+        let row_index = rows.len() as u16 - 1;
+        let row = rows.last_mut().expect("toolbar has a row");
+        if !row.text.is_empty() {
+            row.text.push_str("  ");
+        }
+        let start = row.text.chars().count() as u16;
+        let visible = label
+            .chars()
+            .take(usize::from(label_width))
+            .collect::<String>();
+        row.text.push_str(&visible);
+        row.items.push(ToolbarItem {
+            label: visible,
+            action,
+            rect: Rect::new(start, row_index, label_width, 1),
+        });
+    }
+    ToolbarLayout {
+        height: rows.len() as u16,
+        rows,
+    }
+}
+
+pub fn toolbar_action_at_position(
+    layout: &ToolbarLayout,
+    row: u16,
+    column: u16,
+) -> Option<ToolbarAction> {
+    layout
+        .rows
+        .get(usize::from(row))?
+        .items
+        .iter()
+        .find(|item| {
+            item.rect
+                .contains(ratatui::layout::Position::new(column, row))
+        })
+        .map(|item| item.action)
+}
+
+#[cfg(test)]
 fn static_canvas_header_lines(
     state: &crate::workbench::WorkbenchState,
     context: &str,
@@ -179,6 +268,21 @@ fn static_canvas_header_lines(
     } else {
         vec![toolbar, context.to_string()]
     }
+}
+
+fn canvas_header_lines(
+    state: &crate::workbench::WorkbenchState,
+    context: &str,
+    width: u16,
+) -> (ToolbarLayout, Vec<String>) {
+    let layout = toolbar_layout(state, width);
+    let mut lines = layout
+        .rows
+        .iter()
+        .map(|row| row.text.clone())
+        .collect::<Vec<_>>();
+    lines.push(context.to_string());
+    (layout, lines)
 }
 
 pub fn toolbar_action_at(
@@ -195,6 +299,29 @@ pub fn toolbar_action_at(
         start = end + 2;
     }
     None
+}
+
+pub fn channel_row_rects(
+    state: &crate::workbench::WorkbenchState,
+    inspector: Rect,
+) -> Vec<(crate::sim::experiment_model::ChannelId, Rect)> {
+    let inner = Rect::new(
+        inspector.x.saturating_add(1),
+        inspector.y.saturating_add(1),
+        inspector.width.saturating_sub(2),
+        inspector.height.saturating_sub(2),
+    );
+    let first_row = inner.y.saturating_add(11);
+    state
+        .draft()
+        .channels
+        .iter()
+        .enumerate()
+        .filter_map(|(index, channel)| {
+            let y = first_row.saturating_add(index as u16);
+            (y < inner.bottom()).then_some((channel.id, Rect::new(inner.x, y, inner.width, 1)))
+        })
+        .collect()
 }
 pub fn workbench_layout(area: Rect) -> WorkbenchLayout {
     if area.width >= 120 {
@@ -438,7 +565,8 @@ pub fn draw_workbench(
         app.workbench().focus() == WorkbenchFocus::Canvas,
     );
     let canvas_content = canvas_block.inner(layout.canvas);
-    let header_height = canvas_content.height.min(2);
+    let toolbar = toolbar_layout(app.workbench(), canvas_content.width);
+    let header_height = canvas_content.height.min(toolbar.height.saturating_add(1));
     let canvas_header = Rect::new(
         canvas_content.x,
         canvas_content.y,
@@ -641,12 +769,13 @@ pub fn draw_workbench(
         }
         WorkbenchSection::Experiment => "Review changes; Ctrl+Enter applies explicitly".into(),
     };
-    let mut header_lines = static_canvas_header_lines(state, &header)
+    let (_, header_lines) = canvas_header_lines(state, &header, canvas_content.width);
+    let mut header_lines = header_lines
         .into_iter()
         .map(|line| Line::styled(line, Style::default().fg(Color::Rgb(150, 190, 240))))
         .collect::<Vec<_>>();
     if let Some(editor) = state.numeric_editor() {
-        header_lines.truncate(1);
+        header_lines.truncate(usize::from(toolbar.height));
         header_lines.push(Line::from(vec![
             Span::styled(
                 format!("Exact {} = ", editor.label()),
@@ -666,7 +795,7 @@ pub fn draw_workbench(
             ),
         ]));
     } else if let Some(buffer) = state.kernel_resize_editor() {
-        header_lines.truncate(1);
+        header_lines.truncate(usize::from(toolbar.height));
         header_lines.push(Line::from(vec![
             Span::styled(
                 "Resize width,height,anchor_x,anchor_y = ",
@@ -1199,6 +1328,15 @@ pub fn draw_workbench(
             Line::from(app.workbench_notice().unwrap_or("")),
             Line::from("W leave Workbench · ? help"),
         ]);
+        let inspector_title = if state.section() == WorkbenchSection::Growth {
+            let total = lines.len();
+            let visible = usize::from(inspector.height.saturating_sub(2)).max(1);
+            let start = usize::from(state.growth_help_scroll()).min(total.saturating_sub(1));
+            let end = (start + visible).min(total);
+            format!(" Inspector · syntax  {}–{}/{} ", start + 1, end, total)
+        } else {
+            " Inspector ".to_string()
+        };
         frame.render_widget(
             Paragraph::new(lines)
                 .scroll((
@@ -1211,15 +1349,30 @@ pub fn draw_workbench(
                 ))
                 .wrap(Wrap { trim: false })
                 .block(panel(
-                    if state.section() == WorkbenchSection::Growth {
-                        " Inspector · syntax "
-                    } else {
-                        " Inspector "
-                    },
+                    inspector_title,
                     state.focus() == WorkbenchFocus::Inspector,
                 )),
             inspector,
         );
+        if state.section() == WorkbenchSection::Channels {
+            let labels = channel_inspector_texts(state);
+            for ((channel, rect), label) in
+                channel_row_rects(state, inspector).into_iter().zip(labels)
+            {
+                let selected = channel == state.selected_channel();
+                frame.render_widget(
+                    Paragraph::new(label).style(if selected {
+                        Style::default()
+                            .fg(Color::Rgb(255, 225, 130))
+                            .bg(Color::Rgb(30, 48, 76))
+                            .add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default().fg(Color::Rgb(190, 205, 225))
+                    }),
+                    rect,
+                );
+            }
+        }
     }
     let (frame_width, frame_height) = display.framebuffer_size(graphics_area);
     app.set_viewport(graphics_area, [frame_width, frame_height]);
@@ -1775,7 +1928,7 @@ fn plot_sparkline(values: &[Option<f32>], width: usize) -> String {
         .collect()
 }
 
-fn panel(title: &'static str, focused: bool) -> Block<'static> {
+fn panel(title: impl Into<Line<'static>>, focused: bool) -> Block<'static> {
     Block::default()
         .title(title)
         .borders(Borders::ALL)
@@ -1897,6 +2050,55 @@ mod tests {
             toolbar_action_at(&state, color),
             Some(ToolbarAction::Ui(UiCommand::CycleColor))
         );
+    }
+
+    #[test]
+    fn responsive_toolbar_wraps_without_losing_visible_hit_targets() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.select_section(WorkbenchSection::Kernels);
+        let layout = toolbar_layout(&state, 52);
+        assert!(layout.rows.len() >= 2);
+        assert!(layout.rows.len() <= usize::from(MAX_TOOLBAR_ROWS));
+        for (row_index, row) in layout.rows.iter().enumerate() {
+            assert!(
+                row.text.chars().count() <= 52,
+                "row overflowed: {:?}",
+                row.text
+            );
+            for item in &row.items {
+                let column = item.rect.x + item.rect.width / 2;
+                assert_eq!(
+                    toolbar_action_at_position(&layout, row_index as u16, column),
+                    Some(item.action),
+                    "visible toolbar item {:?} was not clickable",
+                    item.label
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn channel_rows_have_distinct_clickable_rectangles_for_every_visible_channel() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.add_channel().unwrap();
+        state.add_channel().unwrap();
+        state.select_section(WorkbenchSection::Channels);
+        let rows = channel_row_rects(&state, Rect::new(120, 0, 36, 40));
+        assert_eq!(rows.len(), 3);
+        assert_eq!(
+            rows.iter().map(|(channel, _)| *channel).collect::<Vec<_>>(),
+            state
+                .draft()
+                .channels
+                .iter()
+                .map(|channel| channel.id)
+                .collect::<Vec<_>>()
+        );
+        assert!(rows.windows(2).all(|rows| rows[0].1.y + 1 == rows[1].1.y));
     }
 
     #[test]

@@ -52,6 +52,32 @@ fn expanded_initial_state(spec: &ExperimentSpec, bases: usize) -> Option<Vec<f32
     Some(state)
 }
 
+fn visible_basis_brush_tiles(
+    hit: BasisSceneHit,
+    grid: [usize; 2],
+    basis: usize,
+    bases: usize,
+    framebuffer: [usize; 2],
+) -> Vec<usize> {
+    let footprint = [
+        grid[0].div_ceil(framebuffer[0].max(1)).max(1),
+        grid[1].div_ceil(framebuffer[1].max(1)).max(1),
+    ];
+    let start = [-(footprint[0] as isize / 2), -(footprint[1] as isize / 2)];
+    let mut tiles = Vec::with_capacity(footprint[0].saturating_mul(footprint[1]));
+    for dy in 0..footprint[1] {
+        for dx in 0..footprint[0] {
+            let x = (hit.x as isize + start[0] + dx as isize).rem_euclid(grid[0] as isize) as usize;
+            let y = (hit.y as isize + start[1] + dy as isize).rem_euclid(grid[1] as isize) as usize;
+            let tile = (y * grid[0] + x) * bases + basis;
+            if !tiles.contains(&tile) {
+                tiles.push(tile);
+            }
+        }
+    }
+    tiles
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Panel {
     Overview,
@@ -494,6 +520,22 @@ impl App {
         }
         if left_down && layout.inspector.is_some_and(|area| area.contains(point)) {
             self.workbench.set_focus(WorkbenchFocus::Inspector);
+            if self.workbench.section() == WorkbenchSection::Channels
+                && let Some(inspector) = layout.inspector
+                && let Some((channel, _)) =
+                    crate::tui::workbench::channel_row_rects(&self.workbench, inspector)
+                        .into_iter()
+                        .find(|(_, rect)| rect.contains(point))
+            {
+                match self.workbench.set_selected_channel(channel) {
+                    Ok(()) => {
+                        self.workbench_notice = Some(format!("selected channel {}", channel.0));
+                        self.workbench_draft_scene_generation =
+                            self.workbench_draft_scene_generation.wrapping_add(1);
+                    }
+                    Err(error) => self.workbench_notice = Some(error),
+                }
+            }
             return true;
         }
         if layout.canvas.contains(point) {
@@ -504,16 +546,20 @@ impl App {
                 layout.canvas.width.saturating_sub(2),
                 layout.canvas.height.saturating_sub(2),
             );
+            let toolbar =
+                crate::tui::workbench::toolbar_layout(&self.workbench, canvas_content.width);
+            let header_height = canvas_content.height.min(toolbar.height.saturating_add(1));
             let canvas_header = Rect::new(
                 canvas_content.x,
                 canvas_content.y,
                 canvas_content.width,
-                canvas_content.height.min(2),
+                header_height,
             );
             if left_down && canvas_header.contains(point) {
                 let column = point.x.saturating_sub(canvas_header.x);
+                let row = point.y.saturating_sub(canvas_header.y);
                 if let Some(action) =
-                    crate::tui::workbench::toolbar_action_at(&self.workbench, column)
+                    crate::tui::workbench::toolbar_action_at_position(&toolbar, row, column)
                 {
                     match action {
                         crate::tui::workbench::ToolbarAction::Ui(command) => {
@@ -552,13 +598,9 @@ impl App {
             if self.workbench.section() == WorkbenchSection::Growth {
                 let body = Rect::new(
                     canvas_content.x,
-                    canvas_content
-                        .y
-                        .saturating_add(canvas_content.height.min(2)),
+                    canvas_content.y.saturating_add(header_height),
                     canvas_content.width,
-                    canvas_content
-                        .height
-                        .saturating_sub(canvas_content.height.min(2)),
+                    canvas_content.height.saturating_sub(header_height),
                 );
                 let source_height = body.height.saturating_mul(48) / 100;
                 let source = Rect::new(body.x, body.y, body.width, source_height);
@@ -3038,9 +3080,16 @@ impl App {
                         .iter()
                         .position(|candidate| *candidate == hit.basis)
                     {
-                        let tile = (hit.y * grid.width as usize + hit.x) * basis_ids.len() + basis;
-                        if !values.iter().any(|(existing, _)| *existing == tile) {
-                            values.push((tile, value));
+                        for tile in visible_basis_brush_tiles(
+                            hit,
+                            [grid.width as usize, grid.height as usize],
+                            basis,
+                            basis_ids.len(),
+                            frame_size,
+                        ) {
+                            if !values.iter().any(|(existing, _)| *existing == tile) {
+                                values.push((tile, value));
+                            }
                         }
                     }
                 }
@@ -4841,15 +4890,18 @@ fn handle_remote_terminal_event<W: std::io::Write>(
                     layout.canvas.width.saturating_sub(2),
                     layout.canvas.height.saturating_sub(2),
                 );
+                let toolbar =
+                    crate::tui::workbench::toolbar_layout(app.workbench(), canvas_content.width);
                 let canvas_header = Rect::new(
                     canvas_content.x,
                     canvas_content.y,
                     canvas_content.width,
-                    canvas_content.height.min(2),
+                    canvas_content.height.min(toolbar.height.saturating_add(1)),
                 );
                 if canvas_header.contains(point) {
                     let column = point.x.saturating_sub(canvas_header.x);
-                    if crate::tui::workbench::toolbar_action_at(app.workbench(), column)
+                    let row = point.y.saturating_sub(canvas_header.y);
+                    if crate::tui::workbench::toolbar_action_at_position(&toolbar, row, column)
                         == Some(crate::tui::workbench::ToolbarAction::Ui(
                             UiCommand::ApplyDraft,
                         ))
@@ -6580,6 +6632,70 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_toolbar_action_uses_the_same_row_rectangle_as_rendering() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Channels);
+        let area = ratatui::layout::Rect::new(0, 0, 120, 40);
+        app.set_workbench_area(area);
+        let layout = crate::tui::workbench::workbench_layout(area);
+        let canvas_content = ratatui::layout::Rect::new(
+            layout.canvas.x + 1,
+            layout.canvas.y + 1,
+            layout.canvas.width - 2,
+            layout.canvas.height - 2,
+        );
+        let toolbar = crate::tui::workbench::toolbar_layout(app.workbench(), canvas_content.width);
+        let item = toolbar
+            .rows
+            .iter()
+            .flat_map(|row| row.items.iter())
+            .find(|item| {
+                item.action == crate::tui::workbench::ToolbarAction::Ui(UiCommand::ToggleVisibility)
+            })
+            .expect("wrapped visibility action");
+        assert!(item.rect.y > 0, "test requires an action on a wrapped row");
+        let before = app.workbench().draft().channels[0].display.visible;
+        let click = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: canvas_content.x + item.rect.x + item.rect.width / 2,
+            row: canvas_content.y + item.rect.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        assert!(app.handle_workbench_panel_mouse(click));
+        assert_ne!(app.workbench().draft().channels[0].display.visible, before);
+    }
+
+    #[test]
+    fn clicking_each_channel_inspector_row_selects_that_channel() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut().add_channel().unwrap();
+        app.workbench_mut().add_channel().unwrap();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Channels);
+        let area = ratatui::layout::Rect::new(0, 0, 160, 40);
+        app.set_workbench_area(area);
+        let inspector = crate::tui::workbench::workbench_layout(area)
+            .inspector
+            .expect("wide layout inspector");
+        let rows = crate::tui::workbench::channel_row_rects(app.workbench(), inspector);
+
+        for (channel, rect) in rows {
+            let click = crossterm::event::MouseEvent {
+                kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                column: rect.x + 1,
+                row: rect.y,
+                modifiers: crossterm::event::KeyModifiers::NONE,
+            };
+            assert!(app.handle_workbench_panel_mouse(click));
+            assert_eq!(app.workbench().selected_channel(), channel);
+        }
+    }
+
+    #[test]
     fn remote_experiment_apply_toolbar_click_sends_an_apply_request() {
         let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
         app.enter_workbench();
@@ -7288,6 +7404,22 @@ mod tests {
             "256×256 should occupy most of a 1360×900 framebuffer, got zoom {}",
             app.camera().zoom()
         );
+    }
+
+    #[test]
+    fn undersampled_workbench_brush_covers_one_visible_framebuffer_pixel() {
+        let basis = crate::sim::tiling::BasisId(7);
+        let hit = crate::render::basis_scene::BasisSceneHit {
+            x: 128,
+            y: 128,
+            basis,
+        };
+
+        let fallback = visible_basis_brush_tiles(hit, [256, 256], 0, 1, [98, 72]);
+        let graphics = visible_basis_brush_tiles(hit, [256, 256], 0, 1, [1360, 900]);
+
+        assert_eq!(fallback.len(), 12, "3×4 cells cover one fallback pixel");
+        assert_eq!(graphics.len(), 1, "high-resolution graphics remains exact");
     }
 
     #[test]

@@ -3,6 +3,7 @@ use std::collections::HashSet;
 use std::io::{self, Read};
 use std::os::fd::FromRawFd;
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -11,6 +12,8 @@ const STARTUP_TIMEOUT: Duration = Duration::from_secs(10);
 const INPUT_TIMEOUT: Duration = Duration::from_secs(5);
 const FRAME_WARMUP: Duration = Duration::from_secs(1);
 const FRAME_WINDOW: Duration = Duration::from_secs(3);
+const MAX_READS_PER_PUMP: usize = 16;
+static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
 pub struct TerminalProbeReport {
@@ -56,6 +59,7 @@ struct PtySession {
     frames: Vec<FrameObservation>,
     active_kitty_images: HashSet<u32>,
     latest_graphics: Option<CapturedGraphics>,
+    workspace_root: std::path::PathBuf,
 }
 
 enum EscapeState {
@@ -75,6 +79,7 @@ pub struct TerminalScreen {
     current_style: u64,
     state: EscapeState,
     utf8_remaining: u8,
+    utf8_hash: u8,
 }
 
 impl TerminalScreen {
@@ -91,6 +96,7 @@ impl TerminalScreen {
             current_style: 0,
             state: EscapeState::Ground,
             utf8_remaining: 0,
+            utf8_hash: 0,
         }
     }
 
@@ -104,6 +110,7 @@ impl TerminalScreen {
                     0x08 => self.column = self.column.saturating_sub(1),
                     0x20..=0x7e => self.put(byte),
                     0xc0..=0xf7 => {
+                        self.utf8_hash = byte.wrapping_mul(31);
                         self.utf8_remaining = if byte < 0xe0 {
                             1
                         } else if byte < 0xf0 {
@@ -113,9 +120,10 @@ impl TerminalScreen {
                         };
                     }
                     0x80..=0xbf if self.utf8_remaining > 0 => {
+                        self.utf8_hash = self.utf8_hash.wrapping_mul(31) ^ byte;
                         self.utf8_remaining -= 1;
                         if self.utf8_remaining == 0 {
-                            self.put(b'?');
+                            self.put(0x80 | (self.utf8_hash & 0x7f));
                         }
                     }
                     _ => {}
@@ -300,6 +308,12 @@ impl PtySession {
         });
         let client = std::env::var_os("CELLARIUM_E2E_CLIENT")
             .unwrap_or_else(|| env!("CARGO_BIN_EXE_cellarium").into());
+        let workspace_root = std::env::temp_dir().join(format!(
+            "cellarium-terminal-probe-{}-{}",
+            std::process::id(),
+            NEXT_SESSION_ID.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::fs::create_dir(&workspace_root)?;
         let mut command = Command::new(client);
         command
             .args(["connect", host])
@@ -318,6 +332,7 @@ impl PtySession {
             .env("CELLARIUM_CELL_HEIGHT", "16")
             .env("CELLARIUM_E2E_TRACE", "1")
             .env("CELLARIUM_SSH_COMMAND", ssh_command)
+            .env("XDG_DATA_HOME", &workspace_root)
             .env_remove("SSH_CONNECTION")
             .env_remove("SSH_TTY");
         if graphics {
@@ -356,6 +371,7 @@ impl PtySession {
             frames: Vec::new(),
             active_kitty_images: HashSet::new(),
             latest_graphics: None,
+            workspace_root,
         })
     }
 
@@ -368,6 +384,45 @@ impl PtySession {
             return Err(io::Error::new(io::ErrorKind::WriteZero, "short PTY write"));
         }
         Ok(())
+    }
+
+    /// Send a user-like SGR mouse click: press, wait for the semantic result,
+    /// then release and let the release event drain before the next action.
+    /// Keeping press and release in one PTY write can hide ordering bugs under
+    /// a continuously redrawing half-block screen.
+    fn click_until<F>(
+        &mut self,
+        description: &str,
+        column: u16,
+        row: u16,
+        timeout: Duration,
+        condition: F,
+    ) -> io::Result<()>
+    where
+        F: Fn(&mut Self) -> bool,
+    {
+        self.write(format!("\x1b[<0;{column};{row}M").as_bytes())?;
+        self.pump_until(description, timeout, condition)?;
+        self.write(format!("\x1b[<0;{column};{row}m").as_bytes())?;
+        self.pump_for(Duration::from_millis(50))
+    }
+
+    /// Drag along a short path at a human-like cadence so the test exercises
+    /// the same event ordering as an actual terminal mouse instead of flooding
+    /// the PTY input queue with hundreds of synthetic motion reports.
+    fn drag_path(&mut self, button: u8, points: &[(u16, u16)]) -> io::Result<()> {
+        let Some(&(first_column, first_row)) = points.first() else {
+            return Ok(());
+        };
+        self.write(format!("\x1b[<{button};{first_column};{first_row}M").as_bytes())?;
+        self.pump_for(Duration::from_millis(20))?;
+        for &(column, row) in &points[1..] {
+            self.write(format!("\x1b[<{};{column};{row}M", button + 32).as_bytes())?;
+            self.pump_for(Duration::from_millis(10))?;
+        }
+        let &(last_column, last_row) = points.last().expect("non-empty drag path");
+        self.write(format!("\x1b[<{button};{last_column};{last_row}m").as_bytes())?;
+        self.pump_for(Duration::from_millis(50))
     }
 
     fn trace_len(&self) -> usize {
@@ -488,7 +543,7 @@ impl PtySession {
         if ready == 0 || poll.revents & libc::POLLIN == 0 {
             return Ok(());
         }
-        loop {
+        for _ in 0..MAX_READS_PER_PUMP {
             let mut buffer = [0_u8; 65_536];
             let count =
                 unsafe { libc::read(self.master, buffer.as_mut_ptr().cast(), buffer.len()) };
@@ -530,6 +585,7 @@ impl PtySession {
                 }
             }
         }
+        Ok(())
     }
 
     fn pump_until(
@@ -634,6 +690,7 @@ impl Drop for PtySession {
             let _ = thread.join();
         }
         unsafe { libc::close(self.master) };
+        let _ = std::fs::remove_dir_all(&self.workspace_root);
     }
 }
 
@@ -726,19 +783,27 @@ pub fn run_terminal_probe(host: &str) -> io::Result<TerminalProbeReport> {
         clear_frame.at.duration_since(clear_started).as_secs_f64() * 1_000.0;
 
     let mouse_started = Instant::now();
-    // SGR mouse: button-motion bit plus left button, coordinates are 1-based.
-    session.write(b"\x1b[<32;16;8M")?;
+    let frames_before_mouse = session.frames.len();
+    // A real click begins with a button-down event. A standalone motion event
+    // can be acknowledged without establishing a paint stroke in some
+    // terminal/input stacks and therefore is not a valid user-level probe.
+    session.write(b"\x1b[<0;16;8M")?;
     session.pump_until("server mouse acknowledgement", INPUT_TIMEOUT, |session| {
         session.screen.contains(b"ack 3")
     })?;
     let mouse_ack_at = Instant::now();
-    let frames_after_mouse_ack = session.frames.len();
+    for column in 17..=24 {
+        session.write(format!("\x1b[<32;{column};8M").as_bytes())?;
+        session.pump_for(Duration::from_millis(10))?;
+    }
+    session.write(b"\x1b[<0;24;8m")?;
+    session.pump_for(Duration::from_millis(50))?;
     session.pump_until("mouse-edited Kitty frame", INPUT_TIMEOUT, |session| {
-        session.frames[frames_after_mouse_ack..]
+        session.frames[frames_before_mouse..]
             .iter()
             .any(|frame| frame.hash != cleared_hash)
     })?;
-    let mouse_frame = session.frames[frames_after_mouse_ack..]
+    let mouse_frame = session.frames[frames_before_mouse..]
         .iter()
         .find(|frame| frame.hash != cleared_hash)
         .copied()
@@ -778,10 +843,50 @@ pub fn run_terminal_probe(host: &str) -> io::Result<TerminalProbeReport> {
 pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
     // Use a wide, realistic Workbench terminal so the Inspector/editor pane
     // is present and user-visible while typing Growth source.
-    let mut session = PtySession::spawn_with_graphics(host, 120, 36, true)?;
+    let mut session = PtySession::spawn_with_graphics(host, 160, 40, true)?;
     session.pump_until("Workbench startup", STARTUP_TIMEOUT, |session| {
-        session.screen.contains(b"Cellarium")
+        session.screen.contains(b"Cellarium") && session.latest_graphics.is_some()
     })?;
+    let startup = session
+        .latest_graphics
+        .as_ref()
+        .ok_or_else(|| io::Error::other("startup simulation did not render graphics"))?;
+    let bright = startup
+        .rgba
+        .chunks_exact(4)
+        .enumerate()
+        .filter(|(_, pixel)| pixel[0].max(pixel[1]).max(pixel[2]) > 80)
+        .map(|(index, _)| {
+            (
+                (index % startup.width as usize) as u32,
+                (index / startup.width as usize) as u32,
+            )
+        })
+        .collect::<Vec<_>>();
+    let bright_bounds =
+        bright
+            .iter()
+            .fold(None, |bounds: Option<(u32, u32, u32, u32)>, &(x, y)| {
+                Some(match bounds {
+                    None => (x, y, x, y),
+                    Some((min_x, min_y, max_x, max_y)) => {
+                        (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+                    }
+                })
+            });
+    let Some((min_x, min_y, max_x, max_y)) = bright_bounds else {
+        return Err(io::Error::other(
+            "startup simulation frame has no visible state",
+        ));
+    };
+    if max_x.saturating_sub(min_x) * 2 < startup.width
+        || max_y.saturating_sub(min_y) * 2 < startup.height
+    {
+        return Err(io::Error::other(format!(
+            "startup simulation is not auto-fit: bright bounds {min_x},{min_y}..{max_x},{max_y} in {}x{}",
+            startup.width, startup.height
+        )));
+    }
     let workbench_trace_start = session.trace_len();
     let workbench_frame_start = session.frames.len();
     let simulation_hash = session.frames.last().map(|frame| frame.hash);
@@ -825,27 +930,36 @@ pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
     session.capture_state("01-world-painted-and-panned")?;
     // Click Channels in the left Experiment outline (SGR coordinates are
     // one-based; the section is the fourth terminal row).
-    session.write(b"\x1b[<0;5;4M\x1b[<0;5;4m")?;
-    session.pump_until("Channels section", INPUT_TIMEOUT, |session| {
+    let channel_frame_start = session.frames.len();
+    session.click_until("Channels section", 5, 4, INPUT_TIMEOUT, |session| {
         session.screen.contains(b"section: Channels")
-            && session.screen.contains(b"Add/remove channels")
+            && session.screen.contains(b"Preview: running state")
+            && !session.active_kitty_images.is_empty()
     })?;
-    if !session.active_kitty_images.is_empty() {
-        return Err(io::Error::other(
-            "text-only Channels must clear the previous Kitty placement",
-        ));
-    }
+    session.wait_for_stable_new_kitty_frame(
+        "authoritative Channels preview",
+        channel_frame_start,
+        world_hash,
+    )?;
     session.capture_state("02-channels")?;
     // Freeze removes kernels targeting the channel. Verify undo/redo, then
     // leave the draft restored so the following kernel editor is meaningful.
-    session.write(b"a]cvxf\x1a\x19\x1a")?;
+    session.write(b"a")?;
     session.pump_until("channel controls", INPUT_TIMEOUT, |session| {
         session.screen.contains(b"channel_2")
     })?;
+    // Click the second rendered Inspector row, rather than cycling it by key.
+    session.click_until(
+        "clickable second channel row",
+        130,
+        14,
+        INPUT_TIMEOUT,
+        |session| session.screen.contains(b"selected: channel_2"),
+    )?;
+    session.write(b"cvxf\x1a\x19\x1a")?;
     let frames_before_kernels = session.frames.len();
     let graphics_before_kernels = session.frames.last().map(|frame| frame.hash);
-    session.write(b"\x1b[<0;5;5M\x1b[<0;5;5m")?;
-    session.pump_until("Kernels section", INPUT_TIMEOUT, |session| {
+    session.click_until("Kernels section", 5, 5, INPUT_TIMEOUT, |session| {
         session.screen.contains(b"selected Kernels") && !session.active_kitty_images.is_empty()
     })?;
     let kernel_hash = Some(session.wait_for_stable_new_kitty_frame(
@@ -871,7 +985,9 @@ pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
     // evaluated kernel so the result becomes directly editable.
     let kernel_trace_start = session.trace_len();
     let kernel_frame_start = session.frames.len();
-    session.write(b"\x1b[<0;30;8M\x1b[<32;32;8M\x1b[<0;32;8m")?;
+    // The preceding pan moves the fitted anchor from roughly (75,20) to
+    // (79,22).  Mutate that visible cell instead of a hard-coded empty corner.
+    session.write(b"\x1b[<0;79;22M\x1b[<32;81;22M\x1b[<0;81;22m")?;
     session.pump_until("kernel mouse mutation", INPUT_TIMEOUT, |session| {
         session.trace_contains_since(kernel_trace_start, b"E2E_WORKBENCH_MOUSE applied=true")
     })?;
@@ -881,11 +997,9 @@ pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
         panned_kernel_hash,
     )?;
     session.capture_state("03-kernel-mouse-edit")?;
-    session.write(b"a")?;
     let frames_before_growth = session.frames.len();
     let graphics_before_growth = session.frames.last().map(|frame| frame.hash);
-    session.write(b"\x1b[<0;5;6M\x1b[<0;5;6m")?;
-    session.pump_until("Growth section", INPUT_TIMEOUT, |session| {
+    session.click_until("Growth section", 5, 6, INPUT_TIMEOUT, |session| {
         session.screen.contains(b"selected Growth") && !session.active_kitty_images.is_empty()
     })?;
     session.wait_for_stable_new_kitty_frame(
@@ -897,19 +1011,21 @@ pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
     session.pump_until("Growth editor", INPUT_TIMEOUT, |session| {
         session.screen.contains(b"section: Growth") && session.screen.contains(b"EDITING")
     })?;
-    // Type a valid expression suffix through the real PTY editor and require
-    // the high-resolution plot itself to change, not merely the text panel.
+    // Replace the whole source with an exact-equality program. Uniform-only
+    // sampling renders this flat, so the orange threshold markers are a
+    // semantic framebuffer gate rather than a generic frame-hash check.
     let growth_hash = session.frames.last().map(|frame| frame.hash);
     let growth_frame_start = session.frames.len();
     let growth_trace_start = session.trace_len();
-    session.write(b"+0.2*sin(potential*20)")?;
+    // Adding a channel materializes the legacy kernel as `k1`, so use the
+    // signature shown by the editor rather than a stale `potential` name.
+    session.write(b"\x01if k1 == 2/6 || k1 == 3/6 { 1 } else { 0 }")?;
     session.pump_until("typed Growth source", INPUT_TIMEOUT, |session| {
-        session.screen.contains(b"sin(potential*20)")
+        session.screen.contains(b"k1 == 3/6")
             && session
                 .last_trace_line_since(growth_trace_start, b"E2E_GROWTH_VALID")
                 .is_some_and(|line| {
-                    contains(&line, b"E2E_GROWTH_VALID valid=true")
-                        && contains(&line, b"+0.2*sin(potential*20)")
+                    contains(&line, b"E2E_GROWTH_VALID valid=true") && contains(&line, b"k1 == 3/6")
                 })
     })?;
     session.wait_for_stable_new_kitty_frame(
@@ -917,11 +1033,26 @@ pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
         growth_frame_start,
         growth_hash,
     )?;
+    let exact_markers = session
+        .latest_graphics
+        .as_ref()
+        .map(|graphics| {
+            graphics
+                .rgba
+                .chunks_exact(4)
+                .filter(|pixel| pixel[0] == 255 && pixel[1] == 190 && pixel[2] == 70)
+                .count()
+        })
+        .unwrap_or(0);
+    if exact_markers < 10 {
+        return Err(io::Error::other(format!(
+            "discontinuous Growth curve rendered without exact markers ({exact_markers})"
+        )));
+    }
     session.capture_state("04-growth-expression-edit")?;
     session.write(b"\x1b")?;
     session.pump_for(Duration::from_millis(200))?;
-    session.write(b"\x1b[<0;5;7M\x1b[<0;5;7m")?;
-    session.pump_until("Experiment section", INPUT_TIMEOUT, |session| {
+    session.click_until("Experiment section", 5, 7, INPUT_TIMEOUT, |session| {
         session.screen.contains(b"Experiment review") && session.active_kitty_images.is_empty()
     })?;
     if !session.active_kitty_images.is_empty() {
@@ -932,7 +1063,10 @@ pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
     session.capture_state("05-experiment-cleared")?;
     let frames_before_tiling = session.frames.len();
     let graphics_before_tiling = session.frames.last().map(|frame| frame.hash);
-    session.write(b"\x1b[<0;5;3M\x1b[<0;5;3mp")?;
+    session.click_until("Tiling section", 5, 3, INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"section: Tiling")
+    })?;
+    session.write(b"p")?;
     session.pump_until("square tiling editor", INPUT_TIMEOUT, |session| {
         session.screen.contains(b"section: Tiling")
             && session.screen.contains(b"exact edge-to-edge tiling")
@@ -947,9 +1081,9 @@ pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
     // and release. Undo afterwards so the final Apply remains a valid tiling.
     let tiling_trace_start = session.trace_len();
     let tiling_frame_start = session.frames.len();
-    // The graphics viewport begins below the two-line Canvas header.  Row 19
-    // maps to pixel y=height/2, the square preset's world-origin vertex.
-    session.write(b"\x1b[<0;55;19M\x1b[<32;56;19M\x1b[<0;56;19m")?;
+    // The wrapped toolbar plus context occupy three rows. Drag the fitted
+    // world-origin vertex far enough to produce an unmistakable new frame.
+    session.write(b"\x1b[<0;75;21M\x1b[<32;85;21M\x1b[<0;85;21m")?;
     session.pump_until("tiling vertex mutation", INPUT_TIMEOUT, |session| {
         session.trace_contains_since(tiling_trace_start, b"E2E_WORKBENCH_MOUSE applied=true")
     })?;
@@ -961,8 +1095,7 @@ pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
     session.capture_state("06-tiling-vertex-drag")?;
     session.write(b"\x1a")?;
     session.pump_for(Duration::from_millis(200))?;
-    session.write(b"\x1b[<0;5;7M\x1b[<0;5;7m")?;
-    session.pump_until("Experiment review", INPUT_TIMEOUT, |session| {
+    session.click_until("Experiment review", 5, 7, INPUT_TIMEOUT, |session| {
         session.screen.contains(b"Experiment review")
             && !session.screen.contains(b"Periodic tiling editor")
             && session.active_kitty_images.is_empty()
@@ -978,7 +1111,7 @@ pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
         ));
     }
     let experiment_click_trace = session.trace_len();
-    session.write(b"\x1b[<0;60;18M")?;
+    session.write(b"\x1b[<0;75;20M")?;
     session.pump_until(
         "Experiment canvas click handled without Apply",
         INPUT_TIMEOUT,
@@ -1012,7 +1145,7 @@ pub fn run_workbench_probe(host: &str) -> io::Result<f64> {
 /// Exercise the same editor entry, mouse, keyboard, source editing, and Apply
 /// path without any terminal graphics protocol.
 pub fn run_workbench_fallback_probe(host: &str) -> io::Result<()> {
-    let mut session = PtySession::spawn_with_graphics(host, 120, 36, false)?;
+    let mut session = PtySession::spawn_with_graphics(host, 160, 40, false)?;
     session.pump_until("fallback startup", STARTUP_TIMEOUT, |session| {
         session.screen.contains(b"Cellarium")
     })?;
@@ -1021,7 +1154,7 @@ pub fn run_workbench_fallback_probe(host: &str) -> io::Result<()> {
         session.screen.contains(b"paused")
     })?;
     let workbench_trace_start = session.trace_len();
-    let canvas_region = (25, 1, 58, 32);
+    let canvas_region = (25, 1, 98, 36);
     let simulation_hash = session.screen.visual_hash(
         canvas_region.0,
         canvas_region.1,
@@ -1032,18 +1165,35 @@ pub fn run_workbench_fallback_probe(host: &str) -> io::Result<()> {
     session.pump_until("fallback Workbench", INPUT_TIMEOUT, |session| {
         session.screen.contains(b"Workbench") && session.screen.contains(b"World")
     })?;
-    let mut canvas_hash = session.wait_for_stable_new_terminal_visual(
+    let _world_hash = session.wait_for_stable_new_terminal_visual(
         "stable fallback World canvas",
         canvas_region,
         Some(simulation_hash),
     )?;
+    // First erase a broad stroke from the nonzero default state. This gives
+    // half-block a deterministic visual baseline instead of painting 1 over
+    // a cell that may already be saturated.
+    let erase_trace_start = session.trace_len();
+    let stroke_path = (35..=71)
+        .step_by(2)
+        .map(|column| (column, 20))
+        .collect::<Vec<_>>();
+    session.drag_path(2, &stroke_path)?;
+    session.pump_until("fallback mouse erase", INPUT_TIMEOUT, |session| {
+        session.trace_contains_since(erase_trace_start, b"E2E_WORKBENCH_MOUSE applied=true")
+            && session.screen.contains(b"Dirty")
+    })?;
+    // Erasing an already-empty initial field is legitimately invisible. Let
+    // the accepted erase settle, then use its actual visual as the baseline.
+    session.pump_for(Duration::from_millis(200))?;
+    let mut canvas_hash = session.screen.visual_hash(
+        canvas_region.0,
+        canvas_region.1,
+        canvas_region.2,
+        canvas_region.3,
+    );
     let paint_trace_start = session.trace_len();
-    let mut stroke = b"\x1b[<0;35;18M".to_vec();
-    for column in (37..=71).step_by(2) {
-        stroke.extend_from_slice(format!("\x1b[<32;{column};18M").as_bytes());
-    }
-    stroke.extend_from_slice(b"\x1b[<0;71;18m");
-    session.write(&stroke)?;
+    session.drag_path(0, &stroke_path)?;
     session.pump_until("fallback mouse paint", INPUT_TIMEOUT, |session| {
         session.trace_contains_since(paint_trace_start, b"E2E_WORKBENCH_MOUSE applied=true")
             && session.screen.contains(b"Dirty")
@@ -1054,14 +1204,13 @@ pub fn run_workbench_fallback_probe(host: &str) -> io::Result<()> {
         Some(canvas_hash),
     )?;
     canvas_hash = painted_hash;
-    session.write(b"\x1b[<1;60;12M\x1b[<33;64;14M\x1b[<1;64;14m")?;
+    session.drag_path(1, &[(60, 12), (62, 13), (64, 14)])?;
     let _panned_hash = session.wait_for_stable_new_terminal_visual(
         "fallback middle-button World pan",
         canvas_region,
         Some(canvas_hash),
     )?;
-    session.write(b"\x1b[<0;5;5M\x1b[<0;5;5m")?;
-    session.pump_until("fallback Kernels", INPUT_TIMEOUT, |session| {
+    session.click_until("fallback Kernels", 5, 5, INPUT_TIMEOUT, |session| {
         session.screen.contains(b"selected Kernels")
     })?;
     canvas_hash = session.wait_for_stable_new_terminal_visual(
@@ -1082,7 +1231,7 @@ pub fn run_workbench_fallback_probe(host: &str) -> io::Result<()> {
         Some(zoomed_kernel_hash),
     )?;
     let kernel_trace_start = session.trace_len();
-    session.write(b"\x1b[<0;30;8M\x1b[<32;32;8M\x1b[<0;32;8m")?;
+    session.write(b"\x1b[<0;79;22M\x1b[<32;81;22M\x1b[<0;81;22m")?;
     session.pump_until("fallback kernel mutation", INPUT_TIMEOUT, |session| {
         session.trace_contains_since(kernel_trace_start, b"E2E_WORKBENCH_MOUSE applied=true")
     })?;
@@ -1091,8 +1240,7 @@ pub fn run_workbench_fallback_probe(host: &str) -> io::Result<()> {
         canvas_region,
         Some(canvas_hash),
     )?;
-    session.write(b"\x1b[<0;5;6M\x1b[<0;5;6m")?;
-    session.pump_until("fallback Growth", INPUT_TIMEOUT, |session| {
+    session.click_until("fallback Growth", 5, 6, INPUT_TIMEOUT, |session| {
         session.screen.contains(b"selected Growth")
     })?;
     canvas_hash = session.wait_for_stable_new_terminal_visual(
@@ -1101,16 +1249,16 @@ pub fn run_workbench_fallback_probe(host: &str) -> io::Result<()> {
         Some(kernel_hash),
     )?;
     let growth_trace_start = session.trace_len();
-    session.write(b"e+0.1*sin(potential*10)")?;
+    session.write(b"e\x01if potential == 2/6 || potential == 3/6 { 1 } else { 0 }")?;
     session.pump_until("fallback Growth source typing", INPUT_TIMEOUT, |session| {
         session.screen.contains(b"section: Growth")
             && session.screen.contains(b"EDITING")
-            && session.screen.contains(b"sin(potential*10)")
+            && session.screen.contains(b"potential == 3/6")
             && session
                 .last_trace_line_since(growth_trace_start, b"E2E_GROWTH_VALID")
                 .is_some_and(|line| {
                     contains(&line, b"E2E_GROWTH_VALID valid=true")
-                        && contains(&line, b"+0.1*sin(potential*10)")
+                        && contains(&line, b"potential == 3/6")
                 })
     })?;
     let growth_hash = session.wait_for_stable_new_terminal_visual(
@@ -1120,7 +1268,10 @@ pub fn run_workbench_fallback_probe(host: &str) -> io::Result<()> {
     )?;
     session.write(b"\x1b")?;
     session.pump_for(Duration::from_millis(200))?;
-    session.write(b"\x1b[<0;5;3M\x1b[<0;5;3mp")?;
+    session.click_until("fallback Tiling", 5, 3, INPUT_TIMEOUT, |session| {
+        session.screen.contains(b"section: Tiling")
+    })?;
+    session.write(b"p")?;
     session.pump_until("fallback square Tiling", INPUT_TIMEOUT, |session| {
         session.screen.contains(b"section: Tiling")
             && session.screen.contains(b"exact edge-to-edge tiling")
@@ -1131,7 +1282,7 @@ pub fn run_workbench_fallback_probe(host: &str) -> io::Result<()> {
         Some(growth_hash),
     )?;
     let tiling_trace_start = session.trace_len();
-    session.write(b"\x1b[<0;55;18M\x1b[<32;56;18M\x1b[<0;56;18m")?;
+    session.write(b"\x1b[<0;75;21M\x1b[<32;85;21M\x1b[<0;85;21m")?;
     session.pump_until("fallback tiling mutation", INPUT_TIMEOUT, |session| {
         session.trace_contains_since(tiling_trace_start, b"E2E_WORKBENCH_MOUSE applied=true")
     })?;
@@ -1141,8 +1292,7 @@ pub fn run_workbench_fallback_probe(host: &str) -> io::Result<()> {
         Some(canvas_hash),
     )?;
     session.write(b"\x1a")?;
-    session.write(b"\x1b[<0;5;7M\x1b[<0;5;7m")?;
-    session.pump_until("fallback Experiment", INPUT_TIMEOUT, |session| {
+    session.click_until("fallback Experiment", 5, 7, INPUT_TIMEOUT, |session| {
         session.screen.contains(b"Experiment review")
     })?;
     if session.trace_contains_since(workbench_trace_start, b"E2E_MOUSE_FORWARDED") {
@@ -1151,7 +1301,7 @@ pub fn run_workbench_fallback_probe(host: &str) -> io::Result<()> {
         ));
     }
     let experiment_click_trace = session.trace_len();
-    session.write(b"\x1b[<0;60;18M")?;
+    session.write(b"\x1b[<0;75;20M")?;
     session.pump_until(
         "fallback Experiment canvas click handled without Apply",
         INPUT_TIMEOUT,

@@ -124,6 +124,17 @@ fn terminal_screen_visual_hash_includes_ansi_colors() {
 }
 
 #[test]
+fn terminal_screen_visual_hash_distinguishes_half_block_glyphs() {
+    let mut screen = terminal_probe::TerminalScreen::new(1, 1);
+    screen.push("\u{2580}".as_bytes());
+    let upper = screen.visual_hash(0, 0, 1, 1);
+    screen.push(b"\x1b[1;1H");
+    screen.push("\u{2584}".as_bytes());
+    let lower = screen.visual_hash(0, 0, 1, 1);
+    assert_ne!(upper, lower);
+}
+
+#[test]
 fn terminal_probe_expands_kitty_rgb_frames_for_visual_checks() {
     assert_eq!(
         terminal_probe::decode_kitty_pixels(
