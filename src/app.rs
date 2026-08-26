@@ -14,7 +14,9 @@ use crate::render::camera::Camera;
 use crate::render::display::DisplayProtocol;
 use crate::render::raster::{Framebuffer, rasterize_world_into};
 use crate::render::scene_transform::{SceneCamera, SceneTransform};
-use crate::render::workbench_graphics::{GraphicsSurface, PlacementAction, SceneKey};
+use crate::render::workbench_graphics::{
+    GraphicsSurface, PlacementAction, SceneKey, ScenePresence,
+};
 use crate::sim::backend::{BackendKind, SimulationBackend};
 use crate::sim::basis_runtime::StateLayout;
 use crate::sim::experiment::{ExperimentError, ExperimentFile, ExperimentMetadata};
@@ -380,6 +382,7 @@ impl App {
     }
     pub fn prepare_workbench_scene(
         &mut self,
+        presence: ScenePresence,
         terminal_rect: Rect,
         pixel_size: [u32; 2],
         display_mode: DisplayProtocol,
@@ -411,7 +414,7 @@ impl App {
             self.workbench_placement_generation =
                 self.workbench_placement_generation.wrapping_add(1);
         }
-        let scene = SceneKey {
+        let scene = (presence == ScenePresence::Pixels).then_some(SceneKey {
             section: self.workbench.section(),
             selected_basis: self.workbench.selected_basis(),
             selected_channel: self.workbench.selected_channel(),
@@ -420,8 +423,10 @@ impl App {
             placement_generation: self.workbench_placement_generation,
             transform_generation: self.workbench_transform_generation,
             draft_scene_generation: self.workbench_draft_scene_generation,
-        };
-        let action = self.workbench_graphics_surface.transition(scene);
+        });
+        let action = self
+            .workbench_graphics_surface
+            .transition_presence(presence, scene);
         if action != PlacementAction::Keep {
             self.workbench_frame_generation = self.workbench_frame_generation.wrapping_add(1);
         }

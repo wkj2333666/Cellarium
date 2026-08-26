@@ -98,6 +98,18 @@ pub enum PlacementAction {
     DeleteOnly,
 }
 
+/// Whether the current Workbench section owns a raster placement.
+///
+/// Empty and Text are distinct UI states, but both must invalidate any
+/// previously presented raster image.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScenePresence {
+    Pixels,
+    #[default]
+    Empty,
+    Text,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SceneKey {
     pub section: crate::workbench::WorkbenchSection,
@@ -143,6 +155,7 @@ pub struct GraphicsSurface {
     presented_generation: Option<u64>,
     max_dimensions: Option<(u32, u32)>,
     scene: Option<SceneKey>,
+    presence: ScenePresence,
     fresh_presentations: u64,
 }
 
@@ -157,12 +170,16 @@ impl GraphicsSurface {
             presented_generation: None,
             max_dimensions: Some((max_width.max(1), max_height.max(1))),
             scene: None,
+            presence: ScenePresence::Empty,
             fresh_presentations: 0,
         }
     }
 
     /// Schedule the next redraw to present a frame.
     pub fn mark_dirty(&mut self) {
+        // Standalone surfaces used by non-Workbench callers predate explicit
+        // scene keys; marking them dirty still means they own pixel output.
+        self.presence = ScenePresence::Pixels;
         self.dirty = true;
     }
 
@@ -177,33 +194,54 @@ impl GraphicsSurface {
     }
 
     pub fn transition(&mut self, scene: SceneKey) -> PlacementAction {
-        if self.scene == Some(scene) {
+        self.transition_presence(ScenePresence::Pixels, Some(scene))
+    }
+
+    pub fn transition_presence(
+        &mut self,
+        presence: ScenePresence,
+        scene: Option<SceneKey>,
+    ) -> PlacementAction {
+        debug_assert_eq!(presence == ScenePresence::Pixels, scene.is_some());
+        if self.presence == presence && self.scene == scene {
             return PlacementAction::Keep;
         }
-        let previous = self.scene.replace(scene);
+        let previous_presence = self.presence;
+        let previous = self.scene;
+        self.presence = presence;
+        self.scene = scene;
         self.presented_generation = None;
-        self.dirty = true;
-        if previous.is_some_and(|previous| {
-            previous.section != scene.section
-                || previous.selected_basis != scene.selected_basis
-                || previous.selected_channel != scene.selected_channel
-                || previous.selected_kernel != scene.selected_kernel
-                || previous.display_mode != scene.display_mode
-                || previous.placement_generation != scene.placement_generation
-        }) {
+        self.dirty = presence == ScenePresence::Pixels;
+        if presence != ScenePresence::Pixels {
+            return if previous_presence == ScenePresence::Pixels || previous.is_some() {
+                PlacementAction::DeleteOnly
+            } else {
+                PlacementAction::Keep
+            };
+        }
+        let scene = scene.expect("pixel presence requires a scene key");
+        if previous_presence == ScenePresence::Pixels
+            && previous.is_some_and(|previous| {
+                previous.section != scene.section
+                    || previous.selected_basis != scene.selected_basis
+                    || previous.selected_channel != scene.selected_channel
+                    || previous.selected_kernel != scene.selected_kernel
+                    || previous.display_mode != scene.display_mode
+                    || previous.placement_generation != scene.placement_generation
+            })
+        {
             PlacementAction::DeleteBeforePresent
         } else {
             PlacementAction::Present
         }
     }
 
+    pub fn presence(&self) -> ScenePresence {
+        self.presence
+    }
+
     pub fn leave_scene(&mut self) -> PlacementAction {
-        if self.scene.take().is_none() {
-            return PlacementAction::Keep;
-        }
-        self.presented_generation = None;
-        self.dirty = false;
-        PlacementAction::DeleteOnly
+        self.transition_presence(ScenePresence::Empty, None)
     }
 
     pub fn fresh_presentations(&self) -> u64 {
@@ -235,7 +273,8 @@ impl GraphicsSurface {
                 actual: frame.rgba.len(),
             });
         }
-        let fresh = self.dirty
+        let fresh = self.presence == ScenePresence::Pixels
+            && self.dirty
             && self
                 .presented_generation
                 .is_none_or(|generation| frame.generation > generation);
@@ -408,5 +447,35 @@ mod tests {
         );
         assert_eq!(surface.leave_scene(), PlacementAction::DeleteOnly);
         assert_eq!(surface.leave_scene(), PlacementAction::Keep);
+    }
+
+    #[test]
+    fn pixels_to_empty_deletes_the_existing_placement() {
+        let mut surface = GraphicsSurface::new();
+        let key = SceneKey::test(1, 1, 10, 5);
+        assert_eq!(
+            surface.transition_presence(ScenePresence::Pixels, Some(key)),
+            PlacementAction::Present
+        );
+        assert_eq!(
+            surface.transition_presence(ScenePresence::Empty, None),
+            PlacementAction::DeleteOnly
+        );
+        assert_eq!(surface.presence(), ScenePresence::Empty);
+        assert!(!surface.needs_present());
+    }
+
+    #[test]
+    fn empty_presence_rejects_a_late_pixel_frame() {
+        let mut surface = GraphicsSurface::new();
+        let key = SceneKey::test(1, 1, 10, 5);
+        assert_eq!(
+            surface.transition_presence(ScenePresence::Pixels, Some(key)),
+            PlacementAction::Present
+        );
+        surface.transition_presence(ScenePresence::Empty, None);
+        assert_eq!(surface.present(frame(2, 2, 5)), Ok(PresentResult::Stale));
+        assert_eq!(surface.presented_generation(), None);
+        assert_eq!(surface.fresh_presentations(), 0);
     }
 }

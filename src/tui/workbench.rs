@@ -1,7 +1,7 @@
 use crate::app::App;
 use crate::input::UiCommand;
 use crate::render::display::ViewportDisplay;
-use crate::render::workbench_graphics::{GraphicsScene, PlacementAction};
+use crate::render::workbench_graphics::{GraphicsScene, PlacementAction, ScenePresence};
 use crate::workbench::{WorkbenchFocus, WorkbenchSection};
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
@@ -21,6 +21,38 @@ pub enum ToolbarAction {
     Ui(UiCommand),
     EditorKey(crossterm::event::KeyCode),
     ToggleGrowthEditor,
+}
+
+fn workbench_scene_presence(state: &crate::workbench::WorkbenchState) -> ScenePresence {
+    match state.section() {
+        WorkbenchSection::Experiment => ScenePresence::Text,
+        WorkbenchSection::Tiling
+            if state.draft().tiling.is_none()
+                && !state.is_drawing_new_basis()
+                && state.tiling_construction().is_empty() =>
+        {
+            ScenePresence::Empty
+        }
+        WorkbenchSection::Kernels => {
+            let periodic = state.draft().tiling.as_ref().is_some_and(|_| {
+                state.selected_rule_kernel().is_some_and(|kernel| {
+                    matches!(
+                        kernel.spatial,
+                        crate::sim::ruleset::KernelSpatialDefinition::Periodic(_)
+                    )
+                })
+            });
+            if periodic || state.selected_raster_kernel_definition().is_some() {
+                ScenePresence::Pixels
+            } else {
+                ScenePresence::Empty
+            }
+        }
+        WorkbenchSection::World | WorkbenchSection::Channels | WorkbenchSection::Growth => {
+            ScenePresence::Pixels
+        }
+        WorkbenchSection::Tiling => ScenePresence::Pixels,
+    }
 }
 
 fn toolbar_segments(
@@ -431,7 +463,9 @@ pub fn draw_workbench(
         canvas_inner
     };
     let (pixel_width, pixel_height) = display.framebuffer_size(graphics_area);
+    let scene_presence = workbench_scene_presence(app.workbench());
     let (placement_action, scene_generation) = app.prepare_workbench_scene(
+        scene_presence,
         graphics_area,
         [pixel_width as u32, pixel_height as u32],
         display.protocol(),
@@ -762,6 +796,20 @@ pub fn draw_workbench(
                     graphics.generation = scene_generation;
                     graphics
                 },
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(
+                    canvas_lines
+                        .into_iter()
+                        .map(Line::from)
+                        .chain(std::iter::once(Line::from(
+                            "No kernel is available · [A] Add kernel",
+                        )))
+                        .collect::<Vec<_>>(),
+                )
+                .wrap(Wrap { trim: false }),
+                canvas_inner,
             );
         }
     } else if state.section() == WorkbenchSection::Growth {
@@ -2052,6 +2100,33 @@ mod tests {
         assert!(text.contains("[A]"));
         assert!(text.contains("draw"));
         assert!(text.contains("[P]"));
+    }
+
+    #[test]
+    fn blank_tiling_has_explicit_empty_graphics_presence() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.select_section(WorkbenchSection::Tiling);
+        assert_eq!(workbench_scene_presence(&state), ScenePresence::Empty);
+
+        let mut spec = crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4);
+        spec.tiling = Some(crate::sim::tiling::build_preset(
+            crate::sim::tiling::TilingPreset::RegularHexagon,
+            1.0,
+        ));
+        let mut state = crate::workbench::WorkbenchState::new(spec);
+        state.select_section(WorkbenchSection::Tiling);
+        assert_eq!(workbench_scene_presence(&state), ScenePresence::Pixels);
+    }
+
+    #[test]
+    fn experiment_is_a_text_scene() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.select_section(WorkbenchSection::Experiment);
+        assert_eq!(workbench_scene_presence(&state), ScenePresence::Text);
     }
 
     #[test]
