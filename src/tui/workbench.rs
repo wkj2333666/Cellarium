@@ -1099,11 +1099,11 @@ pub fn draw_workbench(
                 match state.kernel_tool() {
                     crate::workbench::kernel_editor::KernelTool::Weights => {
                         lines.push(Line::from(
-                            "Weights: left/drag paint · right zero · inactive is locked",
+                            "Weights: left/drag paint · right zero · inactive selects only",
                         ));
                         lines.push(Line::from("Active wheel ±0.05 · Shift ±0.005 · Ctrl ±0.5"));
                         lines.push(Line::from(
-                            "Inactive/empty wheel zoom · middle pan · E exact value",
+                            "Inactive: press M for Support · empty wheel zoom · E exact",
                         ));
                     }
                     crate::workbench::kernel_editor::KernelTool::Support => {
@@ -1124,6 +1124,9 @@ pub fn draw_workbench(
                     state.kernel_gaussian_sigma(),
                 )));
                 lines.push(Line::from("Channel count: Channels section A/Del"));
+                lines.push(Line::from(
+                    "Legend: cyan + · red − · dark=0 · X inactive · gold anchor",
+                ));
                 lines.push(Line::from(format!(
                     "paint value: {:.4}",
                     state.kernel_paint_value()

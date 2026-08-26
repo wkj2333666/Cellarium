@@ -3370,12 +3370,27 @@ impl App {
                             crate::input::MouseAction::Zoom { direction } => {
                                 if self.workbench.kernel_tool()
                                     == crate::workbench::kernel_editor::KernelTool::Weights
-                                    && let Some(selection) = scene.selection_in_pixel_rect_for_tool(
-                                        pointer.bounds,
-                                        [frame_size[0] as u32, frame_size[1] as u32],
-                                        crate::workbench::kernel_editor::KernelTool::Weights,
+                                    && let Some(selection) = scene.selection_in_pixel_rect(
+                                        pointer.bounds[0],
+                                        pointer.bounds[1],
+                                        pointer.bounds[2],
+                                        pointer.bounds[3],
+                                        frame_size[0] as u32,
+                                        frame_size[1] as u32,
                                     )
                                 {
+                                    self.workbench.select_periodic_kernel(selection);
+                                    if scene.edit_permission(
+                                        selection,
+                                        crate::workbench::kernel_editor::KernelTool::Weights,
+                                    ) == crate::workbench::kernel_editor::KernelEditPermission::RequiresSupportMode
+                                    {
+                                        self.workbench_notice = Some(
+                                            "inactive cell selected · press M to switch to Support mode and activate it"
+                                                .into(),
+                                        );
+                                        return true;
+                                    }
                                     let step = if event
                                         .modifiers
                                         .contains(crossterm::event::KeyModifiers::CONTROL)
@@ -3440,16 +3455,30 @@ impl App {
                             }
                             _ => {}
                         }
-                        let Some(selection) = scene.selection_in_pixel_rect_for_tool(
-                            pointer.bounds,
-                            [frame_size[0] as u32, frame_size[1] as u32],
-                            self.workbench.kernel_tool(),
+                        let Some(selection) = scene.selection_in_pixel_rect(
+                            pointer.bounds[0],
+                            pointer.bounds[1],
+                            pointer.bounds[2],
+                            pointer.bounds[3],
+                            frame_size[0] as u32,
+                            frame_size[1] as u32,
                         ) else {
                             return false;
                         };
+                        self.workbench.select_periodic_kernel(selection);
+                        let permission =
+                            scene.edit_permission(selection, self.workbench.kernel_tool());
                         match action {
                             crate::input::MouseAction::Inspect => {
-                                self.workbench.select_periodic_kernel(selection);
+                                if permission
+                                    == crate::workbench::kernel_editor::KernelEditPermission::RequiresSupportMode
+                                {
+                                    self.workbench_notice = Some(
+                                        "inactive cell selected · press M to switch to Support mode and activate it"
+                                            .into(),
+                                    );
+                                    return true;
+                                }
                                 if self.workbench.kernel_tool()
                                     == crate::workbench::kernel_editor::KernelTool::Support
                                 {
@@ -3480,6 +3509,15 @@ impl App {
                                 return true;
                             }
                             crate::input::MouseAction::Paint => {
+                                if permission
+                                    == crate::workbench::kernel_editor::KernelEditPermission::RequiresSupportMode
+                                {
+                                    self.workbench_notice = Some(
+                                        "inactive cell selected · press M to switch to Support mode and activate it"
+                                            .into(),
+                                    );
+                                    return true;
+                                }
                                 return match self.workbench.kernel_tool() {
                                     crate::workbench::kernel_editor::KernelTool::Weights => self
                                         .set_periodic_kernel_value(
@@ -3493,6 +3531,15 @@ impl App {
                                 };
                             }
                             crate::input::MouseAction::Erase => {
+                                if permission
+                                    == crate::workbench::kernel_editor::KernelEditPermission::RequiresSupportMode
+                                {
+                                    self.workbench_notice = Some(
+                                        "inactive cell selected · press M to switch to Support mode and activate it"
+                                            .into(),
+                                    );
+                                    return true;
+                                }
                                 return match self.workbench.kernel_tool() {
                                     crate::workbench::kernel_editor::KernelTool::Weights => {
                                         self.set_periodic_kernel_value(selection, 0.0).is_ok()
@@ -6687,6 +6734,56 @@ mod tests {
             _ => None,
         };
         assert_eq!(active, Some(true), "Support click must match its UI label");
+    }
+
+    #[test]
+    fn weights_click_selects_an_inactive_periodic_cell_and_explains_activation() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut().cycle_tiling_preset().unwrap();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Kernels);
+        let selection = crate::workbench::kernel_editor::KernelSelection {
+            offset: [-13, -13],
+            source_basis: crate::sim::tiling::BasisId(0),
+        };
+        let tiling = app.workbench().draft().tiling.clone().unwrap();
+        let definition = match &app.workbench().selected_rule_kernel().unwrap().spatial {
+            crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) => {
+                definition.clone()
+            }
+            _ => panic!("preset did not create a periodic kernel"),
+        };
+        let scene = crate::workbench::kernel_editor::PeriodicKernelScene::new(
+            tiling,
+            definition,
+            app.workbench().selected_basis(),
+        );
+        let (px, py) = scene
+            .pixel_for_selection(selection, 800, 800)
+            .expect("inactive corner cell is visible");
+        app.set_viewport(Rect::new(0, 0, 100, 100), [800, 800]);
+        let event = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: u16::try_from(px * 100 / 800).unwrap(),
+            row: u16::try_from(py * 100 / 800).unwrap(),
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        assert!(app.handle_mouse(event, &mut crate::input::MouseTracker::new()));
+        assert_eq!(app.workbench().periodic_kernel_selection(), Some(selection));
+        assert!(app.workbench_notice().unwrap().contains("Support mode"));
+        let active = match &app.workbench().selected_rule_kernel().unwrap().spatial {
+            crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) => {
+                definition.is_active(selection.offset, selection.source_basis)
+            }
+            _ => None,
+        };
+        assert_eq!(
+            active,
+            Some(false),
+            "Weights selection must not mutate support"
+        );
     }
 
     #[test]

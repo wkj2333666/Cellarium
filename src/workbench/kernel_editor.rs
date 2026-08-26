@@ -27,6 +27,12 @@ pub enum KernelTool {
     Support,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum KernelEditPermission {
+    Editable,
+    RequiresSupportMode,
+}
+
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct KernelView {
     /// View center in normalized kernel coordinates.
@@ -441,16 +447,21 @@ impl PeriodicKernelScene {
             })
     }
 
-    pub fn selection_at_pixel_for_tool(
+    pub fn edit_permission(
         &self,
-        px: u32,
-        py: u32,
-        width: u32,
-        height: u32,
+        selection: KernelSelection,
         tool: KernelTool,
-    ) -> Option<KernelSelection> {
-        self.selection_at_pixel(px, py, width, height)
-            .filter(|selection| self.tool_accepts(*selection, tool))
+    ) -> KernelEditPermission {
+        if tool == KernelTool::Support
+            || self
+                .definition
+                .is_active(selection.offset, selection.source_basis)
+                .unwrap_or(false)
+        {
+            KernelEditPermission::Editable
+        } else {
+            KernelEditPermission::RequiresSupportMode
+        }
     }
 
     /// Resolve a terminal mouse cell against the pixel-rendered polygons.
@@ -497,49 +508,6 @@ impl PeriodicKernelScene {
                 center[1].round() as u32,
                 width,
                 height,
-            )
-        })
-    }
-
-    pub fn selection_in_pixel_rect_for_tool(
-        &self,
-        bounds: [u32; 4],
-        size: [u32; 2],
-        tool: KernelTool,
-    ) -> Option<KernelSelection> {
-        let [left, top, right, bottom] = bounds;
-        let [width, height] = size;
-        let right = right.max(left.saturating_add(1));
-        let bottom = bottom.max(top.saturating_add(1));
-        let center = [
-            (f64::from(left) + f64::from(right.saturating_sub(1))) * 0.5,
-            (f64::from(top) + f64::from(bottom.saturating_sub(1))) * 0.5,
-        ];
-        let cells = self.cells();
-        let transform = self.pixel_transform(width, height, world_bounds_for_cells(&cells));
-        let mut nearest = None;
-        for (selection, polygon, _, _) in cells {
-            if !self.tool_accepts(selection, tool) {
-                continue;
-            }
-            let centroid = polygon.iter().fold(Vec2::ZERO, |sum, point| sum + *point)
-                * (1.0 / polygon.len() as f64);
-            let (x, y) = transform.world_to_pixel(centroid);
-            if x < left as i32 || y < top as i32 || x >= right as i32 || y >= bottom as i32 {
-                continue;
-            }
-            let distance = (f64::from(x) - center[0]).powi(2) + (f64::from(y) - center[1]).powi(2);
-            if nearest.is_none_or(|(_, best)| distance < best) {
-                nearest = Some((selection, distance));
-            }
-        }
-        nearest.map(|(selection, _)| selection).or_else(|| {
-            self.selection_at_pixel_for_tool(
-                center[0].round() as u32,
-                center[1].round() as u32,
-                width,
-                height,
-                tool,
             )
         })
     }
@@ -683,14 +651,6 @@ impl PeriodicKernelScene {
             (f64::from(px) - transform.width * 0.5) / transform.scale + transform.center.x,
             (f64::from(py) - transform.height * 0.5) / transform.scale + transform.center.y,
         )
-    }
-
-    fn tool_accepts(&self, selection: KernelSelection, tool: KernelTool) -> bool {
-        tool == KernelTool::Support
-            || self
-                .definition
-                .is_active(selection.offset, selection.source_basis)
-                .unwrap_or(false)
     }
 }
 
@@ -1238,7 +1198,20 @@ mod tests {
     }
 
     #[test]
-    fn inactive_periodic_cell_is_hittable_only_by_the_support_tool() {
+    fn periodic_zero_kernel_keeps_cell_outlines_and_anchor_visible() {
+        let tiling = build_preset(TilingPreset::RegularHexagon, 1.0);
+        let mut definition = PeriodicKernelDefinition::identity(BasisId(0));
+        definition.planes.get_mut(&BasisId(0)).unwrap().values[0] = 0.0;
+        let scene = PeriodicKernelScene::new(tiling, definition, BasisId(0));
+        let frame = scene.render_rgba(320, 240);
+        let pixels = frame.rgba.as_chunks::<4>().0;
+
+        assert!(pixels.iter().any(|pixel| pixel[..3] == [255, 220, 105]));
+        assert!(pixels.iter().any(|pixel| pixel[..3] == [8, 8, 8]));
+    }
+
+    #[test]
+    fn inactive_periodic_cell_is_selectable_but_requires_support_mode_to_edit() {
         let tiling = build_preset(TilingPreset::RegularHexagon, 1.0);
         let definition = PeriodicKernelDefinition {
             width: 1,
@@ -1261,13 +1234,14 @@ mod tests {
         };
         let (x, y) = scene.pixel_for_selection(selection, 640, 480).unwrap();
 
+        assert_eq!(scene.selection_at_pixel(x, y, 640, 480), Some(selection),);
         assert_eq!(
-            scene.selection_at_pixel_for_tool(x, y, 640, 480, KernelTool::Weights),
-            None,
+            scene.edit_permission(selection, KernelTool::Weights),
+            KernelEditPermission::RequiresSupportMode,
         );
         assert_eq!(
-            scene.selection_at_pixel_for_tool(x, y, 640, 480, KernelTool::Support),
-            Some(selection),
+            scene.edit_permission(selection, KernelTool::Support),
+            KernelEditPermission::Editable,
         );
     }
 
