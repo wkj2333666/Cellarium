@@ -713,7 +713,9 @@ impl WorkbenchState {
         Ok(())
     }
     pub fn pop_tiling_vertex(&mut self) -> Option<crate::sim::tiling::Vec2> {
-        self.tiling_construction.pop()
+        let removed = self.tiling_construction.pop();
+        self.tiling_pointer = self.tiling_construction.last().copied();
+        removed
     }
     pub fn cancel_tiling_construction(&mut self) {
         self.tiling_construction.clear();
@@ -1102,6 +1104,10 @@ impl WorkbenchState {
 
     fn close_section_editors(&mut self) {
         self.finish_tiling_drag();
+        // A pointer is meaningful only inside the currently visible Tiling
+        // canvas. Keeping it across section changes can recreate an obsolete
+        // construction segment when the user returns.
+        self.tiling_pointer = None;
         self.growth_editing = false;
         self.numeric_editor = None;
         self.simulation_dt_editing = false;

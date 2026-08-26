@@ -6389,12 +6389,19 @@ mod tests {
         app.workbench_mut()
             .push_tiling_vertex(crate::sim::tiling::Vec2::new(1.0, 0.0))
             .unwrap();
+        app.workbench_mut()
+            .set_tiling_pointer(Some(crate::sim::tiling::Vec2::new(1.0, 0.0)));
 
         assert!(app.handle_workbench_editor_key(KeyEvent::new(
             KeyCode::Char('z'),
             crossterm::event::KeyModifiers::CONTROL,
         )));
         assert_eq!(app.workbench().tiling_construction().len(), 1);
+        assert_eq!(
+            app.workbench().tiling_pointer(),
+            Some(crate::sim::tiling::Vec2::new(0.0, 0.0)),
+            "the live pointer must not recreate the removed second vertex"
+        );
         assert_eq!(
             app.workbench_notice(),
             Some("removed vertex 2 · 1 vertex remains")
