@@ -111,6 +111,36 @@ pub struct WorkbenchState {
     tiling_drag_active: bool,
     tiling_constraints: Vec<SeamConstraint>,
 }
+
+fn validate_growth_after_kernel_removal(
+    source: &str,
+    kernel_inputs: Vec<String>,
+    parameters: Vec<String>,
+    removed_symbol: &str,
+) -> Result<(), String> {
+    crate::sim::growth::typecheck::compile(
+        source,
+        &crate::sim::growth::types::ExternalSymbols {
+            kernel_inputs,
+            parameters,
+        },
+    )
+    .map(|_| ())
+    .map_err(|diagnostics| {
+        let details = diagnostics
+            .into_iter()
+            .map(|diagnostic| {
+                format!(
+                    "{} at {}..{}",
+                    diagnostic.code, diagnostic.span.start, diagnostic.span.end
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        format!("cannot remove kernel `{removed_symbol}`: Growth would become invalid ({details})")
+    })
+}
+
 impl WorkbenchState {
     pub fn new(spec: ExperimentSpec) -> Self {
         let selected_channel = spec.channels.first().map_or(ChannelId(0), |c| c.id);
@@ -1895,8 +1925,17 @@ impl WorkbenchState {
                 .selected_kernel
                 .and_then(|id| rule.kernels.iter().position(|kernel| kernel.id == id))
                 .unwrap_or(rule.kernels.len() - 1);
-            let removed = rule.kernels.remove(position).id;
-            rule.growth.kernel_inputs.retain(|id| *id != removed);
+            let removed = rule.kernels.remove(position);
+            rule.growth.kernel_inputs.retain(|id| *id != removed.id);
+            validate_growth_after_kernel_removal(
+                &rule.growth.source,
+                rule.kernels
+                    .iter()
+                    .map(|kernel| kernel.symbol.clone())
+                    .collect(),
+                rule.growth.parameters.keys().cloned().collect(),
+                &removed.symbol,
+            )?;
             rule.validate().map_err(|error| error.to_string())?;
             self.execute(DraftCommand::ReplaceDraft(Box::new(next)))
                 .map_err(|error| error.to_string())?;
@@ -1926,13 +1965,25 @@ impl WorkbenchState {
                     .map(|(position, _)| *position)
             })
             .unwrap_or_else(|| candidates.last().unwrap().0);
-        let removed = next.kernels.remove(position).id;
+        let removed = next.kernels.remove(position);
         if let Some(growth) = next
             .growth
             .iter_mut()
             .find(|growth| growth.target == target)
         {
-            growth.kernel_inputs.retain(|id| *id != removed);
+            growth.kernel_inputs.retain(|id| *id != removed.id);
+            let symbols = growth
+                .kernel_inputs
+                .iter()
+                .filter_map(|id| next.kernels.iter().find(|kernel| kernel.id == *id))
+                .map(|kernel| kernel.symbol.clone())
+                .collect();
+            validate_growth_after_kernel_removal(
+                &growth.source,
+                symbols,
+                growth.parameters.keys().cloned().collect(),
+                &removed.symbol,
+            )?;
         }
         self.replace_draft(next)
             .map_err(|error| error.to_string())?;
@@ -2811,6 +2862,91 @@ mod tests {
             &sibling_before
         );
         selected.validate().unwrap();
+    }
+
+    #[test]
+    fn kernel_removal_preserves_growth_signature_atomically() {
+        let mut state = WorkbenchState::new(basis_fixture());
+        state.add_kernel_for_selected().unwrap();
+        let rule_set = state.selected_rule_set().unwrap();
+        let removed = state.selected_kernel.unwrap();
+        let removed_symbol = state
+            .draft
+            .rules
+            .get(rule_set)
+            .unwrap()
+            .kernels
+            .iter()
+            .find(|kernel| kernel.id == removed)
+            .unwrap()
+            .symbol
+            .clone();
+        state.draft.rules.get_mut(rule_set).unwrap().growth.source =
+            format!("self + {removed_symbol}");
+        let before = state.draft.clone();
+        let before_status = state.status();
+
+        let error = state.remove_last_kernel_for_selected().unwrap_err();
+
+        assert!(error.contains(&removed_symbol), "{error}");
+        assert_eq!(state.draft(), &before);
+        assert_eq!(state.status(), before_status);
+
+        let rule_set = state.selected_rule_set().unwrap();
+        let remaining_symbol = state
+            .draft
+            .rules
+            .get(rule_set)
+            .unwrap()
+            .kernels
+            .iter()
+            .find(|kernel| kernel.id != removed)
+            .unwrap()
+            .symbol
+            .clone();
+        state.draft.rules.get_mut(rule_set).unwrap().growth.source =
+            format!("self + {remaining_symbol}");
+        let before_success = state.draft.clone();
+
+        state.remove_last_kernel_for_selected().unwrap();
+        assert_eq!(
+            state
+                .rule_for(state.selected_basis(), state.selected_channel())
+                .unwrap()
+                .kernels
+                .len(),
+            1,
+        );
+        state.undo().unwrap();
+        assert_eq!(state.draft(), &before_success);
+    }
+
+    #[test]
+    fn legacy_kernel_removal_also_rejects_a_referenced_symbol() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        state.add_kernel_for_selected().unwrap();
+        let removed = state.selected_kernel.unwrap();
+        let removed_symbol = state
+            .draft
+            .kernels
+            .iter()
+            .find(|kernel| kernel.id == removed)
+            .unwrap()
+            .symbol
+            .clone();
+        state
+            .draft
+            .growth
+            .iter_mut()
+            .find(|growth| growth.target == state.selected_channel)
+            .unwrap()
+            .source = format!("self + {removed_symbol}");
+        let before = state.draft.clone();
+
+        let error = state.remove_last_kernel_for_selected().unwrap_err();
+
+        assert!(error.contains(&removed_symbol), "{error}");
+        assert_eq!(state.draft(), &before);
     }
 
     #[test]
