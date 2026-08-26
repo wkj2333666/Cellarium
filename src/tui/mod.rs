@@ -127,7 +127,7 @@ fn draw_impl(
         .border_style(Style::default().fg(Color::Rgb(96, 140, 220)));
     let viewport = block.inner(viewport_area);
     let (frame_width, frame_height) = display.framebuffer_size(viewport);
-    app.set_viewport(viewport, [frame_width, frame_height]);
+    app.set_viewport_and_fit(viewport, [frame_width, frame_height]);
 
     let mut fresh_graphics = false;
     if viewport.width > 0 && viewport.height > 0 {

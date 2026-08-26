@@ -88,6 +88,7 @@ pub struct App {
     backend: SimulationBackend,
     world: World,
     camera: Camera,
+    camera_fit_pending: bool,
     paused: bool,
     seed: u64,
     inspected: Option<f32>,
@@ -209,6 +210,7 @@ impl App {
             backend,
             world,
             camera: Camera::new(center, 1.0),
+            camera_fit_pending: true,
             paused: false,
             seed,
             inspected: None,
@@ -1968,6 +1970,7 @@ impl App {
                 .map(|error| error.to_string())
                 .collect::<Vec<_>>()
         })?;
+        self.camera_fit_pending = true;
         self.experiment_model = candidate.clone();
         self.workbench.accept(candidate);
         self.kernel_error = None;
@@ -2058,13 +2061,14 @@ impl App {
             rejected
         })?;
         let normalized = service.active_spec().clone();
+        let geometry_changed = self.experiment_model.geometry != normalized.geometry
+            || self.experiment_model.tiling != normalized.tiling;
         if let Some(first) = normalized.channels.first() {
             let crate::sim::experiment_model::GeometrySpec::RasterGrid(grid) = &normalized.geometry;
             if self.world.width() != grid.width as usize
                 || self.world.height() != grid.height as usize
             {
                 self.world = World::new(grid.width as usize, grid.height as usize);
-                self.camera = Camera::new([grid.width as f32 / 2.0, grid.height as f32 / 2.0], 1.0);
             }
             // The legacy rectangular world has one value per lattice site.
             // A basis-aware draft stores one value per polygon within each
@@ -2077,6 +2081,7 @@ impl App {
             }
         }
         self.experiment_model = normalized.clone();
+        self.camera_fit_pending |= geometry_changed;
         self.workbench.accept(normalized.clone());
         self.experiment_service = Some(service);
         self.paused = false;
@@ -2101,9 +2106,13 @@ impl App {
     }
 
     fn accept_remote_apply(&mut self, accepted: ApplyAccepted) {
+        let geometry_changed = self.experiment_model.geometry
+            != accepted.normalized_experiment.geometry
+            || self.experiment_model.tiling != accepted.normalized_experiment.tiling;
         self.experiment_revision = accepted.revision;
         self.workbench_base_revision = accepted.revision;
         self.experiment_model = accepted.normalized_experiment.clone();
+        self.camera_fit_pending |= geometry_changed;
         self.workbench.accept(accepted.normalized_experiment);
         self.paused = false;
         self.leave_workbench();
@@ -2301,8 +2310,11 @@ impl App {
         revision: u64,
         experiment: crate::sim::experiment_model::ExperimentSpec,
     ) {
+        let geometry_changed = self.experiment_model.geometry != experiment.geometry
+            || self.experiment_model.tiling != experiment.tiling;
         self.experiment_revision = revision;
         self.experiment_model = experiment.clone();
+        self.camera_fit_pending |= geometry_changed;
         let restored_draft = self.workspace_persistence.as_mut().and_then(|persistence| {
             if !persistence.restored_pending_remote_rebase {
                 return None;
@@ -2448,6 +2460,28 @@ impl App {
     pub fn set_viewport(&mut self, viewport: Rect, frame_size: [usize; 2]) {
         self.viewport = Some(viewport);
         self.frame_size = Some(frame_size);
+    }
+
+    pub fn set_viewport_and_fit(&mut self, viewport: Rect, frame_size: [usize; 2]) {
+        self.set_viewport(viewport, frame_size);
+        if !self.camera_fit_pending {
+            return;
+        }
+        let Ok(width) = u32::try_from(frame_size[0]) else {
+            return;
+        };
+        let Ok(height) = u32::try_from(frame_size[1]) else {
+            return;
+        };
+        if let Some(camera) = crate::workbench::camera_fit::fit_experiment_camera(
+            &self.experiment_model,
+            [width, height],
+            0.05,
+        ) {
+            self.camera = camera;
+            self.camera_fit_pending = false;
+            self.invalidate_simulation_scene();
+        }
     }
 
     pub fn viewport_geometry(&self) -> Option<(Rect, [usize; 2])> {
@@ -3669,6 +3703,7 @@ impl App {
 
         match action {
             crate::input::MouseAction::Zoom { direction } => {
+                self.camera_fit_pending = false;
                 let factor = match direction {
                     crate::input::ZoomDirection::In => 1.2,
                     crate::input::ZoomDirection::Out => 1.0 / 1.2,
@@ -3680,6 +3715,7 @@ impl App {
                 }
             }
             crate::input::MouseAction::Pan { dx, dy } => {
+                self.camera_fit_pending = false;
                 self.camera.pan_screen([dx * scale[0], dy * scale[1]]);
                 if self.mode == AppMode::Simulation {
                     self.invalidate_simulation_scene();
@@ -7142,6 +7178,41 @@ mod tests {
             !app.workbench_runtime_matches_draft(),
             "runtime square cells must not be interpreted through an unapplied hexagonal draft"
         );
+    }
+
+    #[test]
+    fn initial_viewport_auto_fits_the_simulation_domain() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 256, 256);
+        app.set_viewport_and_fit(ratatui::layout::Rect::new(0, 0, 136, 45), [1360, 900]);
+
+        assert_eq!(app.camera().center(), [128.0, 128.0]);
+        assert!(
+            app.camera().zoom() > 3.0,
+            "256×256 should occupy most of a 1360×900 framebuffer, got zoom {}",
+            app.camera().zoom()
+        );
+    }
+
+    #[test]
+    fn automatic_fit_does_not_override_a_manual_zoom() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 256, 256);
+        let viewport = ratatui::layout::Rect::new(0, 0, 136, 45);
+        app.set_viewport_and_fit(viewport, [1360, 900]);
+        let fitted_zoom = app.camera().zoom();
+        let mut tracker = crate::input::MouseTracker::new();
+        let event = crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::ScrollUp,
+            column: 68,
+            row: 22,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        assert!(app.handle_mouse(event, &mut tracker));
+        let manual_zoom = app.camera().zoom();
+        assert!(manual_zoom > fitted_zoom);
+
+        app.set_viewport_and_fit(viewport, [1360, 900]);
+
+        assert_eq!(app.camera().zoom(), manual_zoom);
     }
 
     #[test]

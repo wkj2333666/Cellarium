@@ -1,3 +1,4 @@
+pub mod camera_fit;
 mod channel_editor;
 mod command;
 mod experiment_editor;
