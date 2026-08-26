@@ -1,4 +1,5 @@
 use crate::render::workbench_graphics::{GraphicsFrame, GraphicsScene};
+use crate::sim::growth::plot::{CurveSample, CurveSampleKind};
 use crate::workbench::growth_editor::GrowthEditorState;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -11,6 +12,7 @@ pub struct GrowthCursor {
 #[derive(Clone, Debug)]
 pub struct GrowthScene {
     pub plot: Vec<Option<f32>>,
+    pub curve: Vec<CurveSample>,
     pub heatmap: Option<crate::sim::growth::plot::HeatmapData>,
     pub stale: bool,
     pub cursor: Option<GrowthCursor>,
@@ -19,34 +21,67 @@ pub struct GrowthScene {
 
 impl GrowthScene {
     pub fn from_editor(editor: &GrowthEditorState) -> Self {
+        let x_interval = editor.primary_axis_interval();
+        let curve = editor
+            .plot()
+            .curve
+            .as_ref()
+            .map(|curve| curve.samples.clone())
+            .unwrap_or_else(|| {
+                editor
+                    .plot()
+                    .data
+                    .iter()
+                    .enumerate()
+                    .map(|(index, value)| {
+                        let t =
+                            index as f32 / editor.plot().data.len().saturating_sub(1).max(1) as f32;
+                        CurveSample {
+                            input: x_interval[0] + (x_interval[1] - x_interval[0]) * t,
+                            value: *value,
+                            trace: None,
+                            kind: CurveSampleKind::Uniform,
+                        }
+                    })
+                    .collect()
+            });
         Self {
             plot: editor.plot().data.clone(),
+            curve,
             heatmap: editor.plot().heatmap.clone(),
             stale: editor.plot().stale,
             cursor: None,
-            x_interval: editor.primary_axis_interval(),
+            x_interval,
         }
     }
 
     pub fn sample_at_pixel(&self, x: u32, width: u32) -> Option<usize> {
-        if self.plot.is_empty() || width == 0 {
+        if self.curve.is_empty() || width == 0 {
             return None;
         }
-        Some(
-            ((x as usize * self.plot.len().saturating_sub(1)) / width as usize)
-                .min(self.plot.len() - 1),
-        )
+        let left = 24_u32.min(width.saturating_sub(1));
+        let right = width.saturating_sub(8).max(left + 1);
+        let clamped = x.clamp(left, right);
+        let t = (clamped - left) as f32 / (right - left) as f32;
+        let target = self.x_interval[0] + (self.x_interval[1] - self.x_interval[0]) * t;
+        self.curve
+            .iter()
+            .enumerate()
+            .min_by(|(_, left), (_, right)| {
+                (left.input - target)
+                    .abs()
+                    .total_cmp(&(right.input - target).abs())
+            })
+            .map(|(index, _)| index)
     }
 
     pub fn select_pixel(&mut self, x: u32, width: u32) -> Option<GrowthCursor> {
         let sample = self.sample_at_pixel(x, width)?;
-        let value = self.plot[sample];
+        let curve_sample = &self.curve[sample];
         let cursor = GrowthCursor {
             sample,
-            input: self.x_interval[0]
-                + (self.x_interval[1] - self.x_interval[0]) * sample as f32
-                    / self.plot.len().saturating_sub(1).max(1) as f32,
-            value,
+            input: curve_sample.input,
+            value: curve_sample.value,
         };
         self.cursor = Some(cursor);
         Some(cursor)
@@ -151,18 +186,27 @@ impl GraphicsScene for GrowthScene {
         let span = (max - min).max(1e-6);
         if self.heatmap.is_none() {
             let mut previous = None;
-            for (index, value) in self.plot.iter().enumerate() {
-                let Some(value) = value else {
+            for sample in &self.curve {
+                let Some(value) = sample.value else {
                     previous = None;
                     continue;
                 };
-                let x = 24
-                    + (index * (width.saturating_sub(33) as usize)
-                        / self.plot.len().saturating_sub(1).max(1)) as i32;
+                let x_t = ((sample.input - self.x_interval[0])
+                    / (self.x_interval[1] - self.x_interval[0]).max(f32::EPSILON))
+                .clamp(0.0, 1.0);
+                let x = 24 + (x_t * width.saturating_sub(33) as f32).round() as i32;
                 let y = height as i32
                     - 24
                     - (((value - min) / span) * (height.saturating_sub(33) as f32)) as i32;
                 let point = (x, y);
+                if sample.kind == CurveSampleKind::ExactThreshold {
+                    for offset in -3..=3 {
+                        blend(&mut rgba, width, height, x + offset, y, [255, 190, 70, 255]);
+                        blend(&mut rgba, width, height, x, y + offset, [255, 190, 70, 255]);
+                    }
+                    previous = None;
+                    continue;
+                }
                 if let Some(prev) = previous {
                     draw_line(&mut rgba, width, height, prev, point, [80, 220, 140, 255]);
                 }
@@ -170,11 +214,12 @@ impl GraphicsScene for GrowthScene {
             }
         }
         if let Some(cursor) = self.cursor
-            && !self.plot.is_empty()
+            && !self.curve.is_empty()
         {
-            let x = 24
-                + (cursor.sample * width.saturating_sub(33) as usize
-                    / self.plot.len().saturating_sub(1).max(1)) as i32;
+            let x_t = ((cursor.input - self.x_interval[0])
+                / (self.x_interval[1] - self.x_interval[0]).max(f32::EPSILON))
+            .clamp(0.0, 1.0);
+            let x = 24 + (x_t * width.saturating_sub(33) as f32).round() as i32;
             for y in 8..height.saturating_sub(24) {
                 blend(&mut rgba, width, height, x, y as i32, [255, 220, 100, 255]);
             }
@@ -256,6 +301,38 @@ mod tests {
         let scene = GrowthScene::from_editor(&editor);
         let frame = scene.render_rgba(200, 120);
         assert!(frame.rgba.as_chunks::<4>().0.iter().any(|p| p[1] > 100));
+    }
+
+    #[test]
+    fn isolated_equality_branches_render_as_exact_pixel_markers() {
+        let editor = GrowthEditorState::new(
+            "if inner == 2/6 || inner == 3/6 { 1 } else { 0 }",
+            ExternalSymbols::new(&["inner"], &[]),
+            BTreeMap::new(),
+            "growth",
+        );
+        let scene = GrowthScene::from_editor(&editor);
+        assert_eq!(
+            scene
+                .curve
+                .iter()
+                .filter(|sample| sample.kind == CurveSampleKind::ExactThreshold)
+                .count(),
+            2
+        );
+
+        let frame = scene.render_rgba(600, 300);
+        assert!(
+            frame
+                .rgba
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .filter(|pixel| pixel[0] == 255 && pixel[1] == 190 && pixel[2] == 70)
+                .count()
+                >= 10,
+            "both isolated true values must remain visible as exact-threshold markers"
+        );
     }
     #[test]
     fn graph_pixels_change_after_valid_source_edit() {

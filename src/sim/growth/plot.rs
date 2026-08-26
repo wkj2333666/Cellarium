@@ -1,5 +1,6 @@
+use super::ast::{BinaryOp, UnaryOp};
 use super::eval::{EvalTrace, ScalarInputs, evaluate_with_trace};
-use super::types::TypedProgram;
+use super::types::{SymbolId, TypedBinding, TypedExpr, TypedExprKind, TypedProgram};
 use std::collections::BTreeMap;
 
 /// Conservative interval for a raw (unnormalized) weighted sum.
@@ -66,12 +67,29 @@ pub struct CurveSample {
     pub input: f32,
     pub value: Option<f32>,
     pub trace: Option<EvalTrace>,
+    pub kind: CurveSampleKind,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CurveSampleKind {
+    #[default]
+    Uniform,
+    BelowThreshold,
+    ExactThreshold,
+    AboveThreshold,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct PlotDiagnostic {
+    pub code: &'static str,
+    pub message: String,
 }
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct CurveData {
     pub axis: String,
     pub samples: Vec<CurveSample>,
+    pub diagnostics: Vec<PlotDiagnostic>,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -122,14 +140,59 @@ pub fn sample_plot(program: &TypedProgram, request: PlotRequest) -> Result<PlotD
             if !program.externals.ordered().iter().any(|name| name == &axis) {
                 return Err("unknown_plot_axis");
             }
-            let mut result = Vec::with_capacity(samples);
-            for index in 0..samples {
-                let t = if samples == 1 {
+            let axis_id = program
+                .externals
+                .ordered()
+                .iter()
+                .position(|name| name == &axis)
+                .map(|index| SymbolId(index as u32))
+                .ok_or("unknown_plot_axis")?;
+            let mut thresholds = critical_thresholds(program, axis_id)
+                .into_iter()
+                .filter(|value| {
+                    value.is_finite() && *value >= start.min(end) && *value <= start.max(end)
+                })
+                .collect::<Vec<_>>();
+            thresholds.sort_by(f32::total_cmp);
+            thresholds.dedup_by(|left, right| left.to_bits() == right.to_bits());
+            thresholds.truncate((4096_usize.saturating_sub(samples.min(2048))) / 3);
+            let mut points = Vec::with_capacity(samples.min(4096) + thresholds.len() * 3);
+            let uniform_samples = samples.min(4096_usize.saturating_sub(thresholds.len() * 3));
+            for index in 0..uniform_samples {
+                let t = if uniform_samples == 1 {
                     0.0
                 } else {
-                    index as f32 / (samples - 1) as f32
+                    index as f32 / (uniform_samples - 1) as f32
                 };
                 let input = start + (end - start) * t;
+                points.push((input, CurveSampleKind::Uniform));
+            }
+            for threshold in thresholds.iter().copied() {
+                let below = next_down(threshold);
+                let above = next_up(threshold);
+                if below >= start.min(end) && below <= start.max(end) {
+                    points.push((below, CurveSampleKind::BelowThreshold));
+                }
+                points.push((threshold, CurveSampleKind::ExactThreshold));
+                if above >= start.min(end) && above <= start.max(end) {
+                    points.push((above, CurveSampleKind::AboveThreshold));
+                }
+            }
+            points.sort_by(|left, right| left.0.total_cmp(&right.0));
+            let mut deduplicated: Vec<(f32, CurveSampleKind)> = Vec::with_capacity(points.len());
+            for point in points {
+                if let Some(previous) = deduplicated.last_mut()
+                    && previous.0.to_bits() == point.0.to_bits()
+                {
+                    if sample_kind_priority(point.1) > sample_kind_priority(previous.1) {
+                        previous.1 = point.1;
+                    }
+                    continue;
+                }
+                deduplicated.push(point);
+            }
+            let mut result = Vec::with_capacity(deduplicated.len());
+            for (input, kind) in deduplicated {
                 let mut parameters = pinned.0.clone();
                 let axis_is_kernel = program
                     .externals
@@ -169,17 +232,29 @@ pub fn sample_plot(program: &TypedProgram, request: PlotRequest) -> Result<PlotD
                         input,
                         value: Some(trace_value.result),
                         trace: trace.then_some(trace_value),
+                        kind,
                     }),
                     Err(_) => result.push(CurveSample {
                         input,
                         value: None,
                         trace: None,
+                        kind,
                     }),
                 }
             }
             Ok(PlotData::Curve(CurveData {
                 axis,
                 samples: result,
+                diagnostics: (!thresholds.is_empty())
+                    .then(|| PlotDiagnostic {
+                        code: "critical_thresholds",
+                        message: format!(
+                            "{} comparison threshold(s) sampled exactly",
+                            thresholds.len()
+                        ),
+                    })
+                    .into_iter()
+                    .collect(),
             }))
         }
         PlotRequest::Heatmap {
@@ -244,6 +319,121 @@ pub fn sample_plot(program: &TypedProgram, request: PlotRequest) -> Result<PlotD
             }))
         }
     }
+}
+
+fn sample_kind_priority(kind: CurveSampleKind) -> u8 {
+    match kind {
+        CurveSampleKind::Uniform => 0,
+        CurveSampleKind::BelowThreshold | CurveSampleKind::AboveThreshold => 1,
+        CurveSampleKind::ExactThreshold => 2,
+    }
+}
+
+fn next_down(value: f32) -> f32 {
+    if value.is_nan() || value == f32::NEG_INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return -f32::from_bits(1);
+    }
+    let bits = value.to_bits();
+    f32::from_bits(if value > 0.0 { bits - 1 } else { bits + 1 })
+}
+
+fn next_up(value: f32) -> f32 {
+    if value.is_nan() || value == f32::INFINITY {
+        return value;
+    }
+    if value == 0.0 {
+        return f32::from_bits(1);
+    }
+    let bits = value.to_bits();
+    f32::from_bits(if value > 0.0 { bits + 1 } else { bits - 1 })
+}
+
+fn critical_thresholds(program: &TypedProgram, axis: SymbolId) -> Vec<f32> {
+    let mut thresholds = Vec::new();
+    visit_bindings(&program.bindings, axis, &mut thresholds);
+    visit_expression(&program.result, axis, &mut thresholds);
+    thresholds
+}
+
+fn visit_bindings(bindings: &[TypedBinding], axis: SymbolId, thresholds: &mut Vec<f32>) {
+    for binding in bindings {
+        visit_expression(&binding.value, axis, thresholds);
+    }
+}
+
+fn visit_expression(expression: &TypedExpr, axis: SymbolId, thresholds: &mut Vec<f32>) {
+    match &expression.kind {
+        TypedExprKind::Unary { operand, .. } => visit_expression(operand, axis, thresholds),
+        TypedExprKind::Binary { op, lhs, rhs } => {
+            if matches!(
+                op,
+                BinaryOp::Equal
+                    | BinaryOp::NotEqual
+                    | BinaryOp::Less
+                    | BinaryOp::LessEqual
+                    | BinaryOp::Greater
+                    | BinaryOp::GreaterEqual
+            ) {
+                if matches!(lhs.kind, TypedExprKind::Symbol(symbol) if symbol == axis)
+                    && let Some(value) = constant_scalar(rhs)
+                {
+                    thresholds.push(value);
+                } else if matches!(rhs.kind, TypedExprKind::Symbol(symbol) if symbol == axis)
+                    && let Some(value) = constant_scalar(lhs)
+                {
+                    thresholds.push(value);
+                }
+            }
+            visit_expression(lhs, axis, thresholds);
+            visit_expression(rhs, axis, thresholds);
+        }
+        TypedExprKind::Call { arguments, .. } => {
+            for argument in arguments {
+                visit_expression(argument, axis, thresholds);
+            }
+        }
+        TypedExprKind::If {
+            condition,
+            then_branch,
+            then_result,
+            else_branch,
+            else_result,
+        } => {
+            visit_expression(condition, axis, thresholds);
+            visit_bindings(then_branch, axis, thresholds);
+            visit_expression(then_result, axis, thresholds);
+            visit_bindings(else_branch, axis, thresholds);
+            visit_expression(else_result, axis, thresholds);
+        }
+        TypedExprKind::Constant(_) | TypedExprKind::Bool(_) | TypedExprKind::Symbol(_) => {}
+    }
+}
+
+fn constant_scalar(expression: &TypedExpr) -> Option<f32> {
+    let value = match &expression.kind {
+        TypedExprKind::Constant(value) => *value,
+        TypedExprKind::Unary {
+            op: UnaryOp::Neg,
+            operand,
+        } => -constant_scalar(operand)?,
+        TypedExprKind::Binary { op, lhs, rhs } => {
+            let lhs = constant_scalar(lhs)?;
+            let rhs = constant_scalar(rhs)?;
+            match op {
+                BinaryOp::Add => lhs + rhs,
+                BinaryOp::Subtract => lhs - rhs,
+                BinaryOp::Multiply => lhs * rhs,
+                BinaryOp::Divide => lhs / rhs,
+                BinaryOp::Power => lhs.powf(rhs),
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    value.is_finite().then_some(value)
 }
 
 fn evaluate_point(
@@ -324,6 +514,26 @@ mod tests {
     fn invalid_samples_are_masked_without_aborting_the_plot() {
         let data = sample_plot(&compiled("sqrt(inner)"), request("inner", -1.0, 1.0, 3)).unwrap();
         assert_eq!(data.invalid_sample_count(), 1);
+    }
+
+    #[test]
+    fn equality_thresholds_are_sampled_exactly() {
+        let data = sample_plot(
+            &compiled("if inner == 2/6 || inner == 3/6 { 1 } else { 0 }"),
+            request("inner", 0.0, 1.0, 48),
+        )
+        .unwrap();
+        let PlotData::Curve(curve) = data else {
+            panic!("curve request must return curve data");
+        };
+        for threshold in [2.0_f32 / 6.0, 3.0_f32 / 6.0] {
+            let sample = curve
+                .samples
+                .iter()
+                .find(|sample| sample.input.to_bits() == threshold.to_bits())
+                .unwrap_or_else(|| panic!("missing exact threshold {threshold}"));
+            assert_eq!(sample.value, Some(1.0));
+        }
     }
 
     #[test]

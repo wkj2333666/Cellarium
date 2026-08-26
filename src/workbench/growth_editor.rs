@@ -1,7 +1,7 @@
 use super::TextBuffer;
 use crate::sim::experiment_model::UpdateMode;
 use crate::sim::growth::{
-    plot::{HeatmapData, PinnedInputs, PlotData, PlotRequest, sample_plot},
+    plot::{CurveData, HeatmapData, PinnedInputs, PlotData, PlotRequest, sample_plot},
     typecheck::compile,
     types::ExternalSymbols,
 };
@@ -10,6 +10,7 @@ use std::collections::BTreeMap;
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GrowthPlot {
     pub data: Vec<Option<f32>>,
+    pub curve: Option<CurveData>,
     pub heatmap: Option<HeatmapData>,
     pub stale: bool,
 }
@@ -153,6 +154,7 @@ impl GrowthEditorState {
                     ) {
                         self.plot = GrowthPlot {
                             data: Vec::new(),
+                            curve: None,
                             heatmap: Some(heatmap),
                             stale: false,
                         };
@@ -176,12 +178,10 @@ impl GrowthEditorState {
                             trace: false,
                         },
                     ) {
+                        let data = curve.samples.iter().map(|sample| sample.value).collect();
                         self.plot = GrowthPlot {
-                            data: curve
-                                .samples
-                                .into_iter()
-                                .map(|sample| sample.value)
-                                .collect(),
+                            data,
+                            curve: Some(curve),
                             heatmap: None,
                             stale: false,
                         };
