@@ -311,7 +311,10 @@ pub fn channel_row_rects(
         inspector.width.saturating_sub(2),
         inspector.height.saturating_sub(2),
     );
-    let first_row = inner.y.saturating_add(11);
+    // Keep the interactive rows after the wrapped channel controls.  These
+    // rows are rendered exactly once below the base Inspector paragraph so
+    // their highlight and mouse hit target always occupy the same cells.
+    let first_row = inner.y.saturating_add(13);
     state
         .draft()
         .channels
@@ -1097,7 +1100,6 @@ pub fn draw_workbench(
                     lines.push(Line::from("Enter commit · Esc cancel"));
                 }
                 lines.push(Line::from(""));
-                lines.extend(channel_inspector_texts(state).into_iter().map(Line::from));
             }
             WorkbenchSection::Kernels => {
                 if let Some(rule) = state
@@ -2099,6 +2101,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(rows.windows(2).all(|rows| rows[0].1.y + 1 == rows[1].1.y));
+        assert_eq!(rows[0].1.y, 14);
     }
 
     #[test]
