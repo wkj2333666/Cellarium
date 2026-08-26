@@ -9,8 +9,15 @@ fn package_version_is_a_stable_release_not_a_prerelease() {
         .lines()
         .find_map(|line| line.strip_prefix("version = \"")?.strip_suffix('"'))
         .expect("package version");
-    assert_eq!(version, "0.2.0");
     assert!(!version.contains('-'));
+    let components = version.split('.').collect::<Vec<_>>();
+    assert_eq!(components.len(), 3, "stable releases use major.minor.patch");
+    assert!(
+        components
+            .iter()
+            .all(|component| !component.is_empty() && component.chars().all(|c| c.is_ascii_digit())),
+        "stable release components must be numeric: {version}"
+    );
 }
 
 #[test]
