@@ -13,7 +13,9 @@ mod state;
 mod text_buffer;
 pub mod tiling_editor;
 
-pub use channel_editor::{ChannelView, add_channel, resolved_color};
+pub use channel_editor::{
+    ChannelCardModel, ChannelView, add_channel, channel_cards, resolved_color,
+};
 pub use command::DraftCommand;
 pub use experiment_editor::{
     DraftEnvelope, WORKSPACE_FORMAT_VERSION, WorkspaceEnvelope, WorkspacePaths, decode_draft,

@@ -21,6 +21,13 @@ pub struct ObjectCard {
     pub kind: ObjectCardKind,
     pub title: String,
     pub deletable: bool,
+    pub actions: Vec<ObjectCardAction>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ObjectCardAction {
+    pub id: String,
+    pub label: String,
 }
 
 impl ObjectCard {
@@ -29,6 +36,7 @@ impl ObjectCard {
             kind: ObjectCardKind::Object(id),
             title: title.into(),
             deletable,
+            actions: Vec::new(),
         }
     }
 
@@ -37,15 +45,35 @@ impl ObjectCard {
             kind: ObjectCardKind::Add,
             title: "+".into(),
             deletable: false,
+            actions: Vec::new(),
         }
+    }
+
+    pub fn with_actions<const N: usize>(mut self, actions: [(&str, &str); N]) -> Self {
+        self.actions = actions
+            .into_iter()
+            .map(|(id, label)| ObjectCardAction {
+                id: id.into(),
+                label: label.into(),
+            })
+            .collect();
+        self
     }
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub enum ObjectStripHit {
     Select(ObjectCardId),
     Delete(ObjectCardId),
+    Action(ObjectCardId, String),
     Add,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct LaidOutObjectAction {
+    pub id: String,
+    pub label: String,
+    pub rect: Rect,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -54,6 +82,7 @@ pub struct LaidOutObjectCard {
     pub card: ObjectCard,
     pub body_rect: Rect,
     pub delete_rect: Option<Rect>,
+    pub action_rects: Vec<LaidOutObjectAction>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -69,6 +98,14 @@ impl ObjectStripLayout {
                 && let ObjectCardKind::Object(id) = card.card.kind
             {
                 return Some(ObjectStripHit::Delete(id));
+            }
+            if let ObjectCardKind::Object(id) = card.card.kind
+                && let Some(action) = card
+                    .action_rects
+                    .iter()
+                    .find(|action| contains(action.rect, x, y))
+            {
+                return Some(ObjectStripHit::Action(id, action.id.clone()));
             }
             if contains(card.body_rect, x, y) {
                 return Some(match card.card.kind {
@@ -117,11 +154,31 @@ pub fn layout_object_strip(cards: &[ObjectCard], area: Rect, scroll: usize) -> O
                     1,
                 )
             });
+            let action_rects = card
+                .actions
+                .iter()
+                .scan(body_rect.x, |x, action| {
+                    let width = u16::try_from(action.label.chars().count())
+                        .unwrap_or(u16::MAX)
+                        .max(1);
+                    if x.saturating_add(width) > body_rect.x.saturating_add(body_rect.width) {
+                        return None;
+                    }
+                    let rect = Rect::new(*x, body_rect.y.saturating_add(1), width, 1);
+                    *x = x.saturating_add(width.saturating_add(2));
+                    Some(LaidOutObjectAction {
+                        id: action.id.clone(),
+                        label: action.label.clone(),
+                        rect,
+                    })
+                })
+                .collect();
             LaidOutObjectCard {
                 logical_index,
                 card: card.clone(),
                 body_rect,
                 delete_rect,
+                action_rects,
             }
         })
         .collect();
@@ -169,6 +226,9 @@ pub fn render_object_strip(
                 buffer.set_string(laid_out.body_rect.x, laid_out.body_rect.y, title, style);
                 if let Some(delete) = laid_out.delete_rect {
                     buffer.set_string(delete.x, delete.y, "×", Style::default().fg(Color::Red));
+                }
+                for action in &laid_out.action_rects {
+                    buffer.set_string(action.rect.x, action.rect.y, &action.label, style);
                 }
             }
         }
@@ -239,5 +299,36 @@ mod tests {
         assert_eq!(buffer.cell((0, 0)).unwrap().fg, Color::Yellow);
         assert!(buffer.cell((10, 0)).unwrap().symbol().contains('×'));
         assert!(buffer.cell((12, 0)).unwrap().symbol().contains('+'));
+    }
+
+    #[test]
+    fn card_accessories_have_distinct_visible_mouse_targets() {
+        let cards = vec![
+            ObjectCard::object(ObjectCardId(3), "state", true).with_actions([
+                ("color", "●"),
+                ("visible", "◉"),
+                ("frozen", "❄"),
+            ]),
+        ];
+        let layout = layout_object_strip(&cards, Rect::new(0, 0, 12, 2), 0);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 12, 2));
+
+        render_object_strip(&mut buffer, &layout, Some(ObjectCardId(3)));
+
+        let actions = &layout.cards[0].action_rects;
+        assert_eq!(actions.len(), 3);
+        for (action, expected) in actions.iter().zip(["color", "visible", "frozen"]) {
+            assert_eq!(
+                layout.hit(action.rect.x, action.rect.y),
+                Some(ObjectStripHit::Action(ObjectCardId(3), expected.into()))
+            );
+            assert_ne!(
+                buffer
+                    .cell((action.rect.x, action.rect.y))
+                    .unwrap()
+                    .symbol(),
+                " "
+            );
+        }
     }
 }

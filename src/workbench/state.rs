@@ -1559,7 +1559,15 @@ impl WorkbenchState {
 
     pub fn add_channel(&mut self) -> Result<(), HistoryError> {
         let mut next = self.draft.clone();
-        let name = format!("channel_{}", next.channels.len() + 1);
+        let ordinal = next
+            .channels
+            .iter()
+            .map(|channel| channel.id.0)
+            .max()
+            .unwrap_or(0)
+            .checked_add(2)
+            .ok_or_else(|| HistoryError::Edit("channel name ordinal exhausted".into()))?;
+        let name = format!("channel_{ordinal}");
         let id = next.add_channel(name, false);
         let selected_kernel = if next.rules.is_empty() {
             let kernel_id = KernelId(
@@ -1782,7 +1790,88 @@ impl WorkbenchState {
             return Ok(());
         };
         channel.frozen = !channel.frozen;
-        if channel.frozen {
+        let frozen = channel.frozen;
+        if !next.rules.is_empty() {
+            if frozen {
+                next.rules
+                    .bindings
+                    .retain(|binding| binding.output != target);
+                next.rules.defaults.remove(&target);
+            } else {
+                let rule_set = if let Some(rule_set) = next.rules.defaults.get(&target).copied() {
+                    rule_set
+                } else if let Some(rule_set) = next
+                    .rules
+                    .sets
+                    .iter()
+                    .find(|rule| rule.growth.target == target)
+                    .map(|rule| rule.id)
+                {
+                    next.rules.defaults.insert(target, rule_set);
+                    rule_set
+                } else {
+                    let id = RuleSetId(
+                        next.rules
+                            .sets
+                            .iter()
+                            .map(|rule| rule.id.0)
+                            .max()
+                            .unwrap_or(0)
+                            .checked_add(1)
+                            .ok_or_else(|| HistoryError::Edit("rule-set id exhausted".into()))?,
+                    );
+                    let mut rule = RuleSet::identity(id, target);
+                    if next.tiling.is_some() {
+                        let planes = next
+                            .basis_ids()
+                            .into_iter()
+                            .map(|basis| {
+                                (
+                                    basis,
+                                    crate::sim::basis_kernel::BasisWeightPlane {
+                                        values: vec![1.0],
+                                        mask: None,
+                                    },
+                                )
+                            })
+                            .collect();
+                        rule.kernels[0].spatial =
+                            crate::sim::ruleset::KernelSpatialDefinition::Periodic(
+                                crate::sim::basis_kernel::PeriodicKernelDefinition {
+                                    width: 1,
+                                    height: 1,
+                                    anchor_x: 0,
+                                    anchor_y: 0,
+                                    planes,
+                                },
+                            );
+                    }
+                    next.rules.defaults.insert(target, id);
+                    next.rules.sets.push(rule);
+                    id
+                };
+                for basis in next.basis_ids() {
+                    if next.rules.binding(basis, target).is_none() {
+                        next.rules.bindings.push(crate::sim::ruleset::RuleBinding {
+                            basis,
+                            output: target,
+                            rule_set,
+                        });
+                    }
+                }
+            }
+            next.rules
+                .validate(&next.basis_ids(), &next.channels)
+                .map_err(|errors| {
+                    HistoryError::Edit(
+                        errors
+                            .into_iter()
+                            .map(|error| error.to_string())
+                            .collect::<Vec<_>>()
+                            .join("; "),
+                    )
+                })?;
+        } else if frozen {
             next.kernels.retain(|kernel| kernel.target != target);
             next.growth.retain(|growth| growth.target != target);
         } else if !next.growth.iter().any(|growth| growth.target == target) {
@@ -2549,6 +2638,69 @@ mod tests {
         assert_eq!(state.selected_channel(), ChannelId(1));
         state.redo().unwrap();
         assert_eq!(state.selected_channel(), ChannelId(2));
+    }
+
+    #[test]
+    fn deleting_then_adding_a_channel_keeps_ids_and_names_unique() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        state.add_channel().unwrap();
+        state.add_channel().unwrap();
+        state.set_selected_channel(ChannelId(1)).unwrap();
+        state.remove_selected_channel().unwrap();
+
+        state.add_channel().unwrap();
+
+        assert_eq!(
+            state
+                .draft()
+                .channels
+                .iter()
+                .map(|channel| channel.id)
+                .collect::<Vec<_>>(),
+            vec![ChannelId(0), ChannelId(2), ChannelId(3)]
+        );
+        let names = state
+            .draft()
+            .channels
+            .iter()
+            .map(|channel| channel.name.as_str())
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(names.len(), 3);
+        assert_eq!(
+            state
+                .draft()
+                .channels
+                .iter()
+                .find(|channel| channel.id == ChannelId(3))
+                .unwrap()
+                .name,
+            "channel_4"
+        );
+    }
+
+    #[test]
+    fn normalized_freeze_removes_bindings_and_unfreeze_restores_every_basis() {
+        let mut state = WorkbenchState::new(basis_fixture());
+        let bases = state.draft().basis_ids();
+
+        state.toggle_selected_frozen().unwrap();
+
+        assert!(state.draft().channels[0].frozen);
+        assert!(
+            bases
+                .iter()
+                .all(|basis| { state.draft().rules.binding(*basis, ChannelId(0)).is_none() })
+        );
+
+        state.toggle_selected_frozen().unwrap();
+
+        assert!(!state.draft().channels[0].frozen);
+        assert!(
+            bases
+                .iter()
+                .all(|basis| { state.draft().rules.binding(*basis, ChannelId(0)).is_some() })
+        );
+        crate::sim::experiment_model::validate_structure(state.draft()).unwrap();
     }
 
     #[test]

@@ -44,6 +44,80 @@ pub struct ToolbarLayout {
 }
 
 const MAX_TOOLBAR_ROWS: u16 = 4;
+const OBJECT_STRIP_HEIGHT: u16 = 3;
+
+pub fn channel_strip_area(canvas_inner: Rect) -> Rect {
+    Rect::new(
+        canvas_inner.x,
+        canvas_inner.y,
+        canvas_inner.width,
+        canvas_inner.height.min(OBJECT_STRIP_HEIGHT),
+    )
+}
+
+pub fn section_graphics_area(state: &crate::workbench::WorkbenchState, canvas_inner: Rect) -> Rect {
+    if state.section() == WorkbenchSection::Channels {
+        let strip = channel_strip_area(canvas_inner);
+        Rect::new(
+            canvas_inner.x,
+            canvas_inner.y.saturating_add(strip.height),
+            canvas_inner.width,
+            canvas_inner.height.saturating_sub(strip.height),
+        )
+    } else {
+        canvas_inner
+    }
+}
+
+pub fn channel_strip_layout(
+    state: &crate::workbench::WorkbenchState,
+    area: Rect,
+) -> crate::workbench::object_strip::ObjectStripLayout {
+    use crate::workbench::object_strip::{ObjectCard, ObjectCardId, layout_object_strip};
+    let mut cards = crate::workbench::channel_cards(state.draft(), state.selected_channel())
+        .into_iter()
+        .map(|channel| {
+            ObjectCard::object(
+                ObjectCardId(u64::from(channel.id.0)),
+                channel.name,
+                state.draft().channels.len() > 1,
+            )
+            .with_actions([
+                ("color", "●"),
+                ("visible", if channel.visible { "◉" } else { "○" }),
+                ("frozen", if channel.frozen { "❄" } else { "▶" }),
+            ])
+        })
+        .collect::<Vec<_>>();
+    cards.push(ObjectCard::add());
+    layout_object_strip(&cards, area, 0)
+}
+
+fn render_channel_strip(buffer: &mut Buffer, state: &crate::workbench::WorkbenchState, area: Rect) {
+    let layout = channel_strip_layout(state, area);
+    crate::workbench::object_strip::render_object_strip(
+        buffer,
+        &layout,
+        Some(crate::workbench::object_strip::ObjectCardId(u64::from(
+            state.selected_channel().0,
+        ))),
+    );
+    let channels = crate::workbench::channel_cards(state.draft(), state.selected_channel());
+    for (laid_out, channel) in layout.cards.iter().zip(channels) {
+        if let Some(swatch) = laid_out
+            .action_rects
+            .iter()
+            .find(|action| action.id == "color")
+            && let Some(cell) = buffer.cell_mut((swatch.rect.x, swatch.rect.y))
+        {
+            cell.set_fg(Color::Rgb(
+                channel.color.red,
+                channel.color.green,
+                channel.color.blue,
+            ));
+        }
+    }
+}
 
 fn workbench_scene_presence(state: &crate::workbench::WorkbenchState) -> ScenePresence {
     match state.section() {
@@ -591,7 +665,7 @@ pub fn draw_workbench(
             canvas_inner.height.saturating_sub(source_height),
         )
     } else {
-        canvas_inner
+        section_graphics_area(app.workbench(), canvas_inner)
     };
     let (pixel_width, pixel_height) = display.framebuffer_size(graphics_area);
     let scene_presence = workbench_scene_presence(app.workbench());
@@ -819,6 +893,9 @@ pub fn draw_workbench(
         ]));
     }
     frame.render_widget(Paragraph::new(header_lines), canvas_header);
+    if state.section() == WorkbenchSection::Channels {
+        render_channel_strip(frame.buffer_mut(), state, channel_strip_area(canvas_inner));
+    }
     if matches!(state.section(), WorkbenchSection::World) {
         let (width, height) = display.framebuffer_size(graphics_area);
         let basis_scene = app.workbench_initial_basis_scene(state.channel_view(), scene_generation);
@@ -1046,24 +1123,14 @@ pub fn draw_workbench(
     }
     display.apply_placement_action(frame, graphics_area, placement_action);
     if let Some(inspector) = layout.inspector {
-        let selected = state
-            .draft()
-            .channels
-            .iter()
-            .find(|channel| channel.id == state.selected_channel());
-        let mut lines = vec![
-            Line::from(format!("section: {}", state.section().label())),
-            Line::from(format!("draft: {:?}", state.status())),
-            Line::from(format!("channels: {}", state.draft().channels.len())),
-            Line::from(format!("kernels: {}", inspector_kernel_count(state))),
-            Line::from(format!(
-                "selected: {}",
-                selected.map_or("—", |c| c.name.as_str())
-            )),
-            Line::from(format!("view: {:?}", state.channel_view())),
+        let mut lines = inspector_summary_lines(state)
+            .into_iter()
+            .map(Line::from)
+            .collect::<Vec<_>>();
+        lines.extend([
             Line::from(""),
             Line::from("Click section · T section · Tab focus"),
-        ];
+        ]);
         match state.section() {
             WorkbenchSection::World => {
                 lines.push(Line::from("Canvas: left paint · right erase"));
@@ -1407,6 +1474,45 @@ fn channel_inspector_texts(state: &crate::workbench::WorkbenchState) -> Vec<Stri
             )
         })
         .collect()
+}
+
+fn inspector_summary_lines(state: &crate::workbench::WorkbenchState) -> Vec<String> {
+    let selected = state
+        .draft()
+        .channels
+        .iter()
+        .find(|channel| channel.id == state.selected_channel());
+    if state.section() == WorkbenchSection::Channels {
+        let frozen = state
+            .draft()
+            .channels
+            .iter()
+            .filter(|channel| channel.frozen)
+            .count();
+        return vec![
+            "section: Channels".into(),
+            format!("draft: {:?}", state.status()),
+            format!("all channels: {}", state.draft().channels.len()),
+            format!("active: {}", state.draft().channels.len() - frozen),
+            format!("frozen: {frozen}"),
+            format!(
+                "selected: {}",
+                selected.map_or("—", |channel| channel.name.as_str())
+            ),
+            format!("view: {:?}", state.channel_view()),
+        ];
+    }
+    vec![
+        format!("section: {}", state.section().label()),
+        format!("draft: {:?}", state.status()),
+        format!("channels: {}", state.draft().channels.len()),
+        format!("kernels: {}", inspector_kernel_count(state)),
+        format!(
+            "selected: {}",
+            selected.map_or("—", |channel| channel.name.as_str())
+        ),
+        format!("view: {:?}", state.channel_view()),
+    ]
 }
 
 fn tiling_inspector_texts(state: &crate::workbench::WorkbenchState) -> Vec<String> {
@@ -1986,6 +2092,75 @@ mod tests {
         assert!(text.contains("channel_3  #0000FF"));
         assert!(text.contains("visible"));
         assert!(text.contains("active"));
+    }
+
+    #[test]
+    fn channel_canvas_starts_with_visible_cards_and_mouse_accessories() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.add_channel().unwrap();
+        state.add_channel().unwrap();
+        state
+            .set_selected_channel(crate::sim::experiment_model::ChannelId(1))
+            .unwrap();
+        state.select_section(WorkbenchSection::Channels);
+        let canvas = Rect::new(20, 5, 60, 30);
+
+        let strip = channel_strip_layout(&state, channel_strip_area(canvas));
+
+        assert_eq!(strip.logical_len, 4);
+        assert_eq!(strip.cards[0].action_rects.len(), 3);
+        assert_eq!(
+            strip.hit(strip.cards[1].body_rect.x, strip.cards[1].body_rect.y),
+            Some(crate::workbench::object_strip::ObjectStripHit::Select(
+                crate::workbench::object_strip::ObjectCardId(1)
+            ))
+        );
+        assert_eq!(section_graphics_area(&state, canvas).y, canvas.y + 3);
+    }
+
+    #[test]
+    fn channel_color_accessory_uses_the_resolved_channel_color() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.add_channel().unwrap();
+        state.add_channel().unwrap();
+        let area = Rect::new(0, 0, 60, 3);
+        let layout = channel_strip_layout(&state, area);
+        let swatch = layout.cards[0]
+            .action_rects
+            .iter()
+            .find(|action| action.id == "color")
+            .unwrap()
+            .rect;
+        let mut buffer = Buffer::empty(area);
+
+        render_channel_strip(&mut buffer, &state, area);
+
+        assert_eq!(
+            buffer.cell((swatch.x, swatch.y)).unwrap().fg,
+            Color::Rgb(255, 0, 0)
+        );
+    }
+
+    #[test]
+    fn channels_inspector_uses_channel_scope_without_kernel_count() {
+        let mut state = crate::workbench::WorkbenchState::new(
+            crate::sim::experiment_model::ExperimentSpec::single_channel_lenia(4, 4),
+        );
+        state.add_channel().unwrap();
+        state.add_channel().unwrap();
+        state.toggle_selected_frozen().unwrap();
+        state.select_section(WorkbenchSection::Channels);
+
+        let text = inspector_summary_lines(&state).join("\n");
+
+        assert!(text.contains("all channels: 3"));
+        assert!(text.contains("active: 2"));
+        assert!(text.contains("frozen: 1"));
+        assert!(!text.contains("kernels:"));
     }
 
     #[test]

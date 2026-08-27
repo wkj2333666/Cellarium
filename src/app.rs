@@ -595,13 +595,72 @@ impl App {
                     return true;
                 }
             }
-            if self.workbench.section() == WorkbenchSection::Growth {
-                let body = Rect::new(
-                    canvas_content.x,
-                    canvas_content.y.saturating_add(header_height),
-                    canvas_content.width,
-                    canvas_content.height.saturating_sub(header_height),
+            let canvas_inner = Rect::new(
+                canvas_content.x,
+                canvas_content.y.saturating_add(header_height),
+                canvas_content.width,
+                canvas_content.height.saturating_sub(header_height),
+            );
+            if self.workbench.section() == WorkbenchSection::Channels
+                && left_down
+                && crate::tui::workbench::channel_strip_area(canvas_inner).contains(point)
+            {
+                use crate::workbench::object_strip::ObjectStripHit;
+                let strip = crate::tui::workbench::channel_strip_layout(
+                    &self.workbench,
+                    crate::tui::workbench::channel_strip_area(canvas_inner),
                 );
+                let result = match strip.hit(mouse.column, mouse.row) {
+                    Some(ObjectStripHit::Select(id)) => u32::try_from(id.0)
+                        .map_err(|_| "channel id is out of range".to_string())
+                        .and_then(|id| {
+                            self.workbench
+                                .set_selected_channel(crate::sim::experiment_model::ChannelId(id))
+                        }),
+                    Some(ObjectStripHit::Delete(id)) => u32::try_from(id.0)
+                        .map_err(|_| "channel id is out of range".to_string())
+                        .and_then(|id| {
+                            self.workbench
+                                .set_selected_channel(crate::sim::experiment_model::ChannelId(id))
+                        })
+                        .and_then(|_| self.workbench.remove_selected_channel()),
+                    Some(ObjectStripHit::Add) => self
+                        .workbench
+                        .add_channel()
+                        .map_err(|error| error.to_string()),
+                    Some(ObjectStripHit::Action(id, action)) => u32::try_from(id.0)
+                        .map_err(|_| "channel id is out of range".to_string())
+                        .and_then(|id| {
+                            self.workbench
+                                .set_selected_channel(crate::sim::experiment_model::ChannelId(id))
+                        })
+                        .and_then(|_| match action.as_str() {
+                            "color" => self
+                                .workbench
+                                .cycle_selected_color()
+                                .map_err(|error| error.to_string()),
+                            "visible" => self
+                                .workbench
+                                .toggle_selected_visibility()
+                                .map_err(|error| error.to_string()),
+                            "frozen" => self
+                                .workbench
+                                .toggle_selected_frozen()
+                                .map_err(|error| error.to_string()),
+                            _ => Err(format!("unknown channel action `{action}`")),
+                        }),
+                    None => return true,
+                };
+                match result {
+                    Ok(()) => self.workbench_notice = Some("Channel updated".into()),
+                    Err(error) => self.workbench_notice = Some(error),
+                }
+                self.workbench_draft_scene_generation =
+                    self.workbench_draft_scene_generation.wrapping_add(1);
+                return true;
+            }
+            if self.workbench.section() == WorkbenchSection::Growth {
+                let body = canvas_inner;
                 let source_height = body.height.saturating_mul(48) / 100;
                 let source = Rect::new(body.x, body.y, body.width, source_height);
                 if source.contains(point) {
@@ -6693,6 +6752,68 @@ mod tests {
             assert!(app.handle_workbench_panel_mouse(click));
             assert_eq!(app.workbench().selected_channel(), channel);
         }
+    }
+
+    #[test]
+    fn channel_cards_select_and_run_visible_accessory_actions() {
+        let mut app = App::new(SimulationSpec::lenia_orbium(), 16, 16);
+        app.enter_workbench();
+        app.workbench_mut().add_channel().unwrap();
+        app.workbench_mut().add_channel().unwrap();
+        app.workbench_mut()
+            .select_section(crate::workbench::WorkbenchSection::Channels);
+        let area = ratatui::layout::Rect::new(0, 0, 160, 40);
+        app.set_workbench_area(area);
+        let layout = crate::tui::workbench::workbench_layout(area);
+        let canvas_content = ratatui::layout::Rect::new(
+            layout.canvas.x + 1,
+            layout.canvas.y + 1,
+            layout.canvas.width - 2,
+            layout.canvas.height - 2,
+        );
+        let toolbar = crate::tui::workbench::toolbar_layout(app.workbench(), canvas_content.width);
+        let canvas_inner = ratatui::layout::Rect::new(
+            canvas_content.x,
+            canvas_content.y + toolbar.height + 1,
+            canvas_content.width,
+            canvas_content.height - toolbar.height - 1,
+        );
+        let strip = crate::tui::workbench::channel_strip_layout(
+            app.workbench(),
+            crate::tui::workbench::channel_strip_area(canvas_inner),
+        );
+        let first = &strip.cards[0];
+        let click = |rect: ratatui::layout::Rect| crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+            column: rect.x,
+            row: rect.y,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+
+        assert!(app.handle_workbench_panel_mouse(click(first.body_rect)));
+        assert_eq!(
+            app.workbench().selected_channel(),
+            crate::sim::experiment_model::ChannelId(0)
+        );
+        let visible = first
+            .action_rects
+            .iter()
+            .find(|action| action.id == "visible")
+            .unwrap()
+            .rect;
+        assert!(app.handle_workbench_panel_mouse(click(visible)));
+        assert!(!app.workbench().draft().channels[0].display.visible);
+        let color = first
+            .action_rects
+            .iter()
+            .find(|action| action.id == "color")
+            .unwrap()
+            .rect;
+        assert!(app.handle_workbench_panel_mouse(click(color)));
+        assert!(matches!(
+            app.workbench().draft().channels[0].display.color,
+            crate::sim::experiment_model::DisplayColor::Custom(_)
+        ));
     }
 
     #[test]
