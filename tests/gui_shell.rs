@@ -6,13 +6,15 @@ use eframe::egui::accesskit::Role;
 use egui_kittest::Harness;
 use egui_kittest::kittest::Queryable;
 
+/// The shell harness starts on a section whose workspace has no toolbar of its
+/// own. The Simulation workspace deliberately repeats Run, Step and Reset, so
+/// testing the shell there would address two controls by the same name.
 fn shell_harness() -> Harness<'static, CellariumGui> {
+    let mut app = CellariumGui::for_test(ExperimentSpec::single_channel_lenia(64, 64));
+    app.navigation_mut().select(Section::Tiling);
     Harness::builder()
         .with_size(egui::vec2(1280.0, 720.0))
-        .build_ui_state(
-            |ui, app: &mut CellariumGui| layout::draw(app, ui),
-            CellariumGui::for_test(ExperimentSpec::single_channel_lenia(64, 64)),
-        )
+        .build_ui_state(|ui, app: &mut CellariumGui| layout::draw(app, ui), app)
 }
 
 #[test]
@@ -26,7 +28,7 @@ fn every_navigation_section_is_visible_and_selectable() {
         harness.get_by_role_and_label(Role::Button, section.label());
     }
 
-    for section in [Section::Growth, Section::Tiling, Section::Experiment] {
+    for section in [Section::Growth, Section::Channels, Section::Experiment] {
         harness
             .get_by_role_and_label(Role::Button, section.label())
             .click();

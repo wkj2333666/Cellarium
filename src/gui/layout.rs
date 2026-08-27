@@ -129,6 +129,10 @@ fn help(app: &CellariumGui, ui: &mut Ui) {
 fn workspace(app: &mut CellariumGui, ui: &mut Ui) {
     egui::CentralPanel::default().show(ui, |ui| {
         let section = app.navigation().selected();
+        if section == Section::Simulation {
+            crate::gui::sections::simulation::draw(app, ui);
+            return;
+        }
         ui.heading(section.label());
         ui.label(section.hint());
         ui.separator();

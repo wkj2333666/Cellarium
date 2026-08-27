@@ -58,7 +58,7 @@ impl StateLayout {
         self.index_by_position(channel, x, y, basis)
     }
 
-    pub(crate) fn index_by_position(
+    pub fn index_by_position(
         &self,
         channel: usize,
         x: usize,

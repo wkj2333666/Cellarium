@@ -1,7 +1,9 @@
 use std::sync::Arc;
 
 use crate::document::DocumentController;
+use crate::gui::canvas::world::WorldCanvasState;
 use crate::gui::layout;
+use crate::gui::sections::simulation::SimulationControl;
 use crate::sim::backend_selector::{BackendPolicy, BackendSelector};
 use crate::sim::compute_plan::compile_compute_plan;
 use crate::sim::experiment_model::ExperimentSpec;
@@ -166,6 +168,8 @@ pub struct CellariumGui {
     probes: Vec<BackendProbe>,
     backend_open: bool,
     fallback_notice: Option<String>,
+    world_canvas: WorldCanvasState,
+    randomize_seed: u64,
     navigation: Navigation,
     inspector_tab: InspectorTab,
     last_action: Option<ShellAction>,
@@ -229,6 +233,8 @@ impl CellariumGui {
             probes: Vec::new(),
             backend_open: false,
             fallback_notice: None,
+            world_canvas: WorldCanvasState::default(),
+            randomize_seed: 0x2545_F491_4F6C_DD1D,
             navigation: Navigation::default(),
             inspector_tab: InspectorTab::default(),
             last_action: None,
@@ -356,6 +362,54 @@ impl CellariumGui {
             let _ = simulation.send(command);
         }
         self.last_action = Some(action);
+    }
+
+    /// Wait for a published snapshot to satisfy `predicate`. Test support: the
+    /// GUI itself never waits on the worker.
+    pub fn wait_for_simulation(
+        &self,
+        predicate: impl Fn(&SimulationSnapshot) -> bool,
+    ) -> Arc<SimulationSnapshot> {
+        self.simulation
+            .as_ref()
+            .expect("a worker must be running")
+            .wait_for(predicate)
+    }
+
+    pub fn world_canvas(&self) -> &WorldCanvasState {
+        &self.world_canvas
+    }
+
+    pub fn world_canvas_mut(&mut self) -> &mut WorldCanvasState {
+        &mut self.world_canvas
+    }
+
+    /// Send a command to the worker, ignoring a stopped worker: the status bar
+    /// reports that through the next snapshot rather than blocking here.
+    pub fn send_simulation(&self, command: SimulationCommand) {
+        if let Some(simulation) = self.simulation.as_ref() {
+            let _ = simulation.send(command);
+        }
+    }
+
+    /// Handle a click on one of the Simulation canvas controls.
+    pub fn dispatch_simulation(&mut self, control: SimulationControl) {
+        match control {
+            SimulationControl::RunPause => self.dispatch(ShellAction::ToggleRunning),
+            SimulationControl::Step => self.send_simulation(SimulationCommand::Step(1)),
+            SimulationControl::Reset => self.send_simulation(SimulationCommand::Reset),
+            SimulationControl::Randomize => {
+                self.randomize_seed = self
+                    .randomize_seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1);
+                self.send_simulation(SimulationCommand::Randomize {
+                    seed: self.randomize_seed,
+                });
+            }
+            SimulationControl::Clear => self.send_simulation(SimulationCommand::Clear),
+            SimulationControl::Fit => self.world_canvas.request_fit(),
+        }
     }
 
     pub fn status(&self) -> StatusLine {

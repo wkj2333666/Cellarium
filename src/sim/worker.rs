@@ -22,6 +22,8 @@ pub enum SimulationCommand {
     SetRunning(bool),
     Step(u32),
     Reset,
+    Randomize { seed: u64 },
+    Clear,
     EditWorld(Vec<WorldEdit>),
     Shutdown,
 }
@@ -278,6 +280,33 @@ fn run_worker(
                     }
                     publish = true;
                 }
+                SimulationCommand::Randomize { seed } => {
+                    if let Ok(mut state) = backend.readback() {
+                        let cells = randomized(&state.cells, seed);
+                        state.cells = cells;
+                        if let Err(failure) = backend.set_running_state(&state) {
+                            error = Some(RuntimeNotice {
+                                message: failure.to_string(),
+                            });
+                        } else {
+                            confirmed = Some(state);
+                        }
+                    }
+                    publish = true;
+                }
+                SimulationCommand::Clear => {
+                    if let Ok(mut state) = backend.readback() {
+                        state.cells = Arc::from(vec![0.0; state.cells.len()]);
+                        if let Err(failure) = backend.set_running_state(&state) {
+                            error = Some(RuntimeNotice {
+                                message: failure.to_string(),
+                            });
+                        } else {
+                            confirmed = Some(state);
+                        }
+                    }
+                    publish = true;
+                }
                 SimulationCommand::EditWorld(edits) => {
                     if let Err(failure) = backend.apply_edits(&edits) {
                         error = Some(RuntimeNotice {
@@ -322,6 +351,23 @@ fn run_worker(
             published.fetch_add(1, Ordering::Release);
         }
     }
+}
+
+/// Deterministic pseudo-random fill, so a seed reproduces a world exactly.
+fn randomized(cells: &[f32], seed: u64) -> Arc<[f32]> {
+    let mut state = seed | 1;
+    cells
+        .iter()
+        .map(|_| {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            // Take 24 bits and divide by their range, so the fill is uniform
+            // across 0..=1 instead of saturating at the top of the range.
+            (state >> 40) as f32 / ((1_u64 << 24) - 1) as f32
+        })
+        .map(|value: f32| value.clamp(0.0, 1.0))
+        .collect()
 }
 
 /// Try to replace a failed backend from the last confirmed state.
