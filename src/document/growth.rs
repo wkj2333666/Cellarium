@@ -147,6 +147,72 @@ pub fn analyze(
         })
 }
 
+/// Every growth program in the experiment that does not compile.
+///
+/// Structural validation checks that the pieces fit together; it does not read
+/// the programs. An experiment whose growth cannot be compiled is not ready to
+/// run, so this is part of deciding whether a draft may be applied rather than
+/// something discovered later when the backend refuses it.
+pub fn invalid_programs(spec: &ExperimentSpec) -> Vec<String> {
+    let mut problems = Vec::new();
+    if !spec.rules.is_empty() {
+        for rule in &spec.rules.sets {
+            let kernel_inputs: Vec<String> = rule
+                .growth
+                .kernel_inputs
+                .iter()
+                .filter_map(|id| rule.kernels.iter().find(|kernel| kernel.id == *id))
+                .map(|kernel| kernel.symbol.clone())
+                .collect();
+            let externals = ExternalSymbols {
+                kernel_inputs,
+                parameters: rule.growth.parameters.keys().cloned().collect(),
+            };
+            if let Err(diagnostics) = typecheck::compile(&rule.growth.source, &externals) {
+                problems.push(format!(
+                    "rule-set {} growth does not compile: {}",
+                    rule.id.0,
+                    join(diagnostics)
+                ));
+            }
+        }
+        return problems;
+    }
+    for growth in &spec.growth {
+        let kernel_inputs: Vec<String> = growth
+            .kernel_inputs
+            .iter()
+            .filter_map(|id| spec.kernels.iter().find(|kernel| kernel.id == *id))
+            .map(|kernel| kernel.symbol.clone())
+            .collect();
+        let externals = ExternalSymbols {
+            kernel_inputs,
+            parameters: growth.parameters.keys().cloned().collect(),
+        };
+        if let Err(diagnostics) = typecheck::compile(&growth.source, &externals) {
+            problems.push(format!(
+                "channel {} growth does not compile: {}",
+                growth.target.0,
+                join(diagnostics)
+            ));
+        }
+    }
+    problems
+}
+
+fn join(diagnostics: Vec<crate::sim::growth::typecheck::TypeDiagnostic>) -> String {
+    diagnostics
+        .into_iter()
+        .map(|diagnostic| {
+            format!(
+                "{} at {}..{}",
+                diagnostic.code, diagnostic.span.start, diagnostic.span.end
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ")
+}
+
 /// Replace the growth source of a binding.
 ///
 /// The source is stored even when it does not compile: an editor that refused
@@ -296,6 +362,18 @@ mod tests {
         let diagnostics = analyze(&spec, key).unwrap_err();
         assert!(!diagnostics.is_empty());
         assert!(!diagnostics[0].code.is_empty());
+    }
+
+    #[test]
+    fn a_program_that_does_not_compile_is_reported_as_a_reason_not_to_apply() {
+        let spec = spec();
+        let key = binding(&spec);
+        assert!(invalid_programs(&spec).is_empty(), "the fixture is sound");
+
+        let broken = set_source(&spec, key, "unknown_symbol()").unwrap();
+        let problems = invalid_programs(&broken);
+        assert!(!problems.is_empty(), "an unknown symbol must be caught");
+        assert!(problems[0].contains("does not compile"), "{}", problems[0]);
     }
 
     #[test]

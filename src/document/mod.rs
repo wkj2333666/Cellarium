@@ -8,6 +8,7 @@
 pub mod channels;
 pub mod growth;
 pub mod kernels;
+pub mod persistence;
 pub mod selection;
 pub mod tiling;
 
@@ -365,6 +366,13 @@ impl DocumentController {
             .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())?;
         validate_structure(&candidate)
             .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())?;
+        // Structure says the pieces fit; this says the programs can run. An
+        // experiment applied without it fails later, in the backend, where the
+        // user has no way to connect the failure to what they typed.
+        let programs = growth::invalid_programs(&candidate);
+        if !programs.is_empty() {
+            return Err(programs);
+        }
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         Ok(ApplyCandidate {

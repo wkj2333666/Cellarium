@@ -128,28 +128,16 @@ fn help(app: &CellariumGui, ui: &mut Ui) {
 
 fn workspace(app: &mut CellariumGui, ui: &mut Ui) {
     egui::CentralPanel::default().show(ui, |ui| {
-        let section = app.navigation().selected();
-        match section {
-            Section::Simulation => return crate::gui::sections::simulation::draw(app, ui),
-            Section::Tiling => return crate::gui::sections::tiling::draw(app, ui),
-            Section::Channels => return crate::gui::sections::channels::draw(app, ui),
-            Section::Kernels => return crate::gui::sections::kernels::draw(app, ui),
-            Section::Growth => return crate::gui::sections::growth::draw(app, ui),
-            _ => {}
+        // Every section has a workspace now; there is no placeholder left to
+        // fall through to.
+        match app.navigation().selected() {
+            Section::Simulation => crate::gui::sections::simulation::draw(app, ui),
+            Section::Tiling => crate::gui::sections::tiling::draw(app, ui),
+            Section::Channels => crate::gui::sections::channels::draw(app, ui),
+            Section::Kernels => crate::gui::sections::kernels::draw(app, ui),
+            Section::Growth => crate::gui::sections::growth::draw(app, ui),
+            Section::Experiment => crate::gui::sections::experiment::draw(app, ui),
         }
-        ui.heading(section.label());
-        ui.label(section.hint());
-        ui.separator();
-        ui.centered_and_justified(|ui| {
-            ui.label(
-                RichText::new(format!(
-                    "{} workspace arrives in a later task",
-                    section.label()
-                ))
-                .italics()
-                .color(theme::state_color(theme::State::Draft)),
-            );
-        });
     });
 }
 

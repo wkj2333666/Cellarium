@@ -1,5 +1,6 @@
 use std::sync::Arc;
 
+use crate::document::persistence::{self, GuiSettings};
 use crate::document::{DocumentCommand, DocumentController};
 use crate::gui::canvas::channels::{
     ChannelCanvasState, ChannelPreview, ChannelPreviewSource, ChannelView, resolve_preview,
@@ -190,6 +191,11 @@ pub struct CellariumGui {
     /// draft it would produce already computed.
     kernel_decision: Option<(Decision, Box<ExperimentSpec>)>,
     growth_plot: GrowthPlotState,
+    /// Where this experiment was opened from or last saved to.
+    experiment_path: Option<std::path::PathBuf>,
+    settings: GuiSettings,
+    /// Directory holding settings and the autosave.
+    data_root: Option<std::path::PathBuf>,
     seam_proposals: Option<Vec<SeamProposal>>,
     notice: Option<String>,
     randomize_seed: u64,
@@ -264,6 +270,9 @@ impl CellariumGui {
             kernel_popover: NumericPopover::default(),
             kernel_decision: None,
             growth_plot: GrowthPlotState::default(),
+            experiment_path: None,
+            settings: GuiSettings::default(),
+            data_root: None,
             seam_proposals: None,
             notice: None,
             randomize_seed: 0x2545_F491_4F6C_DD1D,
@@ -386,6 +395,14 @@ impl CellariumGui {
                 self.backend_open = !self.backend_open;
                 None
             }
+            ShellAction::ApplyAndRun => {
+                self.apply_and_run();
+                None
+            }
+            ShellAction::Save => {
+                self.save_experiment();
+                None
+            }
             ShellAction::Undo => {
                 // Undo and Redo are document transactions, not simulation
                 // commands: they rewind the draft the user is editing.
@@ -424,6 +441,164 @@ impl CellariumGui {
             .as_ref()
             .expect("a worker must be running")
             .wait_for(predicate)
+    }
+
+    pub fn experiment_path(&self) -> Option<&std::path::Path> {
+        self.experiment_path.as_deref()
+    }
+
+    pub fn settings(&self) -> &GuiSettings {
+        &self.settings
+    }
+
+    /// Point the session at a directory for settings and autosave.
+    pub fn use_data_root(&mut self, root: impl Into<std::path::PathBuf>) {
+        let root = root.into();
+        self.settings = persistence::load_settings(&root);
+        self.data_root = Some(root);
+    }
+
+    /// Reasons the draft cannot be applied, in the model's own words.
+    pub fn draft_problems(&self) -> Vec<String> {
+        match self.document.draft().clone().normalize_rules() {
+            Ok(candidate) => {
+                let mut problems: Vec<String> =
+                    crate::sim::experiment_model::validate_structure(&candidate)
+                        .err()
+                        .map(|errors| errors.iter().map(ToString::to_string).collect())
+                        .unwrap_or_default();
+                // The same question Apply asks, so this workspace cannot report
+                // a draft as ready that Apply would then refuse.
+                problems.extend(crate::document::growth::invalid_programs(&candidate));
+                problems
+            }
+            Err(errors) => errors.iter().map(ToString::to_string).collect(),
+        }
+    }
+
+    /// Validate the draft and, only if it is sound, make it the running
+    /// experiment.
+    ///
+    /// A rejected candidate leaves the active experiment and its world exactly
+    /// as they were: the draft is proven before anything is replaced, never
+    /// after.
+    pub fn apply_and_run(&mut self) {
+        let candidate = match self.document.prepare_apply() {
+            Ok(candidate) => candidate,
+            Err(errors) => {
+                self.notice = Some(errors.join("; "));
+                return;
+            }
+        };
+        let request = candidate.request_id;
+        let experiment = candidate.experiment;
+        if !self.document.accept_apply(request, experiment) {
+            // The draft moved while the candidate was being built, so the
+            // candidate describes an experiment nobody asked for.
+            self.notice = Some("the draft changed while it was being applied".into());
+            return;
+        }
+        self.restart_simulation();
+        if self.startup_notice.is_none() {
+            self.notice = None;
+            self.running = true;
+            self.send_simulation(SimulationCommand::SetRunning(true));
+        }
+        self.channel_canvas.invalidate();
+        self.autosave();
+    }
+
+    /// Save to the current path, or report that there is not one yet.
+    pub fn save_experiment(&mut self) {
+        match self.experiment_path.clone() {
+            Some(path) => self.save_experiment_as(path),
+            None => {
+                self.notice =
+                    Some("this experiment has no path yet; use Save as with a path".into())
+            }
+        }
+    }
+
+    pub fn save_experiment_as(&mut self, path: impl Into<std::path::PathBuf>) {
+        let path = path.into();
+        match persistence::save_experiment(&path, self.document.draft()) {
+            Ok(()) => {
+                self.settings.remember(&path);
+                self.experiment_path = Some(path);
+                self.persist_settings();
+                self.notice = None;
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+    }
+
+    /// Open an experiment, replacing the document and the running world.
+    pub fn open_experiment(&mut self, path: impl Into<std::path::PathBuf>) {
+        let path = path.into();
+        match persistence::load_experiment(&path) {
+            Ok(spec) => {
+                self.document = DocumentController::new(spec);
+                self.settings.remember(&path);
+                self.experiment_path = Some(path);
+                self.persist_settings();
+                self.notice = None;
+                self.reset_view_state();
+                self.restart_simulation();
+            }
+            Err(error) => self.notice = Some(error.to_string()),
+        }
+    }
+
+    /// Start a fresh experiment, keeping the window open.
+    pub fn new_experiment(&mut self, spec: ExperimentSpec) {
+        self.document = DocumentController::new(spec);
+        self.experiment_path = None;
+        self.notice = None;
+        self.reset_view_state();
+        self.restart_simulation();
+    }
+
+    /// Views hold zoom, selections and cached textures for the experiment that
+    /// was open. None of it describes the new one.
+    fn reset_view_state(&mut self) {
+        self.world_canvas = WorldCanvasState::default();
+        self.tiling_canvas = TilingCanvasState::default();
+        self.channel_canvas = ChannelCanvasState::default();
+        self.kernel_canvas = KernelCanvasState::new();
+        self.kernel_popover.close();
+        self.kernel_decision = None;
+        self.growth_plot = GrowthPlotState::default();
+    }
+
+    fn persist_settings(&mut self) {
+        if let Some(root) = self.data_root.clone()
+            && let Err(error) = persistence::save_settings(&root, &self.settings)
+        {
+            self.notice = Some(error.to_string());
+        }
+    }
+
+    /// Write a recovery snapshot. The draft is cloned first, so the copy being
+    /// written is never the one the user is still editing.
+    pub fn autosave(&mut self) {
+        let Some(root) = self.data_root.clone() else {
+            return;
+        };
+        let snapshot = self.document.draft().clone();
+        if let Err(error) = persistence::write_autosave(&root, &snapshot) {
+            self.notice = Some(error.to_string());
+        }
+    }
+
+    /// An experiment left behind by a session that did not finish.
+    pub fn recoverable(&self) -> Option<ExperimentSpec> {
+        self.data_root.as_ref().and_then(persistence::recover)
+    }
+
+    pub fn discard_recovery(&mut self) {
+        if let Some(root) = self.data_root.clone() {
+            persistence::clear_autosave(root);
+        }
     }
 
     pub fn growth_plot(&self) -> &GrowthPlotState {
