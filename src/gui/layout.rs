@@ -123,6 +123,16 @@ fn workspace(app: &mut CellariumGui, ui: &mut Ui) {
     });
 }
 
+/// A slow backend still deserves an honest rate: rounding 0.4 Hz to "0 Hz"
+/// reads as stopped while the simulation is visibly advancing.
+fn format_rate(rate: f32) -> String {
+    if rate > 0.0 && rate < 10.0 {
+        format!("{rate:.1}")
+    } else {
+        format!("{rate:.0}")
+    }
+}
+
 fn status_bar(app: &mut CellariumGui, ui: &mut Ui) {
     egui::Panel::bottom("status").show(ui, |ui| {
         let status = app.status();
@@ -143,11 +153,11 @@ fn status_bar(app: &mut CellariumGui, ui: &mut Ui) {
             ui.separator();
             ui.label(format!("tick {}", status.tick));
             ui.separator();
-            ui.label(format!("sim {:.0} Hz", status.simulation_hz));
+            ui.label(format!("sim {} Hz", format_rate(status.simulation_hz)));
             ui.separator();
-            ui.label(format!("frame {:.0} Hz", status.frame_hz));
+            ui.label(format!("frame {} Hz", format_rate(status.frame_hz)));
             ui.separator();
-            ui.label(status.backend);
+            ui.label(&status.backend);
             if let Some(notice) = &status.notice {
                 ui.separator();
                 ui.label(RichText::new(notice).color(theme::state_color(theme::State::Invalid)));
