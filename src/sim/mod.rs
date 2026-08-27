@@ -26,6 +26,7 @@ pub mod service;
 pub mod strategy;
 pub mod tiling;
 pub mod topology;
+pub mod wgpu_backend;
 pub mod wgsl_codegen;
 pub mod worker;
 pub mod world;

@@ -47,6 +47,54 @@ impl BackendDescriptor {
     }
 }
 
+/// How a probed adapter is classified, used to order Auto candidates.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum GpuDeviceType {
+    Discrete,
+    Integrated,
+    Virtual,
+    Cpu,
+    Other,
+}
+
+/// The result of asking whether a backend can run a plan on this machine.
+/// An unavailable probe always carries the reason, so Settings can show why
+/// rather than silently falling back.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct BackendProbe {
+    pub kind: BackendKind,
+    pub available: bool,
+    pub device_name: Option<String>,
+    pub device_type: Option<GpuDeviceType>,
+    pub reason: Option<String>,
+}
+
+impl BackendProbe {
+    pub fn available(
+        kind: BackendKind,
+        device_name: impl Into<String>,
+        device_type: GpuDeviceType,
+    ) -> Self {
+        Self {
+            kind,
+            available: true,
+            device_name: Some(device_name.into()),
+            device_type: Some(device_type),
+            reason: None,
+        }
+    }
+
+    pub fn unavailable(kind: BackendKind, reason: impl Into<String>) -> Self {
+        Self {
+            kind,
+            available: false,
+            device_name: None,
+            device_type: None,
+            reason: Some(reason.into()),
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, thiserror::Error)]
 pub enum BackendFailure {
     #[error("backend rejected the plan: {0}")]
