@@ -1,10 +1,8 @@
 use std::collections::BTreeMap;
 
 use crate::sim::experiment_model::{ExperimentSpec, UpdateMode};
-use crate::sim::ruleset::KernelSpatialDefinition;
 use crate::sim::runtime::{CompiledBoundary, RuntimeError};
 use crate::sim::tiling::BasisId;
-use crate::sim::topology::BoundarySpec;
 use crate::sim::world::ChannelWorld;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -60,7 +58,13 @@ impl StateLayout {
         self.index_by_position(channel, x, y, basis)
     }
 
-    fn index_by_position(&self, channel: usize, x: usize, y: usize, basis: usize) -> Option<usize> {
+    pub(crate) fn index_by_position(
+        &self,
+        channel: usize,
+        x: usize,
+        y: usize,
+        basis: usize,
+    ) -> Option<usize> {
         if channel >= self.channels
             || x >= self.width
             || y >= self.height
@@ -107,184 +111,56 @@ pub struct CompiledBasisExperiment {
     pub rules: Vec<CompiledBasisRule>,
 }
 
+/// Build the CPU reference runtime from the shared [`ComputePlan`].
+///
+/// Ordering, dense indices and growth typing all come from the plan, so the CPU
+/// path cannot drift from the CUDA and wgpu backends.
 pub fn compile_basis_experiment(
     spec: &ExperimentSpec,
 ) -> Result<CompiledBasisExperiment, RuntimeError> {
-    if spec.rules.is_empty() {
-        return Err(RuntimeError::Model(
-            "basis runtime requires normalized rules".into(),
-        ));
-    }
-    let (width, height, boundary) = match &spec.geometry {
-        crate::sim::experiment_model::GeometrySpec::RasterGrid(grid) => (
-            grid.width as usize,
-            grid.height as usize,
-            match grid.boundary {
-                BoundarySpec::Open => CompiledBoundary::Open,
-                BoundarySpec::Constant(_) => CompiledBoundary::Constant,
-                BoundarySpec::Periodic => CompiledBoundary::Periodic,
-                BoundarySpec::Clamp => CompiledBoundary::Clamp,
-                BoundarySpec::Reflect => CompiledBoundary::Reflect,
-            },
-        ),
-    };
-    let layout = StateLayout::new(width, height, spec.basis_ids(), spec.channels.len())?;
-    spec.rules
-        .validate(&layout.bases, &spec.channels)
-        .map_err(|errors| {
-            RuntimeError::Model(
-                errors
-                    .into_iter()
-                    .map(|error| error.to_string())
-                    .collect::<Vec<_>>()
-                    .join("; "),
-            )
-        })?;
-    let channels = spec
-        .channels
-        .iter()
-        .enumerate()
-        .map(|(index, channel)| (channel.id, index))
-        .collect::<BTreeMap<_, _>>();
-    let constants = spec
-        .channels
-        .iter()
-        .map(|channel| (channel.id, channel.boundary_constant))
-        .collect::<BTreeMap<_, _>>();
-    let basis_positions = layout
-        .bases
-        .iter()
-        .enumerate()
-        .map(|(index, basis)| (*basis, index))
-        .collect::<BTreeMap<_, _>>();
-    let mut rules = Vec::with_capacity(spec.channels.len() * layout.bases.len());
-    for (target_channel, channel) in spec.channels.iter().enumerate() {
-        for (target_basis, basis) in layout.bases.iter().copied().enumerate() {
-            if channel.frozen {
-                rules.push(CompiledBasisRule {
-                    target_channel,
-                    target_basis,
-                    frozen: true,
-                    mode: UpdateMode::DirectUpdate,
-                    kernels: Vec::new(),
-                    parameters: BTreeMap::new(),
-                    program: None,
-                });
-                continue;
-            }
-            let binding = spec.rules.binding(basis, channel.id).ok_or_else(|| {
-                RuntimeError::Model(format!("missing binding for {basis:?}/{:?}", channel.id))
-            })?;
-            let rule = spec.rules.get(binding.rule_set).ok_or_else(|| {
-                RuntimeError::Model(format!("missing rule-set {:?}", binding.rule_set))
-            })?;
-            let mut kernels = Vec::with_capacity(rule.kernels.len());
-            for kernel in &rule.kernels {
-                let source_channel = *channels.get(&kernel.source_channel).ok_or_else(|| {
-                    RuntimeError::Model(format!(
-                        "missing source channel {:?}",
-                        kernel.source_channel
-                    ))
-                })?;
-                let boundary_constant = *constants.get(&kernel.source_channel).unwrap_or(&0.0);
-                let mut weights = Vec::new();
-                match &kernel.spatial {
-                    KernelSpatialDefinition::Periodic(definition) => {
-                        definition
-                            .validate()
-                            .map_err(|error| RuntimeError::Model(error.to_string()))?;
-                        for (source_basis, plane) in &definition.planes {
-                            let source_basis =
-                                *basis_positions.get(source_basis).ok_or_else(|| {
-                                    RuntimeError::Model(
-                                        "periodic kernel references an unknown source basis".into(),
-                                    )
-                                })?;
-                            for y in 0..definition.height {
-                                for x in 0..definition.width {
-                                    let index = y * definition.width + x;
-                                    if plane.mask.as_ref().is_some_and(|mask| !mask[index]) {
-                                        continue;
-                                    }
-                                    let weight = plane.values[index];
-                                    if weight != 0.0 {
-                                        weights.push(SparseBasisWeight {
-                                            dx: x as i16 - definition.anchor_x as i16,
-                                            dy: y as i16 - definition.anchor_y as i16,
-                                            source_basis,
-                                            weight,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    KernelSpatialDefinition::Raster(definition) => {
-                        let built = definition.build()?;
-                        for source_basis in 0..layout.bases.len() {
-                            for y in 0..built.height {
-                                for x in 0..built.width {
-                                    let index = y * built.width + x;
-                                    if built.mask.as_ref().is_some_and(|mask| !mask[index]) {
-                                        continue;
-                                    }
-                                    let weight = built.values[index];
-                                    if weight != 0.0 {
-                                        weights.push(SparseBasisWeight {
-                                            dx: x as i16 - built.anchor_x as i16,
-                                            dy: y as i16 - built.anchor_y as i16,
-                                            source_basis,
-                                            weight,
-                                        });
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-                weights.sort_by_key(|weight| (weight.dy, weight.dx, weight.source_basis));
-                kernels.push(CompiledBasisKernel {
-                    symbol: kernel.symbol.clone(),
-                    source_channel,
-                    boundary_constant,
-                    weights,
-                });
-            }
-            let program = crate::sim::growth::typecheck::compile(
-                &rule.growth.source,
-                &crate::sim::growth::types::ExternalSymbols {
-                    kernel_inputs: kernels.iter().map(|kernel| kernel.symbol.clone()).collect(),
-                    parameters: rule.growth.parameters.keys().cloned().collect(),
-                },
-            )
-            .map_err(|errors| {
-                RuntimeError::Model(
-                    errors
-                        .into_iter()
-                        .map(|error| {
-                            format!("{} at {}..{}", error.code, error.span.start, error.span.end)
-                        })
-                        .collect::<Vec<_>>()
-                        .join("; "),
-                )
-            })?;
-            rules.push(CompiledBasisRule {
-                target_channel,
-                target_basis,
-                frozen: false,
-                mode: rule.growth.mode,
-                kernels,
-                parameters: rule.growth.parameters.clone(),
-                program: Some(program),
-            });
+    let plan = crate::sim::compute_plan::compile_compute_plan(spec).map_err(|diagnostics| {
+        RuntimeError::Model(
+            diagnostics
+                .into_iter()
+                .map(|diagnostic| diagnostic.message)
+                .collect::<Vec<_>>()
+                .join("; "),
+        )
+    })?;
+    Ok(CompiledBasisExperiment::from_plan(&plan))
+}
+
+impl CompiledBasisExperiment {
+    pub fn from_plan(plan: &crate::sim::compute_plan::ComputePlan) -> Self {
+        let rules = plan
+            .bindings
+            .iter()
+            .map(|binding| CompiledBasisRule {
+                target_channel: binding.output_index,
+                target_basis: binding.basis_index,
+                frozen: binding.frozen,
+                mode: binding.mode,
+                kernels: binding
+                    .kernels
+                    .iter()
+                    .map(|kernel| CompiledBasisKernel {
+                        symbol: kernel.symbol.clone(),
+                        source_channel: kernel.source_channel_index,
+                        boundary_constant: kernel.boundary_constant,
+                        weights: kernel.weights.clone(),
+                    })
+                    .collect(),
+                parameters: binding.parameters.clone(),
+                program: binding.program.clone(),
+            })
+            .collect();
+        Self {
+            layout: plan.layout.clone(),
+            boundary: plan.boundary,
+            simulation_dt: plan.dt,
+            rules,
         }
     }
-    Ok(CompiledBasisExperiment {
-        layout,
-        boundary,
-        simulation_dt: spec.simulation_dt,
-        rules,
-    })
 }
 
 impl CompiledBasisExperiment {

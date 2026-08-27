@@ -2,6 +2,7 @@ pub mod backend;
 pub mod backend_error;
 pub mod basis_kernel;
 pub mod basis_runtime;
+pub mod compute_plan;
 pub mod cpu;
 #[cfg(feature = "cuda")]
 pub mod cuda;
