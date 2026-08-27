@@ -1,72 +1,80 @@
-# Cellarium GUI 迁移交接说明
+# Cellarium GUI Migration Handoff
 
-> 日期：2026-08-27
-> 当前产品版本：v0.2.2
-> 当前工作分支：`basis-workbench-implementation`
-> GUI 迁移状态：设计与实施计划阶段，尚未开始迁移代码
+> Date: 2026-08-27
+> Current product version: v0.2.2
+> Current working branch: `basis-workbench-implementation`
+> GUI migration status: design and implementation planning are complete; migration code has not started
 
-## 1. 已经确定、不得重新猜测的产品决策
+## 1. Settled product decisions
 
-1. 主界面迁移到原生 GUI，采用 **egui/eframe + wgpu**。
-2. TUI 废除。最终产品不再依赖 ratatui、crossterm、Kitty graphics、
-   Sixel、iTerm2 graphics 或 half-block。
-3. 产品不再提供服务器连接方式：
-   - 删除 `cellarium server`；
-   - 删除 `cellarium connect <host>`；
-   - 删除 SSH connector 和远端二进制协议；
-   - 不再把模拟放在 tinker、显示放在本机。
-4. 模拟和显示全部在运行 GUI 的本机完成。
-5. 自动计算后端顺序为：
-   1. 可用的独立 GPU 原生后端，当前指 NVIDIA CUDA；
-   2. 可用的 portable wgpu compute GPU，必须验证 Intel 集显，也允许
-      Apple/AMD/树莓派集成 GPU 使用同一路径；
-   3. CPU。
-6. 用户可以在 Settings 中选择 Auto、CUDA、wgpu GPU 或 CPU。显式选择
-   不可用后端时显示原因，不静默伪装成该后端。
-7. 现有实验语义继续成立：
-   - 默认 1 个通道；
-   - 每个 `(basis polygon, output channel)` Binding 默认 1 个核；
-   - 多核必须显式添加；
-   - Potential 保留原始卷积和，不自动归一化；
-   - Growth 支持 Rate 和 Value；
-   - 严格 edge-to-edge 密铺，不支持 T-junction；
-   - 默认 Tiling 设计为空白，可选预设或从头绘制。
-8. GUI 必须鼠标优先。键盘是加速器，不得成为主要功能的唯一入口。
-9. Agentic 测试必须用真实 GUI、真实键鼠和截图完成完整任务，不能以单元
-   测试、事件回执、trace 或图片 hash 代替用户视觉判断。
+These decisions are final unless the user explicitly changes them.
 
-## 2. 仓库和分支现状
+1. Migrate the primary interface to a native GUI using **egui/eframe + wgpu**.
+2. Retire the TUI. The final product must not depend on ratatui, crossterm,
+   Kitty graphics, Sixel, iTerm2 graphics, or half-block rendering.
+3. Remove all server-connection modes:
+   - remove `cellarium server`;
+   - remove `cellarium connect <host>`;
+   - remove the SSH connector and remote binary protocol;
+   - stop running simulation on tinker while displaying it locally.
+4. Run simulation and rendering on the same machine as the GUI.
+5. Automatic compute-backend priority is:
+   1. an available native discrete-GPU backend, currently NVIDIA CUDA;
+   2. an available portable wgpu compute adapter, with mandatory Intel
+      integrated-GPU validation and the same path available to Apple, AMD, and
+      Raspberry Pi integrated GPUs;
+   3. CPU.
+6. Settings must let the user select Auto, CUDA, wgpu GPU, or CPU. If an
+   explicitly selected backend is unavailable, show the reason instead of
+   silently pretending to use it.
+7. Preserve the current experiment semantics:
+   - one channel by default;
+   - one kernel by default for each `(basis polygon, output channel)` binding;
+   - additional kernels require an explicit user action;
+   - Potential is the raw convolution sum and is not automatically normalized;
+   - Growth supports both Rate and Value modes;
+   - tilings are strictly edge-to-edge, with no T-junction support;
+   - a new Tiling design starts blank, with optional presets or free drawing.
+8. The GUI must be mouse-first. Keyboard shortcuts are accelerators and must
+   not be the only entry point for primary features.
+9. Agentic testing must complete realistic tasks in the real GUI with real
+   pointer and keyboard input plus visual screenshot inspection. Unit tests,
+   event acknowledgements, traces, and image hashes cannot replace user-level
+   visual judgment.
 
-远端工作树：
+## 2. Repository and branch state
+
+Remote worktree:
 
 ```text
 /home/wkj/projects/cellarium/.worktrees/basis-workbench-implementation
 ```
 
-基线与当前提交：
+Baseline and relevant commits:
 
 ```text
 271b79e  v0.2.2 / origin/main
-8a41fb4  旧 TUI 图形化 Workbench 设计
-9599ec1  旧 TUI 图形化 Workbench 计划
+8a41fb4  legacy graphical TUI Workbench design
+9599ec1  legacy graphical TUI Workbench plan
 5a20955  TUI object strip
-f959c00  Workbench 稳定选择与 decision state
-4c58cf2  TUI Channels 图形卡片及通道生命周期修复
+f959c00  stable Workbench selection and decision state
+4c58cf2  TUI Channels cards and channel-lifecycle fixes
 ```
 
-在作出 GUI 决定前，旧计划只执行到 Phase A / Task 3。Task 4 的 RED 测试
-没有保留；工作树在写本交接文档前已恢复到已提交状态。
+Before the GUI decision, the legacy plan was implemented only through Phase A /
+Task 3. The RED tests for Task 4 were not retained. The worktree was restored
+to committed state before this handoff was written.
 
-对迁移的价值判断：
+Migration value of those commits:
 
-| 提交 | 处理 |
+| Commit | Treatment |
 | --- | --- |
-| `8a41fb4`、`9599ec1` | 作为用户问题与交互需求来源；技术路线已被本 GUI 设计取代 |
-| `5a20955` | TUI 布局/渲染删除；稳定对象 ID 和命中语义可参考 |
-| `f959c00` | 保留模型层选择、撤销/重做、decision transaction 思路 |
-| `4c58cf2` | 保留通道 ID、名称、冻结/解冻 Binding 修复；删除 ratatui 渲染 |
+| `8a41fb4`, `9599ec1` | Keep as a source of user problems and interaction requirements; their technical direction is superseded by this GUI design |
+| `5a20955` | Delete TUI layout/rendering; stable object IDs and hit semantics remain useful references |
+| `f959c00` | Preserve model-level selection, undo/redo, and decision-transaction ideas |
+| `4c58cf2` | Preserve channel IDs, names, and binding freeze/thaw fixes; delete ratatui rendering |
 
-最近一次已完成的远端门禁是：
+The most recent completed remote gate was:
 
 ```sh
 cargo fmt
@@ -75,228 +83,259 @@ cargo test --locked --test workbench_e2e
 git diff --check
 ```
 
-这些测试验证的是旧 TUI 分支，不代表 GUI 已通过。
+Those tests validate the legacy TUI branch. They are not evidence that the GUI
+migration passes.
 
-## 3. 构建与测试环境约束
+## 3. Build and test constraints
 
-- 本机是性能有限的 ARM64 树莓派，不在本机执行 Rust 构建。
-- Rust 编译、单元测试、Clippy 和交叉构建放在 tinker 或 GitHub Actions。
-- 树莓派只下载校验过 SHA256 的预编译 ARM64 Release 包。
-- 最终 agentic 测试必须在树莓派真实 GUI 会话中运行该预编译包。
-- tinker 可以继续作为开发构建机，但不能作为产品运行时模拟服务器。
-- 不要用本机软件 Xvfb 的帧率推断真实 GPU 性能。
+- The local development machine is a low-performance ARM64 Raspberry Pi. Do
+  not run Rust builds on it.
+- Run Rust compilation, unit tests, Clippy, and cross-builds on tinker or in
+  GitHub Actions.
+- The Raspberry Pi should only download prebuilt ARM64 release artifacts after
+  verifying their SHA-256 checksums.
+- Final agentic acceptance must run that prebuilt artifact in the Raspberry
+  Pi's real GUI session.
+- tinker may remain the development build machine, but must not be a product
+  runtime simulation server.
+- Do not infer real GPU performance from a software-Xvfb session.
 
-## 4. Cellarium 当前是什么
+## 4. What Cellarium is
 
-Cellarium 是一个可编辑的 cellular automata / continuous cellular
-automata 实验室。它不只是 Conway 网格，还允许用户定义：
+Cellarium is an editable cellular-automata and continuous-cellular-automata
+laboratory. It is not limited to a Conway square grid. Users can define:
 
-- 周期晶胞和密铺；
-- 一个晶胞内多个具有独立状态语义的 basis polygon；
-- 每个 basis 上的多个标量 Channel；
-- 每个 `(basis, output channel)` 独立 RuleSet；
-- RuleSet 中一个或多个 Kernel；
-- Kernel 的 source channel、support、权重、采样度量和周期 offset；
-- Rust 风格的 Growth 表达式；
-- Rate 或 Value 更新模式；
-- 初始世界、颜色、可见性、冻结状态和实验 dt。
+- periodic unit cells and tilings;
+- multiple basis polygons with independent state semantics inside one unit cell;
+- multiple scalar channels on each basis polygon;
+- an independent RuleSet for each `(basis, output channel)`;
+- one or more kernels in each RuleSet;
+- each kernel's source channel, support, weights, sampling metric, and periodic
+  offset;
+- Rust-like Growth expressions;
+- Rate or Value update mode;
+- the initial world, colors, visibility, frozen state, and experiment `dt`.
 
-### 4.1 核心数量关系
+### 4.1 Cardinality rules
 
-设：
+Let:
 
-- `B`：中心晶胞中的 basis polygon 数；
-- `C_active`：非冻结通道数；
-- `K(b,c)`：Binding `(basis=b, output=c)` 的核数。
+- `B` be the number of basis polygons in the central unit cell;
+- `C_active` be the number of non-frozen channels;
+- `K(b,c)` be the kernel count for binding `(basis=b, output=c)`.
 
-则：
+Then:
 
-- Growth Binding 数量是 `B × C_active`；
-- 每个 Binding 有独立 Growth；
-- 每个 Binding 默认一个核；
-- Growth 普通输入的数量恰好等于该 Binding 的核数；
-- 完整签名是 `self + K(b,c)`；
-- Channel 数和 Kernel 数没有相等关系；
-- Kernel 可以从不同 source channel 读取；
-- 多个 Binding 可共享 RuleSet，编辑时 copy-on-write 分离。
+- the Growth-binding count is `B × C_active`;
+- every binding has an independent Growth program;
+- every binding has one kernel by default;
+- the number of ordinary Growth inputs exactly equals that binding's kernel
+  count;
+- the full signature contains `self + K(b,c)`;
+- channel count and kernel count are not required to match;
+- a kernel may read from any source channel;
+- multiple bindings may share a RuleSet and detach through copy-on-write when
+  edited.
 
-### 4.2 Growth 语义
+### 4.2 Growth semantics
 
 ```text
 fn growth(self: Scalar, k1: Scalar, ..., kN: Scalar) -> Rate | Value
 ```
 
-- `self` 是当前目标 basis/channel 的值；
-- 每个 `kN` 是对应核的原始卷积结果；
-- Rate：`next = clamp(self + dt * result, 0, 1)`；
-- Value：`next = clamp(result, 0, 1)`；
-- 程序最后一个无分号表达式是结果；
-- 支持 `let`、`if/else`、算术、比较、逻辑和内置数学函数；
-- 当前语言没有 `return`、循环、可变变量或副作用。
+- `self` is the current value of the target basis/channel.
+- Each `kN` is the raw convolution result of its corresponding kernel.
+- Rate mode: `next = clamp(self + dt * result, 0, 1)`.
+- Value mode: `next = clamp(result, 0, 1)`.
+- The final expression without a trailing semicolon is the result.
+- The language supports `let`, `if/else`, arithmetic, comparisons, logical
+  operators, and built-in mathematical functions.
+- The current language has no `return`, loops, mutable variables, or side
+  effects.
 
-### 4.3 保存格式
+### 4.3 Persistence format
 
-默认数据目录：
+Default data directory:
 
-- 绝对 `XDG_DATA_HOME`：`$XDG_DATA_HOME/cellarium/`；
-- 否则：`$HOME/.local/share/cellarium/`。
+- when `XDG_DATA_HOME` is absolute: `$XDG_DATA_HOME/cellarium/`;
+- otherwise: `$HOME/.local/share/cellarium/`.
 
-文件：
+Files:
 
-- `workbench.ron`：active、draft 和 revision；
-- `experiment.ron`：可独立打开运行的实验。
+- `workbench.ron`: active document, draft document, and revision;
+- `experiment.ron`: a self-contained experiment that can be opened and run.
 
-RON 数据模型应保持兼容。GUI 临时状态不写进实验文件；需要持久化的窗口和
-编辑器偏好放独立 `settings.ron`。
+Keep the RON data model compatible. Do not put transient GUI state in experiment
+files. Persist window and editor preferences separately in `settings.ron`.
 
-## 5. 当前代码地图
+## 5. Current code map
 
-### 5.1 必须保留
+### 5.1 Preserve
 
-| 路径 | 责任 |
+| Path | Responsibility |
 | --- | --- |
-| `src/sim/experiment_model.rs` | ExperimentSpec、Channel、Kernel、Growth、更新模式 |
-| `src/sim/ruleset.rs` | RuleSet、Binding、共享/default/local override |
-| `src/sim/tiling/**` | 多边形、周期密铺、验证、coverage、solver、约束 |
-| `src/sim/growth/**` | lexer、parser、AST、typecheck、eval、plot 采样 |
-| `src/sim/basis_runtime.rs` | 多 basis 编译和 CPU 运行语义 |
-| `src/sim/runtime.rs` | Experiment 编译与 CPU 参考实现 |
-| `src/sim/cuda.rs`、`cuda_codegen.rs` | NVIDIA CUDA/NVRTC 后端 |
-| `src/sim/service.rs` | Apply 原子性和 active/draft 切换的可复用逻辑 |
-| `src/workbench/history.rs`、`command.rs` | 草稿事务与撤销/重做 |
-| `src/workbench/state.rs` | 现有编辑动作与选择语义，迁移为 GUI Document 控制器 |
-| `src/render/camera.rs`、`channels.rs`、`scene_transform.rs` | 可复用数学、颜色和坐标变换 |
+| `src/sim/experiment_model.rs` | ExperimentSpec, Channel, Kernel, Growth, and update mode |
+| `src/sim/ruleset.rs` | RuleSet, Binding, shared/default/local-override semantics |
+| `src/sim/tiling/**` | Polygons, periodic tilings, validation, coverage, solver, and constraints |
+| `src/sim/growth/**` | Lexer, parser, AST, type checker, evaluator, and plot sampling |
+| `src/sim/basis_runtime.rs` | Multi-basis compilation and CPU runtime semantics |
+| `src/sim/runtime.rs` | Experiment compilation and CPU reference implementation |
+| `src/sim/cuda.rs`, `cuda_codegen.rs` | NVIDIA CUDA/NVRTC backend |
+| `src/sim/service.rs` | Reusable atomic Apply and active/draft switching logic |
+| `src/workbench/history.rs`, `command.rs` | Draft transactions and undo/redo |
+| `src/workbench/state.rs` | Existing edit actions and selection semantics; migrate into the GUI Document controller |
+| `src/render/camera.rs`, `channels.rs`, `scene_transform.rs` | Reusable math, colors, and coordinate transforms |
 
-### 5.2 重构后保留语义，不保留 UI 实现
+### 5.2 Preserve semantics after refactoring, not UI implementation
 
-| 当前路径 | GUI 目标 |
+| Current path | GUI destination |
 | --- | --- |
-| `src/workbench/tiling_editor.rs` | 提取纯 scene/hit/command，egui Canvas 负责绘制 |
-| `src/workbench/kernel_editor.rs` | 保留映射和编辑命令，删除 RGBA/TUI 假窗口依赖 |
-| `src/workbench/growth_editor.rs` | 保留 source buffer、诊断和 plot model，使用 egui TextEdit |
-| `src/workbench/channel_editor.rs` | 保留 ChannelCard view model 和生命周期命令 |
-| `src/render/basis_scene.rs` | 拆为纯几何 scene + egui/wgpu renderer |
-| `src/app.rs` | 拆为 GUI shell、Document、SimulationWorker，不保留巨型终端事件循环 |
+| `src/workbench/tiling_editor.rs` | Extract pure scene/hit/command logic; let an egui Canvas render it |
+| `src/workbench/kernel_editor.rs` | Preserve mapping and edit commands; remove RGBA/TUI fake-window assumptions |
+| `src/workbench/growth_editor.rs` | Preserve source buffer, diagnostics, and plot model; use an egui text editor |
+| `src/workbench/channel_editor.rs` | Preserve ChannelCard view models and lifecycle commands |
+| `src/render/basis_scene.rs` | Split into pure geometry scene plus egui/wgpu rendering |
+| `src/app.rs` | Split into GUI shell, Document, and SimulationWorker; do not preserve the monolithic terminal event loop |
 
-### 5.3 最终删除
+### 5.3 Delete after feature parity
 
 - `src/tui/**`
 - `src/render/display/**`
 - `src/remote.rs`
-- 终端专用 `src/input.rs`
-- `ratatui`、`ratatui-image`、`crossterm`
-- Kitty/Sixel/iTerm2/half-block/shared-memory graphics
-- SSH connector、远端协议、server loop
-- PTY 和 Kitty protocol 测试
-- `scripts/e2e-tinker.sh` 中的产品 C/S 旅程
-- README、发布文档中的 `server` / `connect` 说明
+- terminal-specific `src/input.rs`
+- `ratatui`, `ratatui-image`, and `crossterm`
+- Kitty, Sixel, iTerm2, half-block, and shared-memory graphics
+- the SSH connector, remote protocol, and server loop
+- PTY and Kitty-protocol tests
+- product C/S journeys in `scripts/e2e-tinker.sh`
+- `server` and `connect` instructions in README and release documentation
 
-删除必须发生在 GUI 功能和本地后端均已等价后，不能先删再长时间破坏主分支。
+Do not delete these paths before the GUI and local backends reach feature
+parity. Keep the branch runnable throughout the migration.
 
-## 6. 目标程序结构
+## 6. Target program structure
 
 ```text
 cellarium
-├── gui                 egui 应用、布局、控件、Canvas
-├── document            active/draft、选择、历史、保存
-├── simulation          本地 worker、命令、快照、性能指标
+├── gui                 egui application, layout, controls, and canvases
+├── document            active/draft state, selection, history, and persistence
+├── simulation          local worker, commands, snapshots, and performance metrics
 ├── sim
-│   ├── model           现有 Experiment/RuleSet/Tiling/Growth
-│   ├── compile         后端无关 ComputePlan
+│   ├── model           existing Experiment/RuleSet/Tiling/Growth model
+│   ├── compile         backend-independent ComputePlan
 │   └── backends
 │       ├── cuda        NVIDIA
-│       ├── wgpu        Intel/Apple/AMD/树莓派 GPU
-│       └── cpu         参考与最终 fallback
+│       ├── wgpu        Intel/Apple/AMD/Raspberry Pi GPUs
+│       └── cpu         reference implementation and final fallback
 └── persistence         RON workspace/experiment/settings
 ```
 
-GUI 线程永远不执行模拟 step、CUDA 编译、WGSL pipeline 构建或大规模
-readback。SimulationWorker 独占后端，通过命令队列接收 Apply、Run、Pause、
-Step、Reset、WorldEdit，并通过 latest-only snapshot 暴露最新可显示状态。
+The GUI thread must never execute simulation steps, CUDA compilation, WGSL
+pipeline construction, or large readbacks. A SimulationWorker owns the selected
+backend, receives Apply, Run, Pause, Step, Reset, and WorldEdit commands, and
+publishes its newest displayable state through a latest-only snapshot.
 
-## 7. 目标 GUI 信息架构
+## 7. Target GUI information architecture
 
-主窗口：
+Main window:
 
-- 顶部：New、Open、Save、Undo、Redo、Apply & Run、Pause/Run、Step、
-  Reset、Backend；
-- 左侧：Simulation、Tiling、Channels、Kernels、Growth、Experiment；
-- 中间：当前 section 的主要画布或编辑器；
-- 右侧：简洁的对象属性与错误，不堆快捷键墙；
-- 底部：backend、tick、sim Hz、frame Hz、draft 状态和持久错误。
+- top bar: New, Open, Save, Undo, Redo, Apply & Run, Pause/Run, Step, Reset,
+  and Backend;
+- left navigation: Simulation, Tiling, Channels, Kernels, Growth, Experiment;
+- center: the primary canvas or editor for the active section;
+- right side: concise object properties and errors, not a wall of shortcuts;
+- bottom status: backend, tick, simulation Hz, frame Hz, draft state, and
+  persistent errors.
 
-所有 primary action 必须有可见鼠标入口和 tooltip。快捷键继续提供，但 Help
-中显示，不占据 Inspector 主页面。
+Every primary action must have a visible pointer target and a tooltip.
+Shortcuts remain available but belong in Help rather than the Inspector's main
+content.
 
 ### 7.1 Tiling
 
-- 默认空白；
-- 明确的 Square、Triangle、Hexagon、Octagon+Square 预设卡片；
-- 自由鼠标画多边形；
-- 点击首点、双击或 Finish 按钮闭合；
-- 非法顶点在放置时拒绝；
-- 中心晶胞强调，周围真实邻接副本虚化；
-- Solve seams 可见按钮；
-- 解算后受约束顶点联动编辑；
-- 严格 edge-to-edge，不支持 T-junction。
+- Start blank by default.
+- Offer visible preset cards for Square, Triangle, Hexagon, and Octagon+Square.
+- Allow freehand polygon construction with the pointer.
+- Close a polygon by clicking the first point, double-clicking, or pressing a
+  visible Finish button.
+- Reject illegal vertices at placement time.
+- Emphasize the central unit cell and render its true adjacent copies with
+  reduced opacity.
+- Provide a visible Solve seams button.
+- After solving, edit constrained vertices as a linked system.
+- Enforce strict edge-to-edge tiling; do not support T-junctions.
 
 ### 7.2 Channels
 
-- 顶部显示所有通道卡片和 Add；
-- 卡片直接选择、删除、改颜色、显隐、冻结；
-- Composite、Solo、Grid 可点击；
-- Live 和 Draft initial 明确分离，不静默替换；
-- 显示真实 polygon geometry，不把六边形斜切成矩形纹理；
-- Inspector 只显示 Channels 范围的数量。
+- Show all channel cards and an Add button at the top.
+- Let each card directly select, delete, recolor, show/hide, and freeze its
+  channel.
+- Make Composite, Solo, and Grid view modes clickable.
+- Clearly separate Live state from Draft initial state; never substitute one
+  silently.
+- Render true polygon geometry rather than shearing a hexagonal lattice into a
+  rectangular texture.
+- The Inspector must show counts relevant to Channels only.
 
 ### 7.3 Kernels
 
-- 显示当前 Binding 的全部 Kernel 卡片和缩略图；
-- Add 后新卡片立即可见并选中；
-- 可以任意顺序点击切换；
-- 删除当前选中核，不得误删“最后一个”；
-- 引用中的核删除弹出可理解的决策对话框；
-- Weights/Support、source/output、Affine/World、sigma、stencil/anchor 都是
-  可见控件；
-- cell 支持点击、拖动、滚轮细调、Shift/Ctrl 步长和双击精确输入；
-- active、negative、zero、inactive、anchor、selected 有稳定图例。
+- Show every kernel for the current binding as a card with a thumbnail.
+- After Add, make the new card immediately visible and selected.
+- Allow direct switching in any order.
+- Delete the selected kernel, never an unrelated "last kernel."
+- When a referenced kernel is removed, present an understandable decision
+  dialog.
+- Expose Weights/Support, source/output channel, Affine/World metric, sigma,
+  stencil size, and anchor as visible controls.
+- Support cell click, drag, wheel fine adjustment, Shift/Ctrl step modifiers,
+  and double-click exact numeric entry.
+- Use a stable legend for active, negative, zero, inactive, anchor, and selected
+  cells.
 
 ### 7.4 Growth
 
-- 中间上方完整显示函数签名；
-- basis、output channel、self 和每个 kernel 是可点击 chip；
-- source editor 有光标、选择、行号、语法色和 inline diagnostics；
-- Plot 与源码同时处于中心区域；
-- 0/1 个引用 kernel 默认曲线，2 个以上引用 kernel 默认 heatmap；
-- 图的维度由实际引用和用户轴选择决定，不由总核数强行决定；
-- 非轴输入有 pinned 数值编辑；
-- stale、无有限样本、离散相等点都有明确视觉反馈；
-- 语法手册在右侧 Help tab 滚动显示。
+- Show the complete function signature at the top of the center panel.
+- Make basis, output channel, `self`, and each kernel clickable chips.
+- Provide a source editor with a caret, selection, line numbers, syntax
+  highlighting, and inline diagnostics.
+- Keep the source and plot together in the center panel.
+- Default to a curve for zero or one referenced kernel and a heatmap for two or
+  more referenced kernels.
+- Derive plot dimensions from actual references and user-selected axes, not the
+  global kernel count.
+- Provide pinned-value controls for non-axis inputs.
+- Clearly visualize stale output, no finite samples, and discrete equality
+  points.
+- Put the syntax reference in a scrollable Help tab on the right.
 
 ### 7.5 Experiment
 
-- 汇总 basis、active/frozen channels、Bindings、当前/全部 kernels、
-  Growth、dt、backend 和诊断；
-- Apply & Run 是大而明确的按钮；
-- Apply 是本地原子事务：构建新 backend 成功后才替换 active；
-- Apply 失败保留旧 active simulation。
+- Summarize basis polygons, active/frozen channels, bindings, current/all
+  kernels, Growth programs, `dt`, backend, and diagnostics.
+- Make Apply & Run a large, explicit button.
+- Apply is a local atomic transaction: replace the active simulation only after
+  the new backend is built successfully.
+- If Apply fails, preserve the previous active simulation.
 
-## 8. 后端选择和失败语义
+## 8. Backend selection and failure semantics
 
-Auto 探测顺序：
+Auto-detection order:
 
-1. CUDA feature 已编译，NVIDIA driver、device 和 NVRTC 均可用；
-2. wgpu 找到支持所需 compute/storage limits 的非 CPU adapter：
-   - discrete adapter 优先；
-   - integrated adapter 次之；
-   - Intel 集显是强制发布验证目标；
-   - Apple/AMD/树莓派集显允许使用相同 portable 路径；
-3. CPU。
+1. the CUDA feature is compiled and the NVIDIA driver, device, and NVRTC are
+   available;
+2. wgpu finds a non-CPU adapter that satisfies the required compute and storage
+   limits:
+   - prefer a discrete adapter;
+   - then prefer an integrated adapter;
+   - validate Intel integrated graphics for every release;
+   - permit Apple, AMD, and Raspberry Pi integrated GPUs on the same portable
+     path;
+3. CPU.
 
-不把 UI renderer 等同于 compute backend。GUI 即使使用 wgpu 显示，也可能
-因计算 limits 不足而选择 CPU。
+Do not equate the UI renderer with the compute backend. The GUI may render with
+wgpu while compute falls back to CPU because the adapter lacks required limits.
 
-每次探测产生结构化报告：
+Every probe produces a structured report:
 
 ```rust
 pub struct BackendProbe {
@@ -307,62 +346,71 @@ pub struct BackendProbe {
 }
 ```
 
-Auto fallback 必须在 UI 中显示一次持久通知，例如
-`CUDA unavailable (NVRTC missing); using Intel Iris Xe via wgpu`。
+When Auto falls back, show one persistent notification, for example:
+`CUDA unavailable (NVRTC missing); using Intel Iris Xe via wgpu`.
 
-运行期 backend 错误：
+On a runtime backend error:
 
-- 暂停 worker；
-- 保存最后一个已确认 snapshot；
-- 尝试下一级 backend 从该 snapshot 重建；
-- 成功后继续用户先前的运行/暂停状态；
-- 失败则保持暂停并显示完整错误；
-- 不跳过 tick，不发布半写状态。
+- pause the worker;
+- retain the last confirmed snapshot;
+- try to rebuild on the next backend from that snapshot;
+- on success, restore the user's previous running or paused state;
+- on failure, remain paused and show the complete error;
+- never skip a tick or publish a partially written state.
 
-## 9. 交接执行顺序
+## 9. Handoff execution order
 
-下一位 agent 应先阅读：
+The next agent must read:
 
-1. 本文件；
-2. `docs/superpowers/specs/2026-08-27-local-egui-gui-migration-design.md`；
-3. `docs/superpowers/plans/2026-08-27-local-egui-gui-migration.md`；
-4. `docs/feature-inventory.md`（只用于产品语义；终端/C/S 部分已过时）。
+1. this file;
+2. `docs/superpowers/specs/2026-08-27-local-egui-gui-migration-design.md`;
+3. `docs/superpowers/plans/2026-08-27-local-egui-gui-migration.md`;
+4. `docs/feature-inventory.md` for product semantics only; its terminal and
+   client/server sections are historical.
 
-随后：
+Then:
 
-1. 从当前 worktree 创建/继续专用 GUI 分支，不在 `origin/main` 直接开发；
-2. 确认 `git status --short` 为空；
-3. 不在树莓派运行 Cargo；
-4. 严格按计划 TDD；
-5. 每个阶段保持一个可启动、可回退 CPU 的本地 GUI；
-6. GUI 等价后再删除 TUI/remote；
-7. 最后对候选 Release 做完整 agentic GUI 旅程。
+1. create or continue a dedicated GUI branch from this worktree; do not develop
+   directly on `origin/main`;
+2. confirm that `git status --short` is empty;
+3. do not run Cargo on the Raspberry Pi;
+4. follow the implementation plan with TDD;
+5. keep a runnable local GUI with CPU fallback at every phase;
+6. remove TUI and remote code only after GUI feature parity;
+7. run the complete agentic GUI journey against the release candidate.
 
-## 10. 旧文档的地位
+## 10. Status of legacy documents
 
-以下内容作为历史设计保留，但不能指导新实现：
+Keep the following as historical design records, but do not use them to direct
+the new implementation:
 
-- `docs/remote-viewer.md`
-- C1 remote viewer 设计和计划
-- hybrid remote E2E 设计和计划
-- 旧 visual workbench 中的 Kitty/half-block 部分
-- `docs/feature-inventory.md` 第 12、13 节终端/远程能力
+- `docs/remote-viewer.md`;
+- C1 remote-viewer design and plans;
+- hybrid remote E2E design and plans;
+- Kitty and half-block portions of the legacy visual-Workbench documents;
+- terminal and remote capabilities in Sections 12 and 13 of
+  `docs/feature-inventory.md`.
 
-如果旧文档与本交接、GUI spec 冲突，以本交接和 GUI spec 为准。
+If a legacy document conflicts with this handoff or the GUI specification, this
+handoff and the GUI specification take precedence.
 
 ## 11. Definition of Done
 
-迁移只有同时满足以下条件才完成：
+The migration is complete only when all of the following are true:
 
-- 产品二进制没有 `server` 和 `connect`；
-- Cargo 不再依赖终端 UI/graphics crates；
-- 默认启动原生 GUI；
-- CUDA、portable wgpu GPU、CPU 三条后端路径都有一致性测试；
-- Intel 集显和至少一个非 Intel 集成 GPU 实机验证；
-- CPU-only 机器可启动、编辑、Apply & Run；
-- 所有 feature inventory 的非终端功能在 GUI 有可见鼠标入口；
-- 多 Channel、多 Kernel、多 basis、多 Growth 完整旅程通过；
-- 保存、关闭、重新打开后实验恢复；
-- 候选 Release 在树莓派通过真实键鼠与视觉 agentic 测试；
-- Windows、macOS、Linux x86_64/ARM64 发布物通过启动 smoke；
-- 稳定版 Release 发布，不以 prerelease 代替最终交付。
+- the product binary has no `server` or `connect` command;
+- Cargo no longer depends on terminal UI or terminal graphics crates;
+- the native GUI is the default entry point;
+- CUDA, portable wgpu GPU, and CPU backends have consistency tests;
+- real hardware validation covers Intel integrated graphics and at least one
+  non-Intel integrated GPU;
+- a CPU-only machine can start, edit, and Apply & Run an experiment;
+- every non-terminal feature in the feature inventory has a visible pointer
+  entry point in the GUI;
+- full multi-channel, multi-kernel, multi-basis, and multi-Growth journeys pass;
+- an experiment survives save, close, and reopen;
+- the release candidate passes real pointer, keyboard, and visual agentic
+  testing on the Raspberry Pi;
+- Windows, macOS, and Linux x86_64/ARM64 artifacts pass startup smoke tests;
+- a stable release is published instead of substituting a prerelease for final
+  delivery.
