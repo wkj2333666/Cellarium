@@ -1650,109 +1650,17 @@ impl WorkbenchState {
 
     pub fn toggle_selected_frozen(&mut self) -> Result<(), HistoryError> {
         let target = self.selected_channel;
-        let mut next = self.draft.clone();
-        let Some(channel) = next
+        let Some(frozen) = self
+            .draft
             .channels
-            .iter_mut()
+            .iter()
             .find(|channel| channel.id == target)
+            .map(|channel| !channel.frozen)
         else {
             return Ok(());
         };
-        channel.frozen = !channel.frozen;
-        let frozen = channel.frozen;
-        if !next.rules.is_empty() {
-            if frozen {
-                next.rules
-                    .bindings
-                    .retain(|binding| binding.output != target);
-                next.rules.defaults.remove(&target);
-            } else {
-                let rule_set = if let Some(rule_set) = next.rules.defaults.get(&target).copied() {
-                    rule_set
-                } else if let Some(rule_set) = next
-                    .rules
-                    .sets
-                    .iter()
-                    .find(|rule| rule.growth.target == target)
-                    .map(|rule| rule.id)
-                {
-                    next.rules.defaults.insert(target, rule_set);
-                    rule_set
-                } else {
-                    let id = RuleSetId(
-                        next.rules
-                            .sets
-                            .iter()
-                            .map(|rule| rule.id.0)
-                            .max()
-                            .unwrap_or(0)
-                            .checked_add(1)
-                            .ok_or_else(|| HistoryError::Edit("rule-set id exhausted".into()))?,
-                    );
-                    let mut rule = RuleSet::identity(id, target);
-                    if next.tiling.is_some() {
-                        let planes = next
-                            .basis_ids()
-                            .into_iter()
-                            .map(|basis| {
-                                (
-                                    basis,
-                                    crate::sim::basis_kernel::BasisWeightPlane {
-                                        values: vec![1.0],
-                                        mask: None,
-                                    },
-                                )
-                            })
-                            .collect();
-                        rule.kernels[0].spatial =
-                            crate::sim::ruleset::KernelSpatialDefinition::Periodic(
-                                crate::sim::basis_kernel::PeriodicKernelDefinition {
-                                    width: 1,
-                                    height: 1,
-                                    anchor_x: 0,
-                                    anchor_y: 0,
-                                    planes,
-                                },
-                            );
-                    }
-                    next.rules.defaults.insert(target, id);
-                    next.rules.sets.push(rule);
-                    id
-                };
-                for basis in next.basis_ids() {
-                    if next.rules.binding(basis, target).is_none() {
-                        next.rules.bindings.push(crate::sim::ruleset::RuleBinding {
-                            basis,
-                            output: target,
-                            rule_set,
-                        });
-                    }
-                }
-            }
-            next.rules
-                .validate(&next.basis_ids(), &next.channels)
-                .map_err(|errors| {
-                    HistoryError::Edit(
-                        errors
-                            .into_iter()
-                            .map(|error| error.to_string())
-                            .collect::<Vec<_>>()
-                            .join("; "),
-                    )
-                })?;
-        } else if frozen {
-            next.kernels.retain(|kernel| kernel.target != target);
-            next.growth.retain(|growth| growth.target != target);
-        } else if !next.growth.iter().any(|growth| growth.target == target) {
-            next.growth
-                .push(crate::sim::experiment_model::GrowthSource {
-                    target,
-                    kernel_inputs: Vec::new(),
-                    parameters: Default::default(),
-                    source: "self".into(),
-                    mode: crate::sim::experiment_model::UpdateMode::DirectUpdate,
-                });
-        }
+        let next = crate::document::channels::set_channel_frozen(&self.draft, target, frozen)
+            .map_err(HistoryError::Edit)?;
         self.replace_draft(next)
     }
 

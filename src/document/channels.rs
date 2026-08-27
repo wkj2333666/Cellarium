@@ -172,6 +172,117 @@ pub fn remove_channel(
     Ok((next, nearest))
 }
 
+/// Freeze or unfreeze a channel, keeping the rule library consistent.
+///
+/// A frozen channel must not keep bindings or a default rule set, and thawing
+/// one has to give it a rule set again, so this cannot be a plain field write.
+pub fn set_channel_frozen(
+    draft: &ExperimentSpec,
+    target: ChannelId,
+    frozen: bool,
+) -> Result<ExperimentSpec, String> {
+    let mut next = draft.clone();
+    let Some(channel) = next
+        .channels
+        .iter_mut()
+        .find(|channel| channel.id == target)
+    else {
+        return Err("unknown channel".into());
+    };
+    channel.frozen = frozen;
+    if !next.rules.is_empty() {
+        if frozen {
+            next.rules
+                .bindings
+                .retain(|binding| binding.output != target);
+            next.rules.defaults.remove(&target);
+        } else {
+            let rule_set = if let Some(rule_set) = next.rules.defaults.get(&target).copied() {
+                rule_set
+            } else if let Some(rule_set) = next
+                .rules
+                .sets
+                .iter()
+                .find(|rule| rule.growth.target == target)
+                .map(|rule| rule.id)
+            {
+                next.rules.defaults.insert(target, rule_set);
+                rule_set
+            } else {
+                let id = RuleSetId(
+                    next.rules
+                        .sets
+                        .iter()
+                        .map(|rule| rule.id.0)
+                        .max()
+                        .unwrap_or(0)
+                        .checked_add(1)
+                        .ok_or("rule-set id exhausted")?,
+                );
+                let mut rule = RuleSet::identity(id, target);
+                if next.tiling.is_some() {
+                    let planes = next
+                        .basis_ids()
+                        .into_iter()
+                        .map(|basis| {
+                            (
+                                basis,
+                                crate::sim::basis_kernel::BasisWeightPlane {
+                                    values: vec![1.0],
+                                    mask: None,
+                                },
+                            )
+                        })
+                        .collect();
+                    rule.kernels[0].spatial = KernelSpatialDefinition::Periodic(
+                        crate::sim::basis_kernel::PeriodicKernelDefinition {
+                            width: 1,
+                            height: 1,
+                            anchor_x: 0,
+                            anchor_y: 0,
+                            planes,
+                        },
+                    );
+                }
+                next.rules.defaults.insert(target, id);
+                next.rules.sets.push(rule);
+                id
+            };
+            for basis in next.basis_ids() {
+                if next.rules.binding(basis, target).is_none() {
+                    next.rules.bindings.push(RuleBinding {
+                        basis,
+                        output: target,
+                        rule_set,
+                    });
+                }
+            }
+        }
+        next.rules
+            .validate(&next.basis_ids(), &next.channels)
+            .map_err(|errors| {
+                errors
+                    .into_iter()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            })?;
+    } else if frozen {
+        next.kernels.retain(|kernel| kernel.target != target);
+        next.growth.retain(|growth| growth.target != target);
+    } else if !next.growth.iter().any(|growth| growth.target == target) {
+        next.growth
+            .push(crate::sim::experiment_model::GrowthSource {
+                target,
+                kernel_inputs: Vec::new(),
+                parameters: Default::default(),
+                source: "self".into(),
+                mode: UpdateMode::DirectUpdate,
+            });
+    }
+    Ok(next)
+}
+
 /// Set the update mode of the growth program behind one binding, detaching a
 /// shared rule set first so unrelated bindings keep their program.
 pub fn set_growth_mode(

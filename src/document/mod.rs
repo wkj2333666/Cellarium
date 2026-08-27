@@ -230,8 +230,12 @@ impl DocumentController {
                 Ok(self.record(vec![Affected::Channels]))
             }
             DocumentCommand::SetSelectedChannelFrozen(frozen) => {
-                let channel = self.selection.channel;
-                self.draft_command(DraftCommand::SetChannelFrozen { channel, frozen })?;
+                // Freezing also has to remove the channel's bindings, so this
+                // cannot be a plain field write on the draft.
+                let next =
+                    channels::set_channel_frozen(&self.draft, self.selection.channel, frozen)
+                        .map_err(DocumentError::Rejected)?;
+                self.transact(next, |_| {})?;
                 Ok(self.record(vec![Affected::Channels]))
             }
             DocumentCommand::SetSelectedGrowthMode(mode) => {
