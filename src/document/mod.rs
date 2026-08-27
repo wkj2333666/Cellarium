@@ -5,8 +5,11 @@
 //! Workbench and the egui GUI both drive it through typed [`DocumentCommand`]
 //! transactions.
 
+pub mod channel_cards;
 pub mod channels;
+pub mod command;
 pub mod growth;
+pub mod history;
 pub mod kernels;
 pub mod persistence;
 pub mod selection;
@@ -17,7 +20,8 @@ use crate::sim::experiment_model::{
 };
 use crate::sim::ruleset::{BindingKey, RuleSetId};
 use crate::sim::tiling::{PeriodicTilingDraft, TilingPreset, Vec2 as TilingVec2};
-use crate::workbench::{DraftCommand, History, HistoryError};
+pub use command::DraftCommand;
+pub use history::{History, HistoryError};
 
 pub use selection::{EditorSelection, PlotAxes, PlotSymbol};
 

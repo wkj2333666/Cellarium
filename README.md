@@ -1,82 +1,89 @@
 # Cellarium
 
-> **Architecture migration notice (2026-08-27):** the next major version is
-> replacing the terminal/SSH client-server interface with a local native
-> egui/wgpu GUI and local CUDA → portable GPU → CPU compute fallback. The
-> current v0.2.2 commands below describe the released legacy product. See
-> [GUI migration handoff](docs/gui-migration-handoff.md) for the approved
-> target and implementation entry points.
+Cellarium is a local application for designing and running lattice experiments:
+Conway-style automata, Lenia and Orbium, periodic polygon tilings, editable
+kernels and growth programs you write yourself.
 
-Cellarium is a GPU-accelerated cellular automata laboratory with an interactive
-terminal UI. It supports Conway-style automata, Lenia/Orbium, editable kernels,
-custom rule programs, and CPU/CUDA simulation backends.
-
-Cellarium remains one executable with three launch modes:
+It opens a native window, runs the simulation in the same process, and uses the
+fastest compute backend the machine actually has. Nothing is sent anywhere.
 
 ```sh
-cellarium                  # simulate and render in the current terminal
-cellarium server           # headless C1 simulation server
-cellarium connect tinker   # local renderer connected to a remote server
+cellarium                          # open the window
+cellarium --experiment lenia.ron   # open the window on an experiment
+cellarium --backend cpu            # run on the CPU, whatever the machine has
+cellarium --safe-mode              # start without probing a GPU at all
+cellarium --version
 ```
 
-Graphics-capable terminals such as Kitty use high-precision graphics rendering
-by default. For SSH sessions, `connect` renders locally so keyboard and mouse
-input are not blocked by image frames crossing SSH. Native local Unix Kitty
-viewers use shared-memory frame transfer instead of embedding full RGB frames
-in the terminal byte stream, with inline Kitty graphics as a compatibility
-fallback. See
-[Remote viewer](docs/remote-viewer.md).
+## Compute backends
 
-## Visual Workbench
+Cellarium picks a backend at startup and falls back on its own when one is
+unavailable:
 
-Press `W` from the simulation to open the Workbench. Its left outline selects
-World, Tiling, Channels, Kernels, Growth, or Experiment; the center is always
-the primary graphics editor, and the right inspector reports exact metadata and
-diagnostics. Click any region or use `Tab` to move focus, and press `?` for
-gestures relevant to the visible editor.
+1. **CUDA**, on an NVIDIA GPU with a working driver.
+2. **wgpu**, on any GPU with Vulkan, Metal, DirectX 12 or OpenGL. This covers
+   Apple Silicon, Intel and AMD integrated graphics, and Windows.
+3. **CPU**, always available.
 
-- Tiling starts with one polygonal basis. Presets include square, triangles,
-  regular hexagons, and octagon-square. Draw a custom polygon with `D`, click
-  vertices, and finish with Enter/double-click. The strong center polygon is
-  editable; translucent copies are its actual seam-derived neighbors.
-- Channels start at one and must be added explicitly. One channel is rendered
-  for maximum contrast on black; three channels default to RGB, and colors and
-  visibility remain editable.
-- Every `(basis polygon, output channel)` selects a complete RuleSet. It starts
-  with one kernel. Clicking a translated polygon selects its semantic basis.
-  Editing an inherited RuleSet detaches it by copy-on-write; reset-to-default
-  relinks it.
-- The kernel canvas draws real source polygons at their lattice offsets. Click
-  or drag to select/paint a weight; wheel changes by `0.05`,
-  `Shift+wheel` by `0.005`, and `Ctrl+wheel` by `0.5`. Press `E` or
-  Enter for an exact floating-point value. Empty-canvas wheel zooms and middle
-  drag pans.
-- Growth shows the complete read-only signature
-  `fn growth(self: Scalar, kernel_1, ...) -> Rate` above a multiline editor.
-  Press `E` to edit. One kernel produces a precise curve; two kernels produce
-  a 2D heatmap. The number of ordinary growth inputs always equals the selected
-  RuleSet's kernel count.
+All three run the same compiled experiment, so a result does not depend on which
+one was chosen. The backend in use is named in the status bar, and the Backend
+panel lists every device found on the machine along with the reason any of them
+was rejected. If a GPU probe is what hangs on a particular machine, start with
+`--safe-mode` and change the setting from inside the window.
 
-Workbench changes are drafts. Review the Experiment section and press
-`Ctrl+Enter` to Apply; server acknowledgement and the new authoritative
-revision complete a remote Apply. `W` returns to simulation without confusing
-draft edits with the active experiment.
+## Workspaces
 
-## Build and install
+- **Simulation** — run, step, reset, randomize and paint directly into the world.
+- **Tiling** — design the periodic unit cell: draw polygons, use a preset, solve
+  the seams that glue them together, and drag vertices with those seams held.
+- **Channels** — add, colour, hide, freeze and delete the scalar fields, and
+  preview either the running world or the values a run would start from.
+- **Kernels** — edit the stencil of every kernel in a binding: paint weights,
+  switch cells in and out of the support, and type exact values.
+- **Growth** — write the program that turns kernel readings into an update, with
+  a plot of what it actually does across the inputs it actually reads.
+- **Experiment** — review the whole draft, see what stops it running, and go
+  straight to the workspace that owns each problem.
 
-On a Linux CUDA machine, the default build includes both CUDA and CPU backends
-and selects one at runtime:
+Every editing operation has a control you can reach with the pointer. Keyboard
+shortcuts only accelerate actions that are already visible.
+
+## Building
+
+Cellarium builds on stable Rust. The CUDA backend is on by default and is
+optional:
 
 ```sh
-cargo build --release
-./scripts/install-local.sh
+cargo build --release                        # with CUDA
+cargo build --release --no-default-features  # CPU and wgpu only
 ```
 
-To build without CUDA support:
+On Linux the window needs the usual X11/Wayland and GL development packages:
 
 ```sh
-cargo build --release --no-default-features
+sudo apt-get install libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+  libxkbcommon-dev libwayland-dev libgl1-mesa-dev mesa-vulkan-drivers
 ```
 
-Prebuilt binaries for Linux, macOS, and Windows on x86_64 and ARM64 are
-described in the [release installation guide](docs/releases.md).
+## Installing a release
+
+Download the archive for your platform along with `SHA256SUMS`, then:
+
+```sh
+./scripts/install-gui-local.sh cellarium-v0.3.0-linux-x86_64.tar.gz SHA256SUMS
+```
+
+The installer verifies the checksum before it installs anything.
+
+## Files
+
+Experiments are RON files. Cellarium reads the older experiment format as well
+as the current one, and opening a file never rewrites it on the way in. Saving
+writes to a temporary file and renames it into place, so an interrupted save
+leaves the previous file intact rather than a truncated one. Settings and a
+recovery autosave live under `$XDG_DATA_HOME/cellarium`.
+
+## Documentation
+
+- [Releases](docs/releases.md)
+- [Performance](docs/performance.md)

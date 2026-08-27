@@ -6,9 +6,12 @@ use crate::sim::experiment_model::ExperimentSpec;
 
 const DEFAULT_WORLD: u32 = 256;
 
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct GuiLaunchOptions {
     pub experiment: Option<PathBuf>,
+    pub backend: crate::sim::backend_selector::BackendPolicy,
+    /// Start without probing a GPU, for a machine where the probe is what hangs.
+    pub safe_mode: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -32,6 +35,18 @@ pub fn initial_spec(options: &GuiLaunchOptions) -> Result<ExperimentSpec, GuiSta
     }
 }
 
+/// Where settings and the autosave live, following the platform's convention.
+///
+/// A session without one still runs; it simply has nothing to remember with.
+fn data_root() -> Option<std::path::PathBuf> {
+    std::env::var_os("XDG_DATA_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("HOME").map(|home| std::path::PathBuf::from(home).join(".local/share"))
+        })
+        .map(|root| root.join("cellarium"))
+}
+
 pub fn run(options: GuiLaunchOptions) -> Result<(), GuiStartupError> {
     let spec = initial_spec(&options)?;
     let native_options = eframe::NativeOptions {
@@ -44,7 +59,20 @@ pub fn run(options: GuiLaunchOptions) -> Result<(), GuiStartupError> {
     eframe::run_native(
         "Cellarium",
         native_options,
-        Box::new(move |_creation| Ok(Box::new(CellariumGui::new(spec)))),
+        Box::new(move |_creation| {
+            let mut app = CellariumGui::new(spec);
+            // Safe mode never asks the driver anything, so a machine whose GPU
+            // probe hangs can still reach the window and change the setting.
+            app.select_backend(if options.safe_mode {
+                crate::sim::backend_selector::BackendPolicy::RequireCpu
+            } else {
+                options.backend.clone()
+            });
+            if let Some(root) = data_root() {
+                app.use_data_root(root);
+            }
+            Ok(Box::new(app))
+        }),
     )
     .map_err(|error| GuiStartupError::Window(error.to_string()))
 }
@@ -65,6 +93,8 @@ mod tests {
     #[test]
     fn a_missing_experiment_path_reports_the_load_failure() {
         let options = GuiLaunchOptions {
+            backend: Default::default(),
+            safe_mode: false,
             experiment: Some(PathBuf::from("/nonexistent/cellarium-missing.ron")),
         };
         let error = initial_spec(&options).unwrap_err();

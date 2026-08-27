@@ -1,10 +1,8 @@
-pub mod app;
+//! Cellarium: a local application for designing and running lattice
+//! experiments. Everything runs in this process, in its own window.
+
 pub mod cli;
 pub mod document;
 pub mod gui;
-pub mod input;
-pub mod remote;
 pub mod render;
 pub mod sim;
-pub mod tui;
-pub mod workbench;

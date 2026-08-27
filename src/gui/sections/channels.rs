@@ -3,6 +3,7 @@
 use eframe::egui::{self, Color32, RichText, Ui};
 
 use crate::document::DocumentCommand;
+use crate::document::channel_cards::channel_cards;
 use crate::gui::app::CellariumGui;
 use crate::gui::canvas::channels::{
     ChannelCanvasInput, ChannelPreviewSource, ChannelView, render_channel_canvas,
@@ -11,7 +12,6 @@ use crate::gui::theme;
 use crate::gui::widgets::object_strip::{CardAction, ObjectCard, StripHit, object_strip};
 use crate::render::channels::automatic_palette;
 use crate::sim::experiment_model::ChannelId;
-use crate::workbench::channel_editor::channel_cards;
 
 /// Presets offered in the colour popover, so a usable colour is one click away
 /// and the exact fields are there when one click is not enough.

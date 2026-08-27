@@ -38,6 +38,13 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
+      - name: Install Linux GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxkbcommon-dev libwayland-dev \
+            libgl1-mesa-dev mesa-vulkan-drivers
       - name: Check formatting
         run: cargo fmt --all -- --check
       - name: Test default Linux build
@@ -100,6 +107,15 @@ jobs:
           rustup toolchain install stable --profile minimal
           rustup default stable
           rustup target add ${{ matrix.target }}
+      - name: Install Linux GUI build dependencies
+        if: matrix.platform == 'linux'
+        shell: bash
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxkbcommon-dev libwayland-dev \
+            libgl1-mesa-dev mesa-vulkan-drivers
       - name: Configure Linux AArch64 cross linker
         if: matrix.cross
         shell: bash
@@ -119,8 +135,10 @@ jobs:
         shell: bash
         run: |
           archive="cellarium-v${{ needs.version.outputs.package-version }}-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz"
-          mkdir -p dist
-          tar -C "target/${{ matrix.target }}/release" -czf "dist/$archive" cellarium
+          mkdir -p dist stage
+          cp "target/${{ matrix.target }}/release/cellarium" stage/
+          cp packaging/cellarium.desktop stage/ 2>/dev/null || true
+          tar -C stage -czf "dist/$archive" .
           echo "archive=$archive" >> "$GITHUB_OUTPUT"
       - id: package-windows
         name: Package Windows executable
@@ -139,9 +157,29 @@ jobs:
           if-no-files-found: error
           retention-days: 7
 
+  parity:
+    name: Backend parity on real hardware
+    needs: [version, quality]
+    # A self-hosted runner with a CUDA device. Compilation does not prove that
+    # two backends agree; only running them on the same experiment does.
+    runs-on: [self-hosted, cuda]
+    timeout-minutes: 45
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Run CUDA, wgpu and CPU parity
+        run: cargo test --locked --test backend_parity -- --include-ignored
+      - name: Record the devices the parity ran on
+        if: always()
+        run: cargo run --locked --release -- --version
+
   release:
     name: Publish GitHub Release
-    needs: build
+    needs: [build, parity]
     runs-on: ubuntu-latest
     permissions:
       contents: write

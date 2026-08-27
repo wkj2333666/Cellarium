@@ -13,8 +13,9 @@ fn gui_fixture() -> Gui {
     let spec = ExperimentSpec::single_channel_lenia(16, 16)
         .normalize_rules()
         .expect("the fixture normalizes");
-    let mut app = CellariumGui::new(spec);
-    app.select_backend(BackendPolicy::RequireCpu);
+    // Choose the backend before the worker starts, so this test never
+    // creates a GPU device it is about to replace.
+    let mut app = CellariumGui::with_backend(spec, BackendPolicy::RequireCpu);
     app.navigation_mut().select(Section::Experiment);
     let mut harness = Harness::builder()
         .with_size(egui::vec2(1280.0, 720.0))

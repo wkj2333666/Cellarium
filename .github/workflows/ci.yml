@@ -24,14 +24,60 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal --component rustfmt --component clippy
           rustup default stable
+      # egui links against the platform's window, input and rendering libraries
+      # even when the tests never open a window.
+      - name: Install Linux GUI build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxkbcommon-dev libwayland-dev \
+            libgl1-mesa-dev mesa-vulkan-drivers
       - name: Check formatting
         run: cargo fmt --all -- --check
+      # The GUI is part of the product on a machine with no GPU, so the CPU-only
+      # configuration builds and tests the window too.
       - name: Test CPU-only build
         run: cargo test --locked --all-targets --no-default-features
       - name: Test default CUDA-enabled build
         run: cargo test --locked --all-targets
       - name: Lint all targets
         run: cargo clippy --locked --all-targets -- -D warnings
+
+  gui-smoke:
+    name: Start the GUI under Xvfb
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Configure stable Rust
+        run: |
+          rustup toolchain install stable --profile minimal
+          rustup default stable
+      - name: Install GUI runtime and test tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
+            libxkbcommon-dev libwayland-dev \
+            libgl1-mesa-dev mesa-vulkan-drivers libgl1-mesa-dri \
+            xvfb xdotool x11-apps imagemagick
+      - name: Build the release executable
+        run: cargo build --locked --release --no-default-features
+      # Compiling proves it builds; this proves it opens, paints and exits.
+      - name: Smoke the window
+        env:
+          LIBGL_ALWAYS_SOFTWARE: "1"
+          WGPU_BACKEND: gl
+        run: ./scripts/smoke-gui.sh target/release/cellarium
+      - name: Upload the captured window
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: gui-smoke
+          path: target/smoke-gui
+          if-no-files-found: warn
+          retention-days: 7
 
   portability:
     name: Check ${{ matrix.target }}

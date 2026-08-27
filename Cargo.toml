@@ -1,6 +1,6 @@
 [package]
 name = "cellarium"
-version = "0.2.2"
+version = "0.3.0"
 edition = "2024"
 
 [features]
@@ -8,18 +8,13 @@ default = ["cuda"]
 cuda = ["dep:cudarc"]
 
 [dependencies]
-base64 = "0.22"
-crossterm = "0.29.0"
 cudarc = { version = "0.19.9", optional = true, default-features = false, features = ["std", "driver", "nvrtc", "fallback-dynamic-loading", "cuda-11080"] }
 image = { version = "0.25", default-features = false }
-ratatui-image = { version = "11.0.6", default-features = false, features = ["crossterm"] }
-ratatui = "0.30.2"
 rand = "0.9"
 ron = "0.10"
 robust = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
-unicode-width = "0.2"
 eframe = { version = "0.36.1", features = ["persistence"] }
 wgpu = "30.0.1"
 bytemuck = "1.25.2"

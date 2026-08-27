@@ -367,10 +367,10 @@ impl DraftCommand {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::document::History;
     use crate::sim::experiment_model::ExperimentSpec;
     use crate::sim::ruleset::RuleKernel;
     use crate::sim::tiling::BasisId;
-    use crate::workbench::History;
 
     #[test]
     fn add_and_remove_kernel_update_growth_arity_with_exact_undo() {

@@ -23,7 +23,6 @@ pub mod program_file;
 pub mod rule;
 pub mod ruleset;
 pub mod runtime;
-pub mod service;
 pub mod strategy;
 pub mod tiling;
 pub mod topology;

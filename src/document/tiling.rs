@@ -11,9 +11,9 @@ use crate::sim::experiment_model::ExperimentSpec;
 use crate::sim::ruleset::{KernelSpatialDefinition, RuleBinding};
 use crate::sim::tiling::{
     BasisId, PeriodicTilingDraft, PrototypeId, PrototypeShape, RigidTransform, TileInstance,
-    TilePrototype, TilingMode, TilingPreset, Vec2, build_preset, polygon,
+    TilePrototype, TilingMode, TilingPreset, Vec2, build_preset, infer_translation_lattice,
+    polygon, provisional_translation_lattice,
 };
-use crate::workbench::tiling_editor::{infer_translation_lattice, provisional_translation_lattice};
 
 /// What a finished construction polygon becomes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

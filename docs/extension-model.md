@@ -2,7 +2,7 @@
 
 Experiment files are the versioned interchange boundary for Cellarium. The
 top-level `format_version` is mandatory and loaders reject versions they do not
-understand before entering the terminal UI. Rule programs, kernels, and lattice
+understand before the window opens. Rule programs, kernels, and lattice
 descriptions are data-only RON values; they do not carry CUDA handles or host
 callbacks.
 
@@ -25,4 +25,4 @@ issues, which is suitable for a preset browser or import preview.
 The `ExperimentMetadata` fields (`name`, `description`, `author`, and `tags`)
 are descriptive and safe to preserve across migrations. External tools should
 write RON using the public data types and should not depend on private backend
-or TUI fields.
+or view fields.

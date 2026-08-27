@@ -10,8 +10,12 @@ use eframe::egui::{Rect, pos2, vec2};
 
 /// The CPU backend keeps these tests independent of whatever GPU the machine has.
 fn simulation_gui() -> CellariumGui {
-    let mut app = CellariumGui::new(ExperimentSpec::single_channel_lenia(16, 16));
-    app.select_backend(BackendPolicy::RequireCpu);
+    // Choose the backend before the worker starts, so this test never
+    // creates a GPU device it is about to replace.
+    let mut app = CellariumGui::with_backend(
+        ExperimentSpec::single_channel_lenia(16, 16),
+        BackendPolicy::RequireCpu,
+    );
     app.navigation_mut().select(Section::Simulation);
     app
 }

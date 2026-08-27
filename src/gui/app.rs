@@ -191,6 +191,8 @@ pub struct CellariumGui {
     /// draft it would produce already computed.
     kernel_decision: Option<(Decision, Box<ExperimentSpec>)>,
     growth_plot: GrowthPlotState,
+    /// Smoothed rate the window is actually being drawn at.
+    frame_hz: f32,
     /// Where this experiment was opened from or last saved to.
     experiment_path: Option<std::path::PathBuf>,
     settings: GuiSettings,
@@ -212,7 +214,18 @@ impl CellariumGui {
     /// shown in the status bar instead of failing startup, so the user can see
     /// and fix the problem.
     pub fn new(spec: ExperimentSpec) -> Self {
+        Self::with_backend(spec, BackendPolicy::Auto)
+    }
+
+    /// Build the GUI and start a worker on a named backend.
+    ///
+    /// Choosing before starting matters: `Auto` asks the drivers what this
+    /// machine has, which creates a device. A caller that already knows it
+    /// wants the CPU should not pay for a GPU it is about to discard, and
+    /// several such callers at once contend for one card.
+    pub fn with_backend(spec: ExperimentSpec, policy: BackendPolicy) -> Self {
         let mut app = Self::for_test(spec);
+        app.backend_policy = policy;
         app.restart_simulation();
         app
     }
@@ -270,6 +283,7 @@ impl CellariumGui {
             kernel_popover: NumericPopover::default(),
             kernel_decision: None,
             growth_plot: GrowthPlotState::default(),
+            frame_hz: 0.0,
             experiment_path: None,
             settings: GuiSettings::default(),
             data_root: None,
@@ -904,7 +918,7 @@ impl CellariumGui {
     pub fn reset_rule_set(&mut self) {
         let binding = self.selected_binding();
         self.dispatch_document(DocumentCommand::Draft(Box::new(
-            crate::workbench::DraftCommand::ResetRuleSetToDefault { binding },
+            crate::document::DraftCommand::ResetRuleSetToDefault { binding },
         )));
     }
 
@@ -921,8 +935,8 @@ impl CellariumGui {
     }
 
     /// The cards the Channels strip is showing.
-    pub fn channel_cards(&self) -> Vec<crate::workbench::channel_editor::ChannelCardModel> {
-        crate::workbench::channel_editor::channel_cards(self.spec(), self.selected_channel())
+    pub fn channel_cards(&self) -> Vec<crate::document::channel_cards::ChannelCardModel> {
+        crate::document::channel_cards::channel_cards(self.spec(), self.selected_channel())
     }
 
     pub fn channel_view(&self) -> ChannelView {
@@ -1096,6 +1110,25 @@ impl CellariumGui {
         }
     }
 
+    /// Record how fast frames are arriving.
+    ///
+    /// egui already measures the interval between frames and smooths out the
+    /// occasional long one; taking its number keeps the status bar agreeing
+    /// with the thing it is reporting on.
+    fn observe_frame(&mut self, ctx: &eframe::egui::Context) {
+        let dt = ctx.input(|input| input.stable_dt);
+        if dt > 0.0 && dt.is_finite() {
+            let instant = 1.0 / dt;
+            // A little smoothing, so the number is readable rather than
+            // flickering through every value between two frames.
+            self.frame_hz = if self.frame_hz > 0.0 {
+                self.frame_hz * 0.9 + instant * 0.1
+            } else {
+                instant
+            };
+        }
+    }
+
     pub fn status(&self) -> StatusLine {
         let snapshot = self.snapshot();
         let backend = snapshot
@@ -1119,7 +1152,7 @@ impl CellariumGui {
                 .as_ref()
                 .map(|snapshot| step_rate(snapshot))
                 .unwrap_or(0.0),
-            frame_hz: 0.0,
+            frame_hz: self.frame_hz,
             draft_clean: self.document.status() == crate::document::DraftStatus::Clean,
             notice,
         }
@@ -1148,6 +1181,10 @@ pub struct StatusLine {
 
 impl eframe::App for CellariumGui {
     fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
+        // The status bar reports what the window is doing, so it has to measure
+        // it. A hardcoded zero beside a visibly animating canvas is worse than
+        // no number at all.
+        self.observe_frame(ui.ctx());
         // While the simulation runs, ask for a repaint at the display cadence
         // instead of polling the worker or spinning at full speed. The local
         // intent counts as running too: the frame that presses Run still sees

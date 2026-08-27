@@ -4,8 +4,9 @@ use cellarium::sim::experiment_model::ExperimentSpec;
 use std::ffi::OsString;
 
 #[test]
-fn gui_flag_selects_local_gui_without_server_or_host() {
-    let options = parse_cli([OsString::from("--gui")]).unwrap();
+fn running_with_no_arguments_opens_the_window() {
+    // The window is the product, so it needs no flag to select it.
+    let options = parse_cli(Vec::<OsString>::new()).unwrap();
     assert_eq!(options.mode, CliMode::Gui);
 }
 

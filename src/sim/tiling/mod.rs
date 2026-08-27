@@ -10,6 +10,7 @@ pub mod constraints;
 pub mod copies;
 pub mod coverage;
 pub mod half_edge;
+pub mod lattice;
 mod model;
 pub mod polygon;
 pub mod predicates;
@@ -29,6 +30,7 @@ pub use coverage::{
     validate_periodic_tiling,
 };
 pub use half_edge::{EdgePair, EdgeRef, HalfEdge, canonical_half_edges};
+pub use lattice::{infer_translation_lattice, provisional_translation_lattice};
 pub use model::{
     BasisId, GeometryIssue, PeriodicTilingDraft, PrototypeId, PrototypeShape, RigidTransform,
     TileId, TileInstance, TilePrototype, TilingMode, Vec2,

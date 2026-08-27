@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=Cellarium
+Comment=Design and run lattice experiments
+Exec=cellarium %f
+Terminal=false
+Categories=Science;Education;Graphics;
+MimeType=application/x-cellarium-experiment;
