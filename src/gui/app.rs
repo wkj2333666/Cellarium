@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
-use crate::document::DocumentController;
+use crate::document::{DocumentCommand, DocumentController};
+use crate::gui::canvas::tiling::TilingCanvasState;
 use crate::gui::canvas::world::WorldCanvasState;
 use crate::gui::layout;
 use crate::gui::sections::simulation::SimulationControl;
@@ -8,6 +9,7 @@ use crate::sim::backend_selector::{BackendPolicy, BackendSelector};
 use crate::sim::compute_plan::compile_compute_plan;
 use crate::sim::experiment_model::ExperimentSpec;
 use crate::sim::local_backend::{BackendProbe, initial_cells};
+use crate::sim::tiling::SeamProposal;
 use crate::sim::worker::{
     BackendFallback, SimulationCommand, SimulationController, SimulationSnapshot,
 };
@@ -169,6 +171,9 @@ pub struct CellariumGui {
     backend_open: bool,
     fallback_notice: Option<String>,
     world_canvas: WorldCanvasState,
+    tiling_canvas: TilingCanvasState,
+    seam_proposals: Option<Vec<SeamProposal>>,
+    tiling_notice: Option<String>,
     randomize_seed: u64,
     navigation: Navigation,
     inspector_tab: InspectorTab,
@@ -234,6 +239,9 @@ impl CellariumGui {
             backend_open: false,
             fallback_notice: None,
             world_canvas: WorldCanvasState::default(),
+            tiling_canvas: TilingCanvasState::default(),
+            seam_proposals: None,
+            tiling_notice: None,
             randomize_seed: 0x2545_F491_4F6C_DD1D,
             navigation: Navigation::default(),
             inspector_tab: InspectorTab::default(),
@@ -374,6 +382,90 @@ impl CellariumGui {
             .as_ref()
             .expect("a worker must be running")
             .wait_for(predicate)
+    }
+
+    pub fn tiling_canvas(&self) -> &TilingCanvasState {
+        &self.tiling_canvas
+    }
+
+    pub fn tiling_canvas_mut(&mut self) -> &mut TilingCanvasState {
+        &mut self.tiling_canvas
+    }
+
+    /// Vertices placed in the polygon currently being drawn.
+    pub fn construction_vertices(&self) -> usize {
+        self.tiling_canvas.construction().len()
+    }
+
+    /// Independent polygon sites in the draft unit cell.
+    pub fn draft_basis_count(&self) -> usize {
+        self.spec()
+            .tiling
+            .as_ref()
+            .map(|tiling| tiling.instances.len())
+            .unwrap_or(0)
+    }
+
+    /// Periodic copies drawn around the unit cell in the last frame.
+    pub fn visible_neighbor_copies(&self) -> usize {
+        self.tiling_canvas.neighbor_copies()
+    }
+
+    pub fn tiling_notice(&self) -> Option<&str> {
+        self.tiling_notice.as_deref()
+    }
+
+    pub fn set_tiling_notice(&mut self, notice: Option<String>) {
+        self.tiling_notice = notice;
+    }
+
+    pub fn seam_proposals(&self) -> Option<&[SeamProposal]> {
+        self.seam_proposals.as_deref()
+    }
+
+    pub fn set_seam_proposals(&mut self, proposals: Vec<SeamProposal>) {
+        self.tiling_notice = (proposals.is_empty())
+            .then(|| "no full-edge pairs are close enough to glue".to_string());
+        self.seam_proposals = Some(proposals);
+    }
+
+    pub fn clear_seam_proposals(&mut self) {
+        self.seam_proposals = None;
+        self.tiling_notice = None;
+    }
+
+    /// Hold the proposed seams. Subsequent vertex drags move whole equivalence
+    /// classes rather than tearing the tiling apart.
+    pub fn accept_seam_proposals(&mut self) {
+        if let Some(proposals) = self.seam_proposals.take() {
+            self.tiling_canvas.seams = proposals
+                .into_iter()
+                .map(|proposal| proposal.constraint)
+                .collect();
+        }
+        self.tiling_notice = None;
+    }
+
+    /// Run one document command, reporting a rejection instead of applying it.
+    pub fn dispatch_document(&mut self, command: DocumentCommand) {
+        match self.document.execute(command) {
+            Ok(_) => self.tiling_notice = None,
+            Err(error) => self.tiling_notice = Some(error.to_string()),
+        }
+    }
+
+    /// Close the construction polygon into the draft.
+    pub fn finish_tiling_polygon(&mut self) {
+        let vertices = self.tiling_canvas.construction().to_vec();
+        let target = self.tiling_canvas.target;
+        self.dispatch_document(DocumentCommand::FinishTilingPolygon { vertices, target });
+        if self.tiling_notice.is_none() {
+            self.tiling_canvas.cancel();
+            self.tiling_canvas.selected_prototype = self.document.selection().prototype;
+            self.tiling_canvas.selected_basis = Some(self.document.selection().basis);
+            // A committed polygon changes what the view should frame.
+            self.tiling_canvas.request_fit();
+        }
     }
 
     pub fn world_canvas(&self) -> &WorldCanvasState {

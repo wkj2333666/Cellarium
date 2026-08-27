@@ -25,7 +25,7 @@ pub use compile::{CompiledTiling, compile_tiling};
 pub use constraints::{SeamConstraint, SeamProposal, propose_full_edge_seams};
 pub use copies::{Aabb, GeometryBudget, LatticeCopyBounds};
 pub use coverage::{
-    CoverageReport, TilingDiagnostic, TilingValidationReport, validate_coverage,
+    CoverageReport, TilingDiagnostic, TilingValidationReport, neighbor_offsets, validate_coverage,
     validate_periodic_tiling,
 };
 pub use half_edge::{EdgePair, EdgeRef, HalfEdge, canonical_half_edges};

@@ -21,6 +21,14 @@ pub const KERNEL_NEGATIVE: Color32 = Color32::from_rgb(226, 74, 74);
 pub const KERNEL_ACTIVE_ZERO: Color32 = Color32::from_rgb(58, 62, 70);
 pub const KERNEL_ANCHOR: Color32 = Color32::from_rgb(226, 178, 66);
 
+/// Tiling canvas. The unit cell is opaque and its periodic copies are
+/// translucent, so what is editable is visibly distinct from what is context.
+pub const CELL_FILL: Color32 = Color32::from_rgb(38, 54, 96);
+pub const CELL_STROKE: Color32 = Color32::from_rgb(150, 176, 224);
+pub const NEIGHBOR_FILL: Color32 = Color32::from_rgba_premultiplied(20, 32, 62, 150);
+pub const NEIGHBOR_STROKE: Color32 = Color32::from_rgba_premultiplied(70, 92, 140, 170);
+pub const LATTICE_VECTOR: Color32 = Color32::from_rgb(226, 178, 66);
+
 pub const SELECTION: Color32 = Color32::WHITE;
 pub const DRAFT: Color32 = Color32::from_rgb(226, 178, 66);
 pub const LIVE: Color32 = Color32::from_rgb(74, 206, 108);

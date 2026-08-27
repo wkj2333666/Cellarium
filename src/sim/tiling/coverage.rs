@@ -153,6 +153,25 @@ pub fn validate_periodic_tiling(
     })
 }
 
+/// Lattice offsets of the periodic copies that actually touch the unit cell.
+///
+/// The ring comes from the validated arrangement rather than a blanket 3x3
+/// sweep, so an oblique lattice shows the neighbours it really has.
+pub fn neighbor_offsets(draft: &PeriodicTilingDraft) -> Vec<[i32; 2]> {
+    let Ok(report) = validate_coverage(draft) else {
+        return Vec::new();
+    };
+    let mut seen = std::collections::BTreeSet::new();
+    report
+        .neighbor_ring
+        .values()
+        .flatten()
+        .map(|neighbor| neighbor.lattice_offset)
+        .filter(|offset| *offset != [0, 0])
+        .filter(|offset| seen.insert(*offset))
+        .collect()
+}
+
 fn stable_diagnostics(diagnostics: &mut Vec<TilingDiagnostic>) {
     diagnostics.sort_by(|left, right| {
         left.code

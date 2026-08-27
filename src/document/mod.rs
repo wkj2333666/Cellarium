@@ -7,11 +7,13 @@
 
 pub mod channels;
 pub mod selection;
+pub mod tiling;
 
 use crate::sim::experiment_model::{
     ChannelId, DisplayColor, ExperimentSpec, KernelId, RgbColor, UpdateMode, validate_structure,
 };
 use crate::sim::ruleset::{BindingKey, RuleSetId};
+use crate::sim::tiling::{PeriodicTilingDraft, TilingPreset, Vec2 as TilingVec2};
 use crate::workbench::{DraftCommand, History, HistoryError};
 
 pub use selection::{EditorSelection, PlotAxes, PlotSymbol};
@@ -76,6 +78,19 @@ pub enum DocumentCommand {
     SetSelectedGrowthMode(UpdateMode),
     SetSelectedGrowthSource(String),
     SetSimulationDt(f32),
+    /// Close a construction path into a basis polygon.
+    FinishTilingPolygon {
+        vertices: Vec<TilingVec2>,
+        target: tiling::ConstructionTarget,
+    },
+    /// Replace the whole tiling with a preset unit cell.
+    ApplyTilingPreset {
+        preset: TilingPreset,
+        scale: f64,
+    },
+    /// Store a tiling the canvas produced directly, such as a dragged vertex or
+    /// an accepted seam solve.
+    SetTilingDraft(Box<PeriodicTilingDraft>),
     /// Escape hatch for the existing kernel and value level edits.
     Draft(Box<DraftCommand>),
 }
@@ -260,6 +275,46 @@ impl DocumentController {
                 next.simulation_dt = dt;
                 self.transact(next, |_| {})?;
                 Ok(self.record(vec![Affected::Experiment]))
+            }
+            DocumentCommand::FinishTilingPolygon { vertices, target } => {
+                let commit = tiling::finish_polygon(&self.draft, &vertices, target)
+                    .map_err(DocumentError::Rejected)?;
+                let prototype = commit.prototype;
+                let basis = commit.basis;
+                self.transact(commit.spec, |selection| {
+                    selection.prototype = Some(prototype);
+                    if let Some(basis) = basis {
+                        selection.basis = basis;
+                    }
+                })?;
+                Ok(self.record(vec![Affected::Tiling, Affected::Selection]))
+            }
+            DocumentCommand::ApplyTilingPreset { preset, scale } => {
+                if !scale.is_finite() || scale <= 0.0 {
+                    return Err(DocumentError::Rejected(
+                        "preset scale must be finite and positive".into(),
+                    ));
+                }
+                let next = tiling::apply_preset(&self.draft, preset, scale)
+                    .map_err(DocumentError::Rejected)?;
+                let first = next
+                    .tiling
+                    .as_ref()
+                    .and_then(|entry| entry.instances.first())
+                    .map(|instance| (instance.prototype, instance.id));
+                self.transact(next, |selection| {
+                    if let Some((prototype, basis)) = first {
+                        selection.prototype = Some(prototype);
+                        selection.basis = basis;
+                    }
+                })?;
+                Ok(self.record(vec![Affected::Tiling, Affected::Selection]))
+            }
+            DocumentCommand::SetTilingDraft(draft) => {
+                let mut next = self.draft.clone();
+                next.tiling = Some(*draft);
+                self.transact(next, |_| {})?;
+                Ok(self.record(vec![Affected::Tiling]))
             }
             DocumentCommand::Draft(command) => {
                 self.draft_command(*command)?;

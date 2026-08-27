@@ -788,158 +788,26 @@ impl WorkbenchState {
         self.tiling_new_basis = false;
     }
     pub fn finish_tiling_construction(&mut self) -> Result<(), String> {
-        if self.tiling_construction.len() < 3 {
-            return Err("place at least three vertices before closing the polygon".into());
-        }
-        if crate::sim::tiling::polygon::signed_area(&self.tiling_construction) < 0.0 {
-            self.tiling_construction.reverse();
-        }
-        let issues = crate::sim::tiling::polygon::validate_polygon(&self.tiling_construction);
-        if let Some(issue) = issues.first() {
-            return Err(issue.message.clone());
-        }
-        let mut next = self.draft.clone();
-        if self.tiling_new_basis {
-            if next.tiling.is_none() {
-                let (translation_a, translation_b) =
-                    super::tiling_editor::infer_translation_lattice(&self.tiling_construction)
-                        .unwrap_or_else(|_| {
-                            super::tiling_editor::provisional_translation_lattice(
-                                &self.tiling_construction,
-                            )
-                        });
-                next.tiling = Some(crate::sim::tiling::PeriodicTilingDraft {
-                    translation_a,
-                    translation_b,
-                    prototypes: Vec::new(),
-                    instances: Vec::new(),
-                    mode: crate::sim::tiling::TilingMode::Topological,
-                });
-            }
-            let tiling = next
-                .tiling
-                .as_mut()
-                .expect("new tiling was initialized above");
-            let prototype = PrototypeId(
-                tiling
-                    .prototypes
-                    .iter()
-                    .map(|entry| entry.id.0)
-                    .max()
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .ok_or("prototype id exhausted")?,
-            );
-            let basis = BasisId(
-                tiling
-                    .instances
-                    .iter()
-                    .map(|entry| entry.id.0)
-                    .max()
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .ok_or("basis id exhausted")?,
-            );
-            tiling.prototypes.push(crate::sim::tiling::TilePrototype {
-                id: prototype,
-                name: format!("basis_{}", basis.0),
-                shape: PrototypeShape::SimplePolygon {
-                    vertices: self.tiling_construction.clone(),
-                },
-            });
-            tiling.instances.push(crate::sim::tiling::TileInstance {
-                id: basis,
-                prototype,
-                transform: crate::sim::tiling::RigidTransform::default(),
-            });
-            if next.rules.is_empty() {
-                next = next.normalize_rules().map_err(|errors| {
-                    errors
-                        .into_iter()
-                        .map(|error| error.to_string())
-                        .collect::<Vec<_>>()
-                        .join("; ")
-                })?;
-            }
-            for rule in &mut next.rules.sets {
-                for kernel in &mut rule.kernels {
-                    let replacement = match &mut kernel.spatial {
-                        crate::sim::ruleset::KernelSpatialDefinition::Raster(definition) => {
-                            let built = definition.build().map_err(|error| error.to_string())?;
-                            Some(crate::sim::ruleset::KernelSpatialDefinition::Periodic(
-                                crate::sim::basis_kernel::PeriodicKernelDefinition {
-                                    width: built.width,
-                                    height: built.height,
-                                    anchor_x: built.anchor_x,
-                                    anchor_y: built.anchor_y,
-                                    planes: std::collections::BTreeMap::from([(
-                                        basis,
-                                        crate::sim::basis_kernel::BasisWeightPlane {
-                                            values: built.values,
-                                            mask: built.mask,
-                                        },
-                                    )]),
-                                },
-                            ))
-                        }
-                        crate::sim::ruleset::KernelSpatialDefinition::Periodic(definition) => {
-                            let plane_len = definition.width * definition.height;
-                            let template = definition.planes.values().next().cloned().unwrap_or(
-                                crate::sim::basis_kernel::BasisWeightPlane {
-                                    values: vec![0.0; plane_len],
-                                    mask: None,
-                                },
-                            );
-                            definition.planes.insert(basis, template);
-                            None
-                        }
-                    };
-                    if let Some(replacement) = replacement {
-                        kernel.spatial = replacement;
-                    }
-                }
-            }
-            for output in next
-                .channels
-                .iter()
-                .filter(|channel| !channel.frozen)
-                .map(|channel| channel.id)
-                .collect::<Vec<_>>()
-            {
-                let default = *next
-                    .rules
-                    .defaults
-                    .get(&output)
-                    .ok_or("active channel has no default rule-set")?;
-                if next.rules.binding(basis, output).is_none() {
-                    next.rules.bindings.push(crate::sim::ruleset::RuleBinding {
-                        basis,
-                        output,
-                        rule_set: default,
-                    });
-                }
-            }
-            self.selected_prototype = Some(prototype);
-            self.selected_basis = basis;
+        // The commit rules live in the document layer so the terminal Workbench
+        // and the GUI produce byte-identical drafts from the same polygon.
+        let target = if self.tiling_new_basis {
+            crate::document::tiling::ConstructionTarget::NewBasis
         } else {
-            let selected = self
-                .selected_prototype
-                .ok_or("select a basis polygon first")?;
-            let prototype = next
-                .tiling
-                .as_mut()
-                .and_then(|tiling| {
-                    tiling
-                        .prototypes
-                        .iter_mut()
-                        .find(|entry| entry.id == selected)
-                })
-                .ok_or("selected basis polygon is missing")?;
-            prototype.shape = PrototypeShape::SimplePolygon {
-                vertices: self.tiling_construction.clone(),
-            };
+            crate::document::tiling::ConstructionTarget::ReplacePrototype(
+                self.selected_prototype
+                    .ok_or("select a basis polygon first")?,
+            )
+        };
+        let commit = crate::document::tiling::finish_polygon(
+            &self.draft,
+            &self.tiling_construction,
+            target,
+        )?;
+        self.selected_prototype = Some(commit.prototype);
+        if let Some(basis) = commit.basis {
+            self.selected_basis = basis;
         }
-        self.replace_draft(next)
+        self.replace_draft(commit.spec)
             .map_err(|error| error.to_string())?;
         self.tiling_construction.clear();
         self.tiling_pointer = None;
