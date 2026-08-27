@@ -4,6 +4,7 @@ use crate::document::{DocumentCommand, DocumentController};
 use crate::gui::canvas::channels::{
     ChannelCanvasState, ChannelPreview, ChannelPreviewSource, ChannelView, resolve_preview,
 };
+use crate::gui::canvas::growth::{GrowthPlotState, PlotInput, PlotScene, compute, default_axes};
 use crate::gui::canvas::kernel::{KernelCanvasState, KernelEdit, KernelStencil};
 use crate::gui::canvas::tiling::TilingCanvasState;
 use crate::gui::canvas::world::WorldCanvasState;
@@ -188,6 +189,7 @@ pub struct CellariumGui {
     /// A destructive kernel edit waiting for the user's answer, with the
     /// draft it would produce already computed.
     kernel_decision: Option<(Decision, Box<ExperimentSpec>)>,
+    growth_plot: GrowthPlotState,
     seam_proposals: Option<Vec<SeamProposal>>,
     notice: Option<String>,
     randomize_seed: u64,
@@ -261,6 +263,7 @@ impl CellariumGui {
             kernel_canvas: KernelCanvasState::new(),
             kernel_popover: NumericPopover::default(),
             kernel_decision: None,
+            growth_plot: GrowthPlotState::default(),
             seam_proposals: None,
             notice: None,
             randomize_seed: 0x2545_F491_4F6C_DD1D,
@@ -421,6 +424,128 @@ impl CellariumGui {
             .as_ref()
             .expect("a worker must be running")
             .wait_for(predicate)
+    }
+
+    pub fn growth_plot(&self) -> &GrowthPlotState {
+        &self.growth_plot
+    }
+
+    pub fn growth_plot_mut(&mut self) -> &mut GrowthPlotState {
+        &mut self.growth_plot
+    }
+
+    pub fn growth_signature(&self) -> crate::document::growth::GrowthSignature {
+        crate::document::growth::signature_of(self.spec(), self.selected_binding())
+    }
+
+    pub fn growth_mode(&self) -> crate::sim::experiment_model::UpdateMode {
+        crate::document::growth::mode_of(self.spec(), self.selected_binding())
+            .unwrap_or(crate::sim::experiment_model::UpdateMode::GrowthRate)
+    }
+
+    pub fn set_growth_mode(&mut self, mode: crate::sim::experiment_model::UpdateMode) {
+        let binding = self.selected_binding();
+        match crate::document::growth::set_mode(self.spec(), binding, mode) {
+            Ok(spec) => self.dispatch_document(DocumentCommand::ReplaceExperiment(Box::new(spec))),
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
+    /// Kernel symbols the program actually reads.
+    pub fn growth_referenced(&self) -> Vec<String> {
+        crate::document::growth::analyze(self.spec(), self.selected_binding()).unwrap_or_default()
+    }
+
+    pub fn growth_diagnostics(&self) -> Vec<crate::document::growth::GrowthDiagnostic> {
+        crate::document::growth::analyze(self.spec(), self.selected_binding())
+            .err()
+            .unwrap_or_default()
+    }
+
+    pub fn kernel_symbol(&self, kernel: KernelId) -> String {
+        self.kernel_cards()
+            .into_iter()
+            .find(|card| card.id == kernel)
+            .map(|card| card.symbol)
+            .unwrap_or_else(|| format!("k{}", kernel.0))
+    }
+
+    /// The axes the plot uses: the user's choice if they made one, otherwise
+    /// the ones the program's own references imply.
+    pub fn plot_axes(&self) -> crate::document::selection::PlotAxes {
+        if let Some(chosen) = self.growth_plot.chosen_axes {
+            return chosen;
+        }
+        let signature = self.growth_signature();
+        let pairs: Vec<(String, KernelId)> = signature
+            .kernel_inputs
+            .iter()
+            .cloned()
+            .zip(signature.kernel_ids.iter().copied())
+            .collect();
+        default_axes(&self.growth_referenced(), &pairs)
+    }
+
+    /// Assign a symbol to one axis, promoting a curve to a heatmap when the
+    /// user asks for a second one.
+    pub fn set_plot_axis(
+        &mut self,
+        axis: crate::gui::sections::growth::Axis,
+        symbol: crate::document::selection::PlotSymbol,
+    ) {
+        use crate::document::selection::PlotAxes;
+        use crate::gui::sections::growth::Axis;
+        let current = self.plot_axes();
+        let next = match (axis, current) {
+            (Axis::X, PlotAxes::Curve(_)) => PlotAxes::Curve(symbol),
+            (Axis::X, PlotAxes::Heatmap(_, y)) => PlotAxes::Heatmap(symbol, y),
+            (Axis::Y, PlotAxes::Curve(x)) if x != symbol => PlotAxes::Heatmap(x, symbol),
+            // Asking for the same symbol on both axes would plot a diagonal
+            // and say nothing, so it collapses back to a curve.
+            (Axis::Y, PlotAxes::Curve(x)) => PlotAxes::Curve(x),
+            (Axis::Y, PlotAxes::Heatmap(x, _)) if x != symbol => PlotAxes::Heatmap(x, symbol),
+            (Axis::Y, PlotAxes::Heatmap(x, _)) => PlotAxes::Curve(x),
+        };
+        self.growth_plot.chosen_axes = Some(next);
+    }
+
+    /// Compute the plot, or nothing when the program does not compile.
+    pub fn growth_scene(&self) -> Option<PlotScene> {
+        let binding = self.selected_binding();
+        let signature = crate::document::growth::signature_of(self.spec(), binding);
+        let source = crate::document::growth::source_of(self.spec(), binding)?;
+        let program =
+            crate::sim::growth::typecheck::compile(&source, &signature.externals()).ok()?;
+        let pairs: Vec<(String, KernelId)> = signature
+            .kernel_inputs
+            .iter()
+            .cloned()
+            .zip(signature.kernel_ids.iter().copied())
+            .collect();
+        let mut pinned = self.growth_plot.pinned.clone();
+        for (name, value) in &signature.parameters {
+            pinned.parameters.entry(name.clone()).or_insert(*value);
+        }
+        Some(compute(&PlotInput {
+            program: &program,
+            signature_kernels: &pairs,
+            axes: self.plot_axes(),
+            pinned: &pinned,
+            domain: self.growth_plot.domain,
+        }))
+    }
+
+    /// What the plot's numbers are, taken from the binding rather than chosen
+    /// separately.
+    pub fn growth_quantity(&self) -> crate::gui::canvas::growth::PlotQuantity {
+        crate::gui::canvas::growth::PlotQuantity::of(self.growth_mode())
+    }
+
+    /// Select a kernel and show it, so a symbol in the growth signature is a
+    /// route to the thing it names.
+    pub fn open_kernel(&mut self, kernel: KernelId) {
+        self.select_kernel(kernel);
+        self.navigation.select(Section::Kernels);
     }
 
     /// The growth program of the selected binding.

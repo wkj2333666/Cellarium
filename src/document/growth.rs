@@ -16,15 +16,17 @@ pub struct GrowthSignature {
     pub kernel_inputs: Vec<String>,
     /// Kernel ids parallel to `kernel_inputs`.
     pub kernel_ids: Vec<KernelId>,
-    /// Named constants the program may read.
-    pub parameters: Vec<String>,
+    /// Named constants the program may read, with the values the experiment
+    /// holds for them. A plot drawn with these missing is a plot of a
+    /// different program.
+    pub parameters: std::collections::BTreeMap<String, f32>,
 }
 
 impl GrowthSignature {
     pub fn externals(&self) -> ExternalSymbols {
         ExternalSymbols {
             kernel_inputs: self.kernel_inputs.clone(),
-            parameters: self.parameters.clone(),
+            parameters: self.parameters.keys().cloned().collect(),
         }
     }
 
@@ -32,7 +34,7 @@ impl GrowthSignature {
     pub fn rendered(&self) -> String {
         let mut names = self.kernel_inputs.clone();
         names.push("self".into());
-        names.extend(self.parameters.iter().cloned());
+        names.extend(self.parameters.keys().cloned());
         format!("f({})", names.join(", "))
     }
 
@@ -98,7 +100,7 @@ pub fn signature_of(spec: &ExperimentSpec, binding: BindingKey) -> GrowthSignatu
         return GrowthSignature {
             kernel_inputs,
             kernel_ids,
-            parameters: rule.growth.parameters.keys().cloned().collect(),
+            parameters: rule.growth.parameters.clone(),
         };
     }
 
@@ -120,7 +122,7 @@ pub fn signature_of(spec: &ExperimentSpec, binding: BindingKey) -> GrowthSignatu
     GrowthSignature {
         kernel_inputs,
         kernel_ids,
-        parameters: growth.parameters.keys().cloned().collect(),
+        parameters: growth.parameters.clone(),
     }
 }
 
