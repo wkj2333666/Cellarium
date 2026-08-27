@@ -26,6 +26,16 @@ pub enum HistoryError {
 }
 
 impl History {
+    /// Number of transactions that can still be undone.
+    pub fn undo_depth(&self) -> usize {
+        self.undo.len()
+    }
+
+    /// Number of transactions that can still be redone.
+    pub fn redo_depth(&self) -> usize {
+        self.redo.len()
+    }
+
     pub fn execute(
         &mut self,
         draft: &mut ExperimentSpec,

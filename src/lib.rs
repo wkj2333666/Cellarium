@@ -1,5 +1,6 @@
 pub mod app;
 pub mod cli;
+pub mod document;
 pub mod gui;
 pub mod input;
 pub mod remote;

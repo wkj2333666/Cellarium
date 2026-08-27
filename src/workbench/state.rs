@@ -1558,150 +1558,19 @@ impl WorkbenchState {
     }
 
     pub fn add_channel(&mut self) -> Result<(), HistoryError> {
-        let mut next = self.draft.clone();
-        let ordinal = next
-            .channels
-            .iter()
-            .map(|channel| channel.id.0)
-            .max()
-            .unwrap_or(0)
-            .checked_add(2)
-            .ok_or_else(|| HistoryError::Edit("channel name ordinal exhausted".into()))?;
-        let name = format!("channel_{ordinal}");
-        let id = next.add_channel(name, false);
-        let selected_kernel = if next.rules.is_empty() {
-            let kernel_id = KernelId(
-                next.kernels
-                    .iter()
-                    .map(|kernel| kernel.id.0)
-                    .max()
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .ok_or_else(|| HistoryError::Edit("kernel id exhausted".into()))?,
-            );
-            let symbol = format!("k{}", kernel_id.0);
-            next.kernels
-                .push(KernelSlot::identity(kernel_id, symbol, id, id));
-            let growth = next
-                .growth
-                .iter_mut()
-                .find(|growth| growth.target == id)
-                .ok_or_else(|| HistoryError::Edit("new channel growth is missing".into()))?;
-            growth.kernel_inputs = vec![kernel_id];
-            Some(kernel_id)
-        } else {
-            next.growth.retain(|growth| growth.target != id);
-            let rule_set_id = RuleSetId(
-                next.rules
-                    .sets
-                    .iter()
-                    .map(|rule| rule.id.0)
-                    .max()
-                    .unwrap_or(0)
-                    .checked_add(1)
-                    .ok_or_else(|| HistoryError::Edit("rule-set id exhausted".into()))?,
-            );
-            let mut rule_set = RuleSet::identity(rule_set_id, id);
-            if next.tiling.is_some() {
-                let bases = next.basis_ids();
-                let planes = bases
-                    .iter()
-                    .map(|basis| {
-                        (
-                            *basis,
-                            crate::sim::basis_kernel::BasisWeightPlane {
-                                values: vec![1.0],
-                                mask: None,
-                            },
-                        )
-                    })
-                    .collect();
-                rule_set.kernels[0].spatial =
-                    crate::sim::ruleset::KernelSpatialDefinition::Periodic(
-                        crate::sim::basis_kernel::PeriodicKernelDefinition {
-                            width: 1,
-                            height: 1,
-                            anchor_x: 0,
-                            anchor_y: 0,
-                            planes,
-                        },
-                    );
-            }
-            next.rules.defaults.insert(id, rule_set_id);
-            next.rules.sets.push(rule_set);
-            next.rules
-                .bindings
-                .extend(next.basis_ids().into_iter().map(|basis| {
-                    crate::sim::ruleset::RuleBinding {
-                        basis,
-                        output: id,
-                        rule_set: rule_set_id,
-                    }
-                }));
-            Some(KernelId(0))
-        };
-        self.replace_draft(next)?;
-        self.selected_channel = id;
+        let added =
+            crate::document::channels::add_channel(&self.draft).map_err(HistoryError::Edit)?;
+        self.replace_draft(added.spec)?;
+        self.selected_channel = added.channel;
         self.tiling_constraints.clear();
         self.refresh_rule_selection();
-        self.selected_kernel = selected_kernel.or(self.selected_kernel);
+        self.selected_kernel = added.selected_kernel.or(self.selected_kernel);
         Ok(())
     }
 
     pub fn remove_selected_channel(&mut self) -> Result<(), String> {
-        if self.draft.channels.len() <= 1 {
-            return Err("an experiment must retain at least one channel".into());
-        }
-        let removed = self.selected_channel;
-        let removed_position = self
-            .draft
-            .channels
-            .iter()
-            .position(|channel| channel.id == removed)
-            .unwrap_or(0);
-        let mut next = self.draft.clone();
-        if !next.rules.is_empty()
-            && next.rules.sets.iter().any(|rule| {
-                rule.kernels
-                    .iter()
-                    .any(|kernel| kernel.source_channel == removed && rule.growth.target != removed)
-            })
-        {
-            return Err(
-                "channel is still used as a kernel source; reroute those kernels first".into(),
-            );
-        }
-        next.channels.retain(|channel| channel.id != removed);
-        next.kernels
-            .retain(|kernel| kernel.source != removed && kernel.target != removed);
-        next.growth.retain(|growth| growth.target != removed);
-        for growth in &mut next.growth {
-            growth.kernel_inputs.retain(|id| {
-                next.kernels
-                    .iter()
-                    .any(|kernel| kernel.id == *id && kernel.target == growth.target)
-            });
-        }
-        if !next.rules.is_empty() {
-            next.rules
-                .bindings
-                .retain(|binding| binding.output != removed);
-            next.rules.defaults.remove(&removed);
-            let referenced = next
-                .rules
-                .bindings
-                .iter()
-                .map(|binding| binding.rule_set)
-                .chain(next.rules.defaults.values().copied())
-                .collect::<std::collections::BTreeSet<_>>();
-            next.rules.sets.retain(|rule| referenced.contains(&rule.id));
-        }
-        let nearest = next
-            .channels
-            .get(removed_position)
-            .or_else(|| next.channels.last())
-            .expect("channel minimum was checked")
-            .id;
+        let (next, nearest) =
+            crate::document::channels::remove_channel(&self.draft, self.selected_channel)?;
         self.replace_draft(next)
             .map_err(|error| error.to_string())?;
         self.selected_channel = nearest;
