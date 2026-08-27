@@ -1,13 +1,16 @@
 use std::sync::Arc;
 
 use crate::document::{DocumentCommand, DocumentController};
+use crate::gui::canvas::channels::{
+    ChannelCanvasState, ChannelPreview, ChannelPreviewSource, ChannelView, resolve_preview,
+};
 use crate::gui::canvas::tiling::TilingCanvasState;
 use crate::gui::canvas::world::WorldCanvasState;
 use crate::gui::layout;
 use crate::gui::sections::simulation::SimulationControl;
 use crate::sim::backend_selector::{BackendPolicy, BackendSelector};
 use crate::sim::compute_plan::compile_compute_plan;
-use crate::sim::experiment_model::ExperimentSpec;
+use crate::sim::experiment_model::{ChannelId, ExperimentSpec};
 use crate::sim::local_backend::{BackendProbe, initial_cells};
 use crate::sim::tiling::SeamProposal;
 use crate::sim::worker::{
@@ -172,8 +175,12 @@ pub struct CellariumGui {
     fallback_notice: Option<String>,
     world_canvas: WorldCanvasState,
     tiling_canvas: TilingCanvasState,
+    channel_canvas: ChannelCanvasState,
+    /// Working RGB for the colour popover, so dragging the fields does not
+    /// write a new draft on every pixel of movement.
+    channel_colour_draft: [u8; 3],
     seam_proposals: Option<Vec<SeamProposal>>,
-    tiling_notice: Option<String>,
+    notice: Option<String>,
     randomize_seed: u64,
     navigation: Navigation,
     inspector_tab: InspectorTab,
@@ -240,8 +247,10 @@ impl CellariumGui {
             fallback_notice: None,
             world_canvas: WorldCanvasState::default(),
             tiling_canvas: TilingCanvasState::default(),
+            channel_canvas: ChannelCanvasState::default(),
+            channel_colour_draft: [236, 240, 246],
             seam_proposals: None,
-            tiling_notice: None,
+            notice: None,
             randomize_seed: 0x2545_F491_4F6C_DD1D,
             navigation: Navigation::default(),
             inspector_tab: InspectorTab::default(),
@@ -362,6 +371,24 @@ impl CellariumGui {
                 self.backend_open = !self.backend_open;
                 None
             }
+            ShellAction::Undo => {
+                // Undo and Redo are document transactions, not simulation
+                // commands: they rewind the draft the user is editing.
+                match self.document.undo() {
+                    Ok(_) => self.notice = None,
+                    Err(error) => self.notice = Some(error.to_string()),
+                }
+                self.channel_canvas.invalidate();
+                None
+            }
+            ShellAction::Redo => {
+                match self.document.redo() {
+                    Ok(_) => self.notice = None,
+                    Err(error) => self.notice = Some(error.to_string()),
+                }
+                self.channel_canvas.invalidate();
+                None
+            }
             _ => None,
         };
         if let (Some(command), Some(simulation)) = (command, self.simulation.as_ref()) {
@@ -382,6 +409,74 @@ impl CellariumGui {
             .as_ref()
             .expect("a worker must be running")
             .wait_for(predicate)
+    }
+
+    pub fn channel_canvas(&self) -> &ChannelCanvasState {
+        &self.channel_canvas
+    }
+
+    pub fn channel_canvas_mut(&mut self) -> &mut ChannelCanvasState {
+        &mut self.channel_canvas
+    }
+
+    pub fn selected_channel(&self) -> ChannelId {
+        self.document.selection().channel
+    }
+
+    /// The cards the Channels strip is showing.
+    pub fn channel_cards(&self) -> Vec<crate::workbench::channel_editor::ChannelCardModel> {
+        crate::workbench::channel_editor::channel_cards(self.spec(), self.selected_channel())
+    }
+
+    pub fn channel_view(&self) -> ChannelView {
+        self.channel_canvas.view
+    }
+
+    pub fn set_channel_view(&mut self, view: ChannelView) {
+        self.channel_canvas.view = view;
+        self.channel_canvas.invalidate();
+    }
+
+    pub fn channel_preview_source(&self) -> ChannelPreviewSource {
+        self.channel_canvas.source
+    }
+
+    pub fn set_channel_preview_source(&mut self, source: ChannelPreviewSource) {
+        self.channel_canvas.source = source;
+        self.channel_canvas.invalidate();
+    }
+
+    /// What the preview would honestly draw right now.
+    pub fn channel_preview(&self) -> ChannelPreview {
+        resolve_preview(
+            self.channel_canvas.source,
+            self.document.active(),
+            self.document.draft(),
+            self.snapshot().as_deref(),
+        )
+    }
+
+    pub fn channel_colour_draft(&self) -> [u8; 3] {
+        self.channel_colour_draft
+    }
+
+    pub fn set_channel_colour_draft(&mut self, rgb: [u8; 3]) {
+        self.channel_colour_draft = rgb;
+    }
+
+    pub fn set_selected_channel_rgb(&mut self, red: u8, green: u8, blue: u8) {
+        self.channel_colour_draft = [red, green, blue];
+        self.dispatch_document(DocumentCommand::SetSelectedChannelColor(
+            crate::document::custom_color(red, green, blue),
+        ));
+        self.channel_canvas.invalidate();
+    }
+
+    pub fn set_selected_channel_automatic_colour(&mut self) {
+        self.dispatch_document(DocumentCommand::SetSelectedChannelColor(
+            crate::sim::experiment_model::DisplayColor::Auto,
+        ));
+        self.channel_canvas.invalidate();
     }
 
     pub fn tiling_canvas(&self) -> &TilingCanvasState {
@@ -411,12 +506,12 @@ impl CellariumGui {
         self.tiling_canvas.neighbor_copies()
     }
 
-    pub fn tiling_notice(&self) -> Option<&str> {
-        self.tiling_notice.as_deref()
+    pub fn notice(&self) -> Option<&str> {
+        self.notice.as_deref()
     }
 
-    pub fn set_tiling_notice(&mut self, notice: Option<String>) {
-        self.tiling_notice = notice;
+    pub fn set_notice(&mut self, notice: Option<String>) {
+        self.notice = notice;
     }
 
     pub fn seam_proposals(&self) -> Option<&[SeamProposal]> {
@@ -424,14 +519,14 @@ impl CellariumGui {
     }
 
     pub fn set_seam_proposals(&mut self, proposals: Vec<SeamProposal>) {
-        self.tiling_notice = (proposals.is_empty())
+        self.notice = (proposals.is_empty())
             .then(|| "no full-edge pairs are close enough to glue".to_string());
         self.seam_proposals = Some(proposals);
     }
 
     pub fn clear_seam_proposals(&mut self) {
         self.seam_proposals = None;
-        self.tiling_notice = None;
+        self.notice = None;
     }
 
     /// Hold the proposed seams. Subsequent vertex drags move whole equivalence
@@ -443,14 +538,14 @@ impl CellariumGui {
                 .map(|proposal| proposal.constraint)
                 .collect();
         }
-        self.tiling_notice = None;
+        self.notice = None;
     }
 
     /// Run one document command, reporting a rejection instead of applying it.
     pub fn dispatch_document(&mut self, command: DocumentCommand) {
         match self.document.execute(command) {
-            Ok(_) => self.tiling_notice = None,
-            Err(error) => self.tiling_notice = Some(error.to_string()),
+            Ok(_) => self.notice = None,
+            Err(error) => self.notice = Some(error.to_string()),
         }
     }
 
@@ -459,7 +554,7 @@ impl CellariumGui {
         let vertices = self.tiling_canvas.construction().to_vec();
         let target = self.tiling_canvas.target;
         self.dispatch_document(DocumentCommand::FinishTilingPolygon { vertices, target });
-        if self.tiling_notice.is_none() {
+        if self.notice.is_none() {
             self.tiling_canvas.cancel();
             self.tiling_canvas.selected_prototype = self.document.selection().prototype;
             self.tiling_canvas.selected_basis = Some(self.document.selection().basis);

@@ -145,7 +145,7 @@ fn seams(app: &mut CellariumGui, ui: &mut Ui) {
     {
         match propose_full_edge_seams(&draft, SEAM_TOLERANCE) {
             Ok(proposals) => app.set_seam_proposals(proposals),
-            Err(reason) => app.set_tiling_notice(Some(reason)),
+            Err(reason) => app.set_notice(Some(reason)),
         }
     }
     let accepted = app.tiling_canvas().seams.len();
@@ -261,7 +261,7 @@ fn proposal_bar(app: &mut CellariumGui, ui: &mut Ui, count: usize, residual: f64
 }
 
 fn readout(app: &CellariumGui, ui: &mut Ui, hovered: Option<crate::sim::tiling::Vec2>) {
-    if let Some(notice) = app.tiling_notice() {
+    if let Some(notice) = app.notice() {
         ui.add(
             egui::Label::new(
                 RichText::new(notice).color(theme::state_color(theme::State::Invalid)),

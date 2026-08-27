@@ -1,5 +1,5 @@
 pub mod camera_fit;
-mod channel_editor;
+pub mod channel_editor;
 mod command;
 pub mod decision;
 mod experiment_editor;

@@ -1,3 +1,4 @@
+pub mod channels;
 pub mod tiling;
 pub mod transform;
 pub mod world;
