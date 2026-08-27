@@ -1,4 +1,6 @@
 pub mod app;
+pub mod cli;
+pub mod gui;
 pub mod input;
 pub mod remote;
 pub mod render;

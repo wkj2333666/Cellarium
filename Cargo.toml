@@ -20,9 +20,14 @@ robust = "1"
 serde = { version = "1", features = ["derive"] }
 thiserror = "2"
 unicode-width = "0.2"
+eframe = { version = "0.36.1", features = ["persistence"] }
+wgpu = "30.0.1"
+bytemuck = "1.25.2"
+pollster = "1.0.1"
 
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 [dev-dependencies]
+egui_kittest = { version = "0.36.1", features = ["wgpu", "snapshot", "eframe"] }
 libc = "0.2"
