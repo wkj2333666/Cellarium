@@ -28,13 +28,15 @@ pub const INVALID: Color32 = Color32::from_rgb(226, 74, 74);
 pub const STALE: Color32 = Color32::from_rgb(226, 178, 66);
 
 /// Color is never the only state indicator; each state also carries this glyph
-/// so the interface stays readable without color discrimination.
+/// so the interface stays readable without color discrimination. The glyphs stay
+/// inside Latin-1 because egui's bundled proportional font has no coverage for
+/// geometric shapes such as U+25CF, which draw as a missing-glyph box.
 pub fn state_glyph(state: State) -> &'static str {
     match state {
-        State::Draft => "◐",
-        State::Live => "●",
-        State::Invalid => "✖",
-        State::Stale => "◌",
+        State::Draft => "»",
+        State::Live => "•",
+        State::Invalid => "×",
+        State::Stale => "·",
     }
 }
 
@@ -58,6 +60,21 @@ pub enum State {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// egui's bundled proportional font covers Latin-1 plus a small set of
+    /// punctuation. A glyph outside that coverage draws as a missing-glyph box,
+    /// which reads as an unexplained mark in the interface.
+    #[test]
+    fn every_glyph_stays_within_the_bundled_font_coverage() {
+        for state in [State::Draft, State::Live, State::Invalid, State::Stale] {
+            for character in state_glyph(state).chars() {
+                assert!(
+                    (character as u32) <= 0x2022,
+                    "glyph {character:?} for {state:?} is outside the covered range"
+                );
+            }
+        }
+    }
 
     #[test]
     fn every_state_has_a_distinct_glyph_and_color() {
