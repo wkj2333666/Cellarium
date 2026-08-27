@@ -7,6 +7,7 @@ pub mod growth_graph;
 mod history;
 pub mod kernel_editor;
 pub mod numeric_editor;
+pub mod object_strip;
 mod state;
 mod text_buffer;
 pub mod tiling_editor;
