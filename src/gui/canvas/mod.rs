@@ -1,4 +1,5 @@
 pub mod channels;
+pub mod kernel;
 pub mod tiling;
 pub mod transform;
 pub mod world;

@@ -4,14 +4,18 @@ use crate::document::{DocumentCommand, DocumentController};
 use crate::gui::canvas::channels::{
     ChannelCanvasState, ChannelPreview, ChannelPreviewSource, ChannelView, resolve_preview,
 };
+use crate::gui::canvas::kernel::{KernelCanvasState, KernelEdit, KernelStencil};
 use crate::gui::canvas::tiling::TilingCanvasState;
 use crate::gui::canvas::world::WorldCanvasState;
 use crate::gui::layout;
 use crate::gui::sections::simulation::SimulationControl;
+use crate::gui::widgets::decision_dialog::Decision;
+use crate::gui::widgets::numeric_popover::NumericPopover;
 use crate::sim::backend_selector::{BackendPolicy, BackendSelector};
 use crate::sim::compute_plan::compile_compute_plan;
-use crate::sim::experiment_model::{ChannelId, ExperimentSpec};
+use crate::sim::experiment_model::{ChannelId, ExperimentSpec, KernelId};
 use crate::sim::local_backend::{BackendProbe, initial_cells};
+use crate::sim::ruleset::BindingKey;
 use crate::sim::tiling::SeamProposal;
 use crate::sim::worker::{
     BackendFallback, SimulationCommand, SimulationController, SimulationSnapshot,
@@ -179,6 +183,11 @@ pub struct CellariumGui {
     /// Working RGB for the colour popover, so dragging the fields does not
     /// write a new draft on every pixel of movement.
     channel_colour_draft: [u8; 3],
+    kernel_canvas: KernelCanvasState,
+    kernel_popover: NumericPopover,
+    /// A destructive kernel edit waiting for the user's answer, with the
+    /// draft it would produce already computed.
+    kernel_decision: Option<(Decision, Box<ExperimentSpec>)>,
     seam_proposals: Option<Vec<SeamProposal>>,
     notice: Option<String>,
     randomize_seed: u64,
@@ -249,6 +258,9 @@ impl CellariumGui {
             tiling_canvas: TilingCanvasState::default(),
             channel_canvas: ChannelCanvasState::default(),
             channel_colour_draft: [236, 240, 246],
+            kernel_canvas: KernelCanvasState::new(),
+            kernel_popover: NumericPopover::default(),
+            kernel_decision: None,
             seam_proposals: None,
             notice: None,
             randomize_seed: 0x2545_F491_4F6C_DD1D,
@@ -409,6 +421,191 @@ impl CellariumGui {
             .as_ref()
             .expect("a worker must be running")
             .wait_for(predicate)
+    }
+
+    /// The growth program of the selected binding.
+    pub fn growth_source(&self) -> String {
+        let binding = self.selected_binding();
+        crate::document::growth::source_of(self.spec(), binding).unwrap_or_default()
+    }
+
+    pub fn set_growth_source(&mut self, source: impl Into<String>) {
+        let binding = self.selected_binding();
+        match crate::document::growth::set_source(self.spec(), binding, &source.into()) {
+            Ok(spec) => self.dispatch_document(DocumentCommand::ReplaceExperiment(Box::new(spec))),
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
+    pub fn kernel_canvas(&self) -> &KernelCanvasState {
+        &self.kernel_canvas
+    }
+
+    pub fn kernel_canvas_mut(&mut self) -> &mut KernelCanvasState {
+        &mut self.kernel_canvas
+    }
+
+    pub fn kernel_popover(&self) -> &NumericPopover {
+        &self.kernel_popover
+    }
+
+    pub fn kernel_popover_mut(&mut self) -> &mut NumericPopover {
+        &mut self.kernel_popover
+    }
+
+    /// The binding the editors are working on: one basis, one output channel.
+    pub fn selected_binding(&self) -> BindingKey {
+        let selection = self.document.selection();
+        BindingKey {
+            basis: selection.basis,
+            output: selection.channel,
+        }
+    }
+
+    pub fn selected_kernel(&self) -> Option<KernelId> {
+        self.document.selection().kernel
+    }
+
+    pub fn kernel_cards(&self) -> Vec<crate::document::kernels::KernelCardModel> {
+        crate::document::kernels::binding_kernels(
+            self.spec(),
+            self.selected_binding(),
+            self.selected_kernel(),
+        )
+    }
+
+    pub fn select_kernel(&mut self, kernel: KernelId) {
+        self.dispatch_document(DocumentCommand::SelectKernel(kernel));
+        // A different kernel is a different stencil, so the view refits rather
+        // than keeping a zoom that framed the previous one.
+        self.kernel_canvas.selected_cell = None;
+        self.kernel_canvas.request_fit();
+    }
+
+    pub fn add_kernel(&mut self) {
+        let binding = self.selected_binding();
+        match crate::document::kernels::add_kernel(self.spec(), binding) {
+            Ok((spec, id)) => {
+                self.dispatch_document(DocumentCommand::ReplaceExperiment(Box::new(spec)));
+                if self.notice.is_none() {
+                    // A kernel the user just added is the one they want to
+                    // edit, so it is selected without a second click.
+                    self.select_kernel(id);
+                }
+            }
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
+    /// Work out what deleting a kernel would do and, if it would rewrite the
+    /// growth program, ask before doing it.
+    pub fn begin_kernel_removal(&mut self, kernel: KernelId) {
+        let binding = self.selected_binding();
+        let symbol = self
+            .kernel_cards()
+            .into_iter()
+            .find(|card| card.id == kernel)
+            .map(|card| card.symbol)
+            .unwrap_or_else(|| format!("k{}", kernel.0));
+        match crate::document::kernels::plan_removal(self.spec(), binding, kernel) {
+            Ok(plan) => match plan.rewrite {
+                Some(rewrite) => {
+                    self.kernel_decision = Some((
+                        Decision {
+                            title: format!("Delete kernel {symbol}"),
+                            summary: format!(
+                                "The growth program uses {symbol}. Deleting it replaces that reference with 0."
+                            ),
+                            diff: Some(crate::gui::widgets::decision_dialog::DecisionDiff {
+                                caption: "Growth source".into(),
+                                before: rewrite.before,
+                                after: rewrite.after,
+                            }),
+                            confirm: "Replace references with 0 and remove".into(),
+                            confirm_hint:
+                                "Remove the kernel and rewrite the growth program as shown".into(),
+                        },
+                        Box::new(plan.spec),
+                    ));
+                }
+                None => {
+                    self.dispatch_document(DocumentCommand::ReplaceExperiment(Box::new(plan.spec)))
+                }
+            },
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
+    pub fn kernel_decision(&self) -> Option<&Decision> {
+        self.kernel_decision.as_ref().map(|(decision, _)| decision)
+    }
+
+    pub fn confirm_kernel_decision(&mut self) {
+        if let Some((_, spec)) = self.kernel_decision.take() {
+            // The kernel removal and the source rewrite were computed together
+            // and are committed together, so the draft is never half-edited.
+            self.dispatch_document(DocumentCommand::ReplaceExperiment(spec));
+        }
+    }
+
+    pub fn cancel_kernel_decision(&mut self) {
+        self.kernel_decision = None;
+    }
+
+    /// The stencil of the selected kernel, flattened for the canvas.
+    pub fn kernel_stencil(&self) -> KernelStencil {
+        let binding = self.selected_binding();
+        let Some(kernel) = self.selected_kernel() else {
+            return KernelStencil::default();
+        };
+        crate::document::kernels::stencil_of(self.spec(), binding, kernel, binding.basis)
+            .unwrap_or_default()
+    }
+
+    pub fn apply_kernel_edit(&mut self, edit: KernelEdit) {
+        let binding = self.selected_binding();
+        let Some(kernel) = self.selected_kernel() else {
+            return;
+        };
+        let result = match edit {
+            KernelEdit::Weight { x, y, value } => crate::document::kernels::set_weight(
+                self.spec(),
+                binding,
+                kernel,
+                binding.basis,
+                x,
+                y,
+                value,
+            ),
+            KernelEdit::Active { x, y, active } => crate::document::kernels::set_active(
+                self.spec(),
+                binding,
+                kernel,
+                binding.basis,
+                x,
+                y,
+                active,
+            ),
+        };
+        match result {
+            Ok(spec) => self.dispatch_document(DocumentCommand::ReplaceExperiment(Box::new(spec))),
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
+    pub fn set_kernel_source(&mut self, kernel: KernelId, source: ChannelId) {
+        let binding = self.selected_binding();
+        match crate::document::kernels::set_source(self.spec(), binding, kernel, source) {
+            Ok(spec) => self.dispatch_document(DocumentCommand::ReplaceExperiment(Box::new(spec))),
+            Err(error) => self.notice = Some(error),
+        }
+    }
+
+    pub fn reset_rule_set(&mut self) {
+        let binding = self.selected_binding();
+        self.dispatch_document(DocumentCommand::Draft(Box::new(
+            crate::workbench::DraftCommand::ResetRuleSetToDefault { binding },
+        )));
     }
 
     pub fn channel_canvas(&self) -> &ChannelCanvasState {

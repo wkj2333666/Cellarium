@@ -141,11 +141,7 @@ fn every_preset_card_installs_its_own_unit_cell() {
     ] {
         let mut gui = tiling_gui_blank();
         click(&mut gui, label);
-        assert_eq!(
-            gui.state().notice(),
-            None,
-            "{label} must be accepted"
-        );
+        assert_eq!(gui.state().notice(), None, "{label} must be accepted");
         assert_eq!(
             gui.state().draft_basis_count(),
             bases,

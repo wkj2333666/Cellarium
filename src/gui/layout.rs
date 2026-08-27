@@ -133,6 +133,7 @@ fn workspace(app: &mut CellariumGui, ui: &mut Ui) {
             Section::Simulation => return crate::gui::sections::simulation::draw(app, ui),
             Section::Tiling => return crate::gui::sections::tiling::draw(app, ui),
             Section::Channels => return crate::gui::sections::channels::draw(app, ui),
+            Section::Kernels => return crate::gui::sections::kernels::draw(app, ui),
             _ => {}
         }
         ui.heading(section.label());

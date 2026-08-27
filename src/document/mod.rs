@@ -6,6 +6,8 @@
 //! transactions.
 
 pub mod channels;
+pub mod growth;
+pub mod kernels;
 pub mod selection;
 pub mod tiling;
 
@@ -91,6 +93,10 @@ pub enum DocumentCommand {
     /// Store a tiling the canvas produced directly, such as a dragged vertex or
     /// an accepted seam solve.
     SetTilingDraft(Box<PeriodicTilingDraft>),
+    /// Commit a whole experiment computed by a pure transform. The transform
+    /// has already worked out every consequence, so this lands as one
+    /// undoable step rather than a sequence a failure could interrupt.
+    ReplaceExperiment(Box<ExperimentSpec>),
     /// Escape hatch for the existing kernel and value level edits.
     Draft(Box<DraftCommand>),
 }
@@ -315,6 +321,10 @@ impl DocumentController {
                 next.tiling = Some(*draft);
                 self.transact(next, |_| {})?;
                 Ok(self.record(vec![Affected::Tiling]))
+            }
+            DocumentCommand::ReplaceExperiment(spec) => {
+                self.transact(*spec, |_| {})?;
+                Ok(self.record(vec![Affected::Kernels, Affected::Selection]))
             }
             DocumentCommand::Draft(command) => {
                 self.draft_command(*command)?;
