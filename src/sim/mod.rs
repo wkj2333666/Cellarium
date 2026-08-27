@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod backend_error;
+pub mod backend_selector;
 pub mod basis_kernel;
 pub mod basis_runtime;
 pub mod compute_plan;

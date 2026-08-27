@@ -76,11 +76,33 @@ fn inspector(app: &mut CellariumGui, ui: &mut Ui) {
                 }
             });
             ui.separator();
-            egui::ScrollArea::vertical().show(ui, |ui| match app.inspector_tab() {
-                InspectorTab::Properties => properties(app, ui),
-                InspectorTab::Help => help(app, ui),
+            egui::ScrollArea::vertical().show(ui, |ui| {
+                if app.backend_panel_open() {
+                    backend(app, ui);
+                    ui.separator();
+                }
+                match app.inspector_tab() {
+                    InspectorTab::Properties => properties(app, ui),
+                    InspectorTab::Help => help(app, ui),
+                }
             });
         });
+}
+
+fn backend(app: &mut CellariumGui, ui: &mut Ui) {
+    let status = app.status();
+    let choice = crate::gui::widgets::backend_picker(
+        ui,
+        crate::gui::widgets::BackendPickerModel {
+            policy: app.backend_policy(),
+            probes: app.probes(),
+            active: Some(status.backend.as_str()),
+            notice: status.notice.as_deref(),
+        },
+    );
+    if let Some(crate::gui::widgets::BackendChoice::Select(policy)) = choice {
+        app.select_backend(policy);
+    }
 }
 
 fn properties(app: &CellariumGui, ui: &mut Ui) {

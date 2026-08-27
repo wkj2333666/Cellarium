@@ -704,6 +704,73 @@ impl CudaBasisExperimentBackend {
         })
     }
 
+    /// Replace the device-resident state.
+    fn upload(&mut self, cells: &[f32]) -> Result<(), BackendError> {
+        if cells.len() != self.width * self.height * self.bases * self.channels {
+            return Err(BackendError::InvalidWorld);
+        }
+        self.stream.memcpy_htod(cells, &mut self.current)?;
+        self.stream.synchronize()?;
+        Ok(())
+    }
+
+    /// Read the device-resident state back to the host.
+    fn download(&mut self) -> Result<Vec<f32>, BackendError> {
+        let cells = self.stream.clone_dtoh(&self.current)?;
+        self.stream.synchronize()?;
+        Ok(cells)
+    }
+
+    /// Advance without touching host memory.
+    ///
+    /// The legacy `step` uploads and downloads the whole world every tick. This
+    /// path keeps state on the device across steps and only checks the error
+    /// flag once the requested steps have been launched, which is what makes a
+    /// GPU backend worth using.
+    fn launch_steps(&mut self, steps: u32) -> Result<(), BackendError> {
+        if steps == 0 {
+            return Ok(());
+        }
+        self.stream.memcpy_htod(&[0_i32], &mut self.error_flag)?;
+        let width = self.width as i32;
+        let height = self.height as i32;
+        let bases = self.bases as i32;
+        let channels = self.channels as i32;
+        let boundary = self.boundary_mode;
+        let total = (self.width * self.height * self.bases * self.channels) as u32;
+        for _ in 0..steps {
+            unsafe {
+                self.stream
+                    .launch_builder(&self.function)
+                    .arg(&mut self.next)
+                    .arg(&self.current)
+                    .arg(&self.kernel_offsets)
+                    .arg(&self.weight_dx)
+                    .arg(&self.weight_dy)
+                    .arg(&self.weight_source_bases)
+                    .arg(&self.weight_values)
+                    .arg(&self.kernel_sources)
+                    .arg(&self.kernel_constants)
+                    .arg(&mut self.error_flag)
+                    .arg(&width)
+                    .arg(&height)
+                    .arg(&bases)
+                    .arg(&channels)
+                    .arg(&boundary)
+                    .arg(&self.dt)
+                    .launch(LaunchConfig::for_num_elems(total))
+            }?;
+            std::mem::swap(&mut self.current, &mut self.next);
+            self.tick += 1;
+        }
+        let error = self.stream.clone_dtoh(&self.error_flag)?;
+        self.stream.synchronize()?;
+        if error.first().copied().unwrap_or(1) != 0 {
+            return Err(BackendError::Runtime(RuntimeError::NonFiniteState));
+        }
+        Ok(())
+    }
+
     fn step(&mut self, world: &mut ChannelWorld) -> Result<(), BackendError> {
         if world.width() != self.width
             || world.height() != self.height
@@ -865,6 +932,145 @@ extern "C" __device__ float cellarium_convolve(const float* current, const float
     for (int ky = 0; ky < heights[input]; ++ky) for (int kx = 0; kx < widths[input]; ++kx) { int ki = offsets[input] + ky * widths[input] + kx; if (!masks[ki]) continue; int valid_x = 1; int valid_y = 1; int nx = cellarium_index(x + kx - anchors_x[input], width, boundary_mode, &valid_x); int ny = cellarium_index(y + ky - anchors_y[input], height, boundary_mode, &valid_y); float sample = (valid_x && valid_y) ? current[sources[input] * width * height + ny * width + nx] : (boundary_mode == 1 ? constants[sources[input]] : 0.0f); result += values[ki] * sample; } return result;
 }
 "#;
+
+/// Adapter exposing the CUDA path through the local backend contract.
+///
+/// State stays on the device between steps; the host reads back only for
+/// snapshots, edits and recovery.
+pub struct CudaLocalBackend {
+    descriptor: crate::sim::local_backend::BackendDescriptor,
+    inner: CudaBasisExperimentBackend,
+    layout: crate::sim::basis_runtime::StateLayout,
+}
+
+impl CudaLocalBackend {
+    pub fn new(
+        plan: &crate::sim::compute_plan::ComputePlan,
+        initial: &[f32],
+    ) -> Result<Self, crate::sim::local_backend::BackendFailure> {
+        use crate::sim::local_backend::BackendFailure;
+        let compiled = crate::sim::basis_runtime::CompiledBasisExperiment::from_plan(plan);
+        let mut inner = CudaBasisExperimentBackend::new(&compiled)
+            .map_err(|error| BackendFailure::Unsupported(error.to_string()))?;
+        inner
+            .upload(initial)
+            .map_err(|error| BackendFailure::State(error.to_string()))?;
+        let device_name = shared_context()
+            .ok()
+            .and_then(|context| context.name().ok())
+            .unwrap_or_else(|| "CUDA device".to_string());
+        Ok(Self {
+            descriptor: crate::sim::local_backend::BackendDescriptor {
+                kind: crate::sim::local_backend::BackendKind::Cuda,
+                device_name,
+            },
+            inner,
+            layout: plan.layout.clone(),
+        })
+    }
+
+    /// Report whether CUDA can run this plan on this machine.
+    pub fn probe(
+        plan: &crate::sim::compute_plan::ComputePlan,
+    ) -> crate::sim::local_backend::BackendProbe {
+        use crate::sim::local_backend::{BackendKind, BackendProbe, GpuDeviceType};
+        let context = match shared_context() {
+            Ok(context) => context,
+            Err(error) => return BackendProbe::unavailable(BackendKind::Cuda, error.to_string()),
+        };
+        let name = context.name().unwrap_or_else(|_| "CUDA device".to_string());
+        let compiled = crate::sim::basis_runtime::CompiledBasisExperiment::from_plan(plan);
+        match generate_basis_cuda_source(&compiled) {
+            Ok(_) => BackendProbe::available(BackendKind::Cuda, name, GpuDeviceType::Discrete),
+            Err(error) => BackendProbe::unavailable(BackendKind::Cuda, error.to_string()),
+        }
+    }
+}
+
+impl crate::sim::local_backend::LocalBackend for CudaLocalBackend {
+    fn descriptor(&self) -> &crate::sim::local_backend::BackendDescriptor {
+        &self.descriptor
+    }
+
+    fn tick(&self) -> u64 {
+        self.inner.tick
+    }
+
+    fn set_running_state(
+        &mut self,
+        state: &crate::sim::local_backend::WorldSnapshot,
+    ) -> Result<(), crate::sim::local_backend::BackendFailure> {
+        use crate::sim::local_backend::BackendFailure;
+        if state.layout != self.layout {
+            return Err(BackendFailure::State(
+                "snapshot layout does not match the compiled plan".into(),
+            ));
+        }
+        self.inner
+            .upload(&state.cells)
+            .map_err(|error| BackendFailure::State(error.to_string()))
+    }
+
+    fn apply_edits(
+        &mut self,
+        edits: &[crate::sim::local_backend::WorldEdit],
+    ) -> Result<(), crate::sim::local_backend::BackendFailure> {
+        use crate::sim::local_backend::BackendFailure;
+        if edits.is_empty() {
+            return Ok(());
+        }
+        let mut cells = self
+            .inner
+            .download()
+            .map_err(|error| BackendFailure::State(error.to_string()))?;
+        for edit in edits {
+            let index = self
+                .layout
+                .index_by_position(edit.channel, edit.x, edit.y, edit.basis)
+                .ok_or_else(|| {
+                    BackendFailure::State(format!(
+                        "edit at channel {} basis {} ({}, {}) is outside the world",
+                        edit.channel, edit.basis, edit.x, edit.y
+                    ))
+                })?;
+            cells[index] = edit.value;
+        }
+        self.inner
+            .upload(&cells)
+            .map_err(|error| BackendFailure::State(error.to_string()))
+    }
+
+    fn step(
+        &mut self,
+        steps: u32,
+    ) -> Result<crate::sim::local_backend::StepStats, crate::sim::local_backend::BackendFailure>
+    {
+        use crate::sim::local_backend::{BackendFailure, StepStats};
+        let started = std::time::Instant::now();
+        self.inner
+            .launch_steps(steps)
+            .map_err(|error| BackendFailure::Step(error.to_string()))?;
+        Ok(StepStats {
+            steps,
+            elapsed_micros: started.elapsed().as_micros() as u64,
+        })
+    }
+
+    fn readback(
+        &mut self,
+    ) -> Result<crate::sim::local_backend::WorldSnapshot, crate::sim::local_backend::BackendFailure>
+    {
+        use crate::sim::local_backend::{BackendFailure, WorldSnapshot};
+        let cells = self
+            .inner
+            .download()
+            .map_err(|error| BackendFailure::Step(error.to_string()))?;
+        Ok(WorldSnapshot {
+            layout: self.layout.clone(),
+            cells: std::sync::Arc::from(cells),
+        })
+    }
+}
 
 #[cfg(test)]
 mod tests {

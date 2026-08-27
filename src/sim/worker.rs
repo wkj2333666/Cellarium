@@ -9,9 +9,11 @@ use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant};
 
+use crate::sim::backend_selector::{BackendPolicy, BackendSelector, Candidate};
 use crate::sim::basis_runtime::StateLayout;
+use crate::sim::compute_plan::ComputePlan;
 use crate::sim::local_backend::{
-    BackendDescriptor, BackendFailure, LocalBackend, StepStats, WorldEdit,
+    BackendDescriptor, BackendFailure, LocalBackend, StepStats, WorldEdit, WorldSnapshot,
 };
 
 /// What the worker is asked to do. Commands are ordered and never dropped.
@@ -50,6 +52,52 @@ pub enum ControllerError {
     WorkerStopped,
 }
 
+/// Rebuilds a backend on the next Auto candidate after a recoverable failure.
+///
+/// Only Auto falls through. An explicit requirement pauses instead, because
+/// silently running on a different kind than the user asked for would make the
+/// backend readout a lie.
+pub struct BackendFallback {
+    plan: Arc<ComputePlan>,
+    candidates: Vec<Candidate>,
+    index: usize,
+    policy: BackendPolicy,
+}
+
+impl BackendFallback {
+    pub fn new(plan: Arc<ComputePlan>, candidates: Vec<Candidate>, policy: BackendPolicy) -> Self {
+        Self {
+            plan,
+            candidates,
+            index: 0,
+            policy,
+        }
+    }
+
+    fn may_fall_through(&self) -> bool {
+        self.policy == BackendPolicy::Auto
+    }
+
+    /// Build the next candidate from a known-good state.
+    fn next(&mut self, state: &WorldSnapshot) -> Option<(Box<dyn LocalBackend>, String)> {
+        if !self.may_fall_through() {
+            return None;
+        }
+        while self.index + 1 < self.candidates.len() {
+            self.index += 1;
+            let candidate = self.candidates[self.index].clone();
+            if let Ok((mut backend, _)) =
+                BackendSelector::build(&[candidate], &self.plan, &state.cells)
+                && backend.set_running_state(state).is_ok()
+            {
+                let summary = backend.descriptor().summary();
+                return Some((backend, summary));
+            }
+        }
+        None
+    }
+}
+
 /// GUI-side handle to the worker.
 pub struct SimulationController {
     commands: Sender<SimulationCommand>,
@@ -61,7 +109,16 @@ pub struct SimulationController {
 impl SimulationController {
     /// Start a worker owning `backend` and publish its first snapshot before
     /// returning, so the GUI always has something valid to draw.
-    pub fn spawn(mut backend: Box<dyn LocalBackend>) -> Result<Self, BackendFailure> {
+    pub fn spawn(backend: Box<dyn LocalBackend>) -> Result<Self, BackendFailure> {
+        Self::spawn_with_fallback(backend, None)
+    }
+
+    /// Start a worker that can rebuild on the next Auto candidate if the
+    /// running backend fails.
+    pub fn spawn_with_fallback(
+        mut backend: Box<dyn LocalBackend>,
+        fallback: Option<BackendFallback>,
+    ) -> Result<Self, BackendFailure> {
         let first = snapshot_of(backend.as_mut(), 0, false, StepStats::default(), None)?;
         let latest = Arc::new(RwLock::new(Arc::new(first)));
         let published = Arc::new(AtomicU64::new(1));
@@ -71,7 +128,7 @@ impl SimulationController {
         let worker = std::thread::Builder::new()
             .name("cellarium-simulation".into())
             .spawn(move || {
-                run_worker(backend, inbox, worker_latest, worker_published);
+                run_worker(backend, fallback, inbox, worker_latest, worker_published);
             })
             .map_err(|error| BackendFailure::Unsupported(error.to_string()))?;
         Ok(Self {
@@ -151,6 +208,7 @@ impl Drop for SimulationController {
 
 fn run_worker(
     mut backend: Box<dyn LocalBackend>,
+    mut fallback: Option<BackendFallback>,
     inbox: Receiver<SimulationCommand>,
     latest: Arc<RwLock<Arc<SimulationSnapshot>>>,
     published: Arc<AtomicU64>,
@@ -159,6 +217,9 @@ fn run_worker(
     let mut generation = 1;
     let mut error = None;
     let initial = backend.readback().ok();
+    // The last state the running backend confirmed. A replacement backend
+    // resumes from here, so at most the unconfirmed in-flight step is lost.
+    let mut confirmed = initial.clone();
 
     loop {
         // Drain every pending command before scheduling more work, so a pause
@@ -191,13 +252,19 @@ fn run_worker(
                 SimulationCommand::Step(steps) => match backend.step(steps) {
                     Ok(step_stats) => {
                         stats = step_stats;
+                        confirmed = backend.readback().ok().or(confirmed);
                         publish = true;
                     }
                     Err(failure) => {
-                        running = false;
-                        error = Some(RuntimeNotice {
-                            message: failure.to_string(),
-                        });
+                        match recover(&mut backend, &mut fallback, &confirmed, &failure) {
+                            Some(notice) => error = Some(notice),
+                            None => {
+                                running = false;
+                                error = Some(RuntimeNotice {
+                                    message: failure.to_string(),
+                                });
+                            }
+                        }
                         publish = true;
                     }
                 },
@@ -226,13 +293,21 @@ fn run_worker(
             match backend.step(1) {
                 Ok(step_stats) => {
                     stats = step_stats;
+                    confirmed = backend.readback().ok().or(confirmed);
                     publish = true;
                 }
                 Err(failure) => {
-                    running = false;
-                    error = Some(RuntimeNotice {
-                        message: failure.to_string(),
-                    });
+                    // A recoverable failure rebuilds on the next candidate and
+                    // keeps the user's running state; otherwise pause and report.
+                    match recover(&mut backend, &mut fallback, &confirmed, &failure) {
+                        Some(notice) => error = Some(notice),
+                        None => {
+                            running = false;
+                            error = Some(RuntimeNotice {
+                                message: failure.to_string(),
+                            });
+                        }
+                    }
                     publish = true;
                 }
             }
@@ -247,6 +322,25 @@ fn run_worker(
             published.fetch_add(1, Ordering::Release);
         }
     }
+}
+
+/// Try to replace a failed backend from the last confirmed state.
+///
+/// Returns the notice to publish when a replacement took over, or None when the
+/// worker must pause instead.
+fn recover(
+    backend: &mut Box<dyn LocalBackend>,
+    fallback: &mut Option<BackendFallback>,
+    confirmed: &Option<WorldSnapshot>,
+    failure: &BackendFailure,
+) -> Option<RuntimeNotice> {
+    let state = confirmed.as_ref()?;
+    let fallback = fallback.as_mut()?;
+    let (replacement, summary) = fallback.next(state)?;
+    *backend = replacement;
+    Some(RuntimeNotice {
+        message: format!("{failure}; continuing on {summary}"),
+    })
 }
 
 fn snapshot_of(
@@ -444,6 +538,133 @@ mod tests {
         controller.send(SimulationCommand::Reset).unwrap();
         let snapshot = controller.wait_for(|state| state.cells[0] == start[0]);
         assert_eq!(snapshot.cells, start);
+    }
+
+    /// A backend that works until it is asked for its Nth step, then fails the
+    /// way a device loss would.
+    struct FailingBackend {
+        descriptor: BackendDescriptor,
+        layout: StateLayout,
+        remaining: u32,
+        tick: u64,
+    }
+
+    impl FailingBackend {
+        fn new(remaining: u32) -> Self {
+            Self {
+                descriptor: BackendDescriptor {
+                    kind: crate::sim::local_backend::BackendKind::Wgpu,
+                    device_name: "flaky device".into(),
+                },
+                // Shaped like the plan the fallback rebuilds against, so a
+                // replacement backend can actually accept this state.
+                layout: StateLayout::new(4, 4, vec![crate::sim::tiling::BasisId(0)], 1).unwrap(),
+                remaining,
+                tick: 0,
+            }
+        }
+    }
+
+    impl LocalBackend for FailingBackend {
+        fn descriptor(&self) -> &BackendDescriptor {
+            &self.descriptor
+        }
+
+        fn tick(&self) -> u64 {
+            self.tick
+        }
+
+        fn set_running_state(&mut self, _state: &WorldSnapshot) -> Result<(), BackendFailure> {
+            Ok(())
+        }
+
+        fn apply_edits(&mut self, _edits: &[WorldEdit]) -> Result<(), BackendFailure> {
+            Ok(())
+        }
+
+        fn step(&mut self, steps: u32) -> Result<StepStats, BackendFailure> {
+            if self.remaining == 0 {
+                return Err(BackendFailure::Step("device lost".into()));
+            }
+            self.remaining -= 1;
+            self.tick += steps as u64;
+            Ok(StepStats {
+                steps,
+                elapsed_micros: 1,
+            })
+        }
+
+        fn readback(&mut self) -> Result<WorldSnapshot, BackendFailure> {
+            Ok(WorldSnapshot {
+                layout: self.layout.clone(),
+                cells: Arc::from(vec![0.25; 16]),
+            })
+        }
+    }
+
+    fn tiny_plan() -> (crate::sim::compute_plan::ComputePlan, Vec<f32>) {
+        let spec = ExperimentSpec::single_channel_lenia(4, 4)
+            .normalize_rules()
+            .unwrap();
+        let plan = compile_compute_plan(&spec).unwrap();
+        let cells = initial_cells(&plan, &spec);
+        (plan, cells)
+    }
+
+    #[test]
+    fn a_failed_backend_hands_over_to_the_next_auto_candidate_and_keeps_running() {
+        use crate::sim::backend_selector::{BackendPolicy, Candidate};
+        let (plan, _) = tiny_plan();
+        let fallback = crate::sim::worker::BackendFallback::new(
+            Arc::new(plan),
+            vec![Candidate::Wgpu("flaky device".into()), Candidate::Cpu],
+            BackendPolicy::Auto,
+        );
+        let controller = SimulationController::spawn_with_fallback(
+            Box::new(FailingBackend::new(1)),
+            Some(fallback),
+        )
+        .unwrap();
+
+        controller.send(SimulationCommand::Step(1)).unwrap();
+        controller.send(SimulationCommand::Step(1)).unwrap();
+        let snapshot = controller.wait_for(|state| state.error.is_some());
+        let notice = snapshot.error.clone().unwrap().message;
+        assert!(notice.contains("device lost"), "{notice}");
+        assert!(notice.contains("CPU"), "{notice}");
+        assert_eq!(
+            snapshot.backend.kind,
+            crate::sim::local_backend::BackendKind::Cpu
+        );
+    }
+
+    #[test]
+    fn an_explicit_requirement_pauses_instead_of_changing_backend_kind() {
+        use crate::sim::backend_selector::{BackendPolicy, Candidate};
+        let (plan, _) = tiny_plan();
+        let fallback = crate::sim::worker::BackendFallback::new(
+            Arc::new(plan),
+            vec![Candidate::Wgpu("flaky device".into()), Candidate::Cpu],
+            BackendPolicy::RequireWgpu { adapter: None },
+        );
+        let controller = SimulationController::spawn_with_fallback(
+            Box::new(FailingBackend::new(0)),
+            Some(fallback),
+        )
+        .unwrap();
+
+        controller
+            .send(SimulationCommand::SetRunning(true))
+            .unwrap();
+        let snapshot = controller.wait_for(|state| state.error.is_some());
+        assert!(
+            !snapshot.running,
+            "a required backend must pause, not switch"
+        );
+        assert_eq!(
+            snapshot.backend.kind,
+            crate::sim::local_backend::BackendKind::Wgpu
+        );
     }
 
     #[test]

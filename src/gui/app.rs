@@ -2,10 +2,13 @@ use std::sync::Arc;
 
 use crate::document::DocumentController;
 use crate::gui::layout;
+use crate::sim::backend_selector::{BackendPolicy, BackendSelector};
 use crate::sim::compute_plan::compile_compute_plan;
 use crate::sim::experiment_model::ExperimentSpec;
-use crate::sim::local_backend::{CpuBackend, initial_cells};
-use crate::sim::worker::{SimulationCommand, SimulationController, SimulationSnapshot};
+use crate::sim::local_backend::{BackendProbe, initial_cells};
+use crate::sim::worker::{
+    BackendFallback, SimulationCommand, SimulationController, SimulationSnapshot,
+};
 
 /// The six top-level workspaces of the application.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -159,6 +162,10 @@ pub struct CellariumGui {
     document: DocumentController,
     simulation: Option<SimulationController>,
     startup_notice: Option<String>,
+    backend_policy: BackendPolicy,
+    probes: Vec<BackendProbe>,
+    backend_open: bool,
+    fallback_notice: Option<String>,
     navigation: Navigation,
     inspector_tab: InspectorTab,
     last_action: Option<ShellAction>,
@@ -173,11 +180,42 @@ impl CellariumGui {
     /// and fix the problem.
     pub fn new(spec: ExperimentSpec) -> Self {
         let mut app = Self::for_test(spec);
-        match app.start_simulation() {
-            Ok(controller) => app.simulation = Some(controller),
-            Err(reason) => app.startup_notice = Some(reason),
-        }
+        app.restart_simulation();
         app
+    }
+
+    /// Rebuild the worker under the current policy, keeping the window open and
+    /// reporting the reason if nothing can run.
+    pub fn restart_simulation(&mut self) {
+        match self.start_simulation() {
+            Ok(controller) => {
+                self.simulation = Some(controller);
+                self.startup_notice = None;
+            }
+            Err(reason) => {
+                self.simulation = None;
+                self.startup_notice = Some(reason);
+            }
+        }
+    }
+
+    pub fn backend_policy(&self) -> &BackendPolicy {
+        &self.backend_policy
+    }
+
+    pub fn probes(&self) -> &[BackendProbe] {
+        &self.probes
+    }
+
+    pub fn backend_panel_open(&self) -> bool {
+        self.backend_open
+    }
+
+    /// Choose a policy and rebuild on it. A policy with nothing to run on
+    /// leaves the reason in the status bar rather than silently using another.
+    pub fn select_backend(&mut self, policy: BackendPolicy) {
+        self.backend_policy = policy;
+        self.restart_simulation();
     }
 
     /// Construct the model without creating a window, event loop, GPU device or
@@ -187,6 +225,10 @@ impl CellariumGui {
             document: DocumentController::new(spec),
             simulation: None,
             startup_notice: None,
+            backend_policy: BackendPolicy::Auto,
+            probes: Vec::new(),
+            backend_open: false,
+            fallback_notice: None,
             navigation: Navigation::default(),
             inspector_tab: InspectorTab::default(),
             last_action: None,
@@ -194,7 +236,7 @@ impl CellariumGui {
         }
     }
 
-    fn start_simulation(&self) -> Result<SimulationController, String> {
+    fn start_simulation(&mut self) -> Result<SimulationController, String> {
         let normalized = self
             .document
             .draft()
@@ -215,8 +257,32 @@ impl CellariumGui {
                 .join("; ")
         })?;
         let cells = initial_cells(&plan, &normalized);
-        let backend = CpuBackend::new(&plan, &cells).map_err(|error| error.to_string())?;
-        SimulationController::spawn(Box::new(backend)).map_err(|error| error.to_string())
+        let probes = BackendSelector::probe_all(&plan);
+        let candidates = BackendSelector::candidates(self.backend_policy.clone(), probes.clone());
+        self.probes = probes;
+        if candidates.is_empty() {
+            return Err(format!(
+                "no backend satisfies the selected policy: {}",
+                crate::gui::widgets::backend_picker::unavailable_reason(
+                    &self.backend_policy,
+                    &self.probes
+                )
+                .unwrap_or_else(|| "nothing available".into())
+            ));
+        }
+        let plan = std::sync::Arc::new(plan);
+        let (backend, rejected) = BackendSelector::build(&candidates, &plan, &cells)
+            .map_err(|reasons| reasons.join("; "))?;
+        let notice = crate::sim::backend_selector::fallback_notice(&rejected, backend.descriptor());
+        let fallback = BackendFallback::new(
+            std::sync::Arc::clone(&plan),
+            candidates,
+            self.backend_policy.clone(),
+        );
+        let controller = SimulationController::spawn_with_fallback(backend, Some(fallback))
+            .map_err(|error| error.to_string())?;
+        self.fallback_notice = notice;
+        Ok(controller)
     }
 
     pub fn document(&self) -> &DocumentController {
@@ -278,6 +344,10 @@ impl CellariumGui {
             }
             ShellAction::Step => Some(SimulationCommand::Step(1)),
             ShellAction::Reset => Some(SimulationCommand::Reset),
+            ShellAction::Backend => {
+                self.backend_open = !self.backend_open;
+                None
+            }
             _ => None,
         };
         if let (Some(command), Some(simulation)) = (command, self.simulation.as_ref()) {
@@ -294,12 +364,16 @@ impl CellariumGui {
             .as_ref()
             .map(|snapshot| snapshot.backend.summary())
             .unwrap_or_else(|| "no backend".into());
-        let notice = self.startup_notice.clone().or_else(|| {
-            snapshot
-                .as_ref()
-                .and_then(|snapshot| snapshot.error.as_ref())
-                .map(|error| error.message.clone())
-        });
+        let notice = self
+            .startup_notice
+            .clone()
+            .or_else(|| self.fallback_notice.clone())
+            .or_else(|| {
+                snapshot
+                    .as_ref()
+                    .and_then(|snapshot| snapshot.error.as_ref())
+                    .map(|error| error.message.clone())
+            });
         StatusLine {
             backend,
             tick: snapshot.as_ref().map(|snapshot| snapshot.tick).unwrap_or(0),
@@ -387,7 +461,16 @@ mod tests {
     fn a_started_gui_reports_its_backend_and_reaches_the_worker() {
         let mut model = CellariumGui::new(ExperimentSpec::single_channel_lenia(8, 8));
         assert!(model.snapshot().is_some(), "worker should be running");
-        assert!(model.status().backend.starts_with("CPU"));
+        // Auto picks the best backend this machine offers, so assert that the
+        // status names a probed backend rather than assuming which one won.
+        let backend = model.status().backend;
+        assert!(
+            model
+                .probes()
+                .iter()
+                .any(|probe| probe.available && backend.starts_with(probe.kind.label())),
+            "status reported {backend}, which no available probe matches"
+        );
         assert_eq!(model.status().tick, 0);
 
         model.dispatch(ShellAction::Step);
@@ -406,6 +489,14 @@ mod tests {
         let first = simulation.wait_for(|state| state.running && state.tick >= 1);
         let later = simulation.wait_for(|state| state.tick > first.tick);
         assert!(later.tick > first.tick);
+    }
+
+    #[test]
+    fn requiring_the_cpu_runs_on_the_cpu() {
+        let mut model = CellariumGui::new(ExperimentSpec::single_channel_lenia(8, 8));
+        model.select_backend(BackendPolicy::RequireCpu);
+        assert!(model.status().backend.starts_with("CPU"));
+        assert_eq!(*model.backend_policy(), BackendPolicy::RequireCpu);
     }
 
     #[test]
