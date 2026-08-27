@@ -242,10 +242,10 @@ git commit -m "feat: visualize and edit simulation channels"
 ```rust
 #[test]
 fn text_buffer_edits_on_utf8_boundaries_but_growth_identifiers_remain_ascii() {
-    let mut buffer = TextBuffer::new("// 生长\ninner");
+    let mut buffer = TextBuffer::new("// café\ninner");
     buffer.move_end();
     buffer.insert_str(" + self");
-    assert_eq!(buffer.as_str(), "// 生长\ninner + self");
+    assert_eq!(buffer.as_str(), "// café\ninner + self");
     assert!(buffer.cursor_is_char_boundary());
 }
 

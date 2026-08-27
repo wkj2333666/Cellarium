@@ -853,7 +853,7 @@ mod tests {
     #[test]
     fn footer_never_emits_partial_or_overwide_segments() {
         let segments = [
-            "[界面/T] section",
+            "[View/T] section",
             "[Tab] focus",
             "[Ctrl+Enter] Apply & Run",
             "[?] help",
@@ -863,7 +863,7 @@ mod tests {
             assert!(UnicodeWidthStr::width(row.as_str()) <= width);
             assert!(segments.iter().any(|prefix| row.ends_with(prefix)) || row.is_empty());
             let status =
-                truncate_display_width("Workbench · 生长函数 · Dirty · Kitty graphics", width);
+                truncate_display_width("Workbench · Growth · Dirty · Kitty graphics", width);
             assert!(UnicodeWidthStr::width(status.as_str()) <= width);
         }
     }

@@ -299,31 +299,31 @@ mod tests {
     use super::*;
     #[test]
     fn edits_utf8_boundaries() {
-        let mut buffer = TextBuffer::new("// 生长\ninner");
+        let mut buffer = TextBuffer::new("// café\ninner");
         buffer.move_end();
         buffer.insert_str(" + self");
-        assert_eq!(buffer.as_str(), "// 生长\ninner + self");
+        assert_eq!(buffer.as_str(), "// café\ninner + self");
         assert!(buffer.cursor_is_char_boundary());
         buffer.backspace();
-        assert_eq!(buffer.as_str(), "// 生长\ninner + sel");
+        assert_eq!(buffer.as_str(), "// café\ninner + sel");
     }
 
     #[test]
     fn mouse_style_line_column_placement_respects_utf8_boundaries() {
-        let mut buffer = TextBuffer::new("alpha\n生长 + self");
-        buffer.set_cursor_line_column(1, 2);
+        let mut buffer = TextBuffer::new("alpha\ncafé + self");
+        buffer.set_cursor_line_column(1, 4);
         buffer.insert_char('X');
-        assert_eq!(buffer.as_str(), "alpha\n生长X + self");
+        assert_eq!(buffer.as_str(), "alpha\ncaféX + self");
         assert!(buffer.cursor_is_char_boundary());
     }
 
     #[test]
     fn utf8_selection_replaces_the_selected_span_and_tracks_anchor() {
-        let mut buffer = TextBuffer::new("alpha 生长 omega");
+        let mut buffer = TextBuffer::new("alpha café omega");
         buffer.set_cursor_line_column(0, 6);
         buffer.begin_selection();
-        buffer.set_cursor_line_column_extending(0, 8);
-        assert_eq!(buffer.selected_text(), Some("生长"));
+        buffer.set_cursor_line_column_extending(0, 10);
+        assert_eq!(buffer.selected_text(), Some("café"));
         buffer.insert_str("rate");
         assert_eq!(buffer.as_str(), "alpha rate omega");
         assert_eq!(buffer.selection(), None);
@@ -343,12 +343,12 @@ mod tests {
 
     #[test]
     fn select_all_replaces_the_complete_utf8_program() {
-        let mut buffer = TextBuffer::new("if potential > 0.5 { 生长 } else { self }");
+        let mut buffer = TextBuffer::new("if potential > 0.5 { café } else { self }");
 
         buffer.select_all();
         assert_eq!(
             buffer.selected_text(),
-            Some("if potential > 0.5 { 生长 } else { self }")
+            Some("if potential > 0.5 { café } else { self }")
         );
         buffer.insert_str("potential - self");
 

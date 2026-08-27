@@ -1,488 +1,623 @@
-# Cellarium 功能与验收清单
+# Cellarium Feature and Acceptance Inventory
 
-> **迁移说明（2026-08-27）：** 本文主体记录 v0.2.2 TUI 的历史功能事实。
-> 下一主版本已决定迁移到本地 egui/wgpu GUI，并删除 TUI、Kitty/half-block、
-> `server`、`connect`、SSH 和远端协议。第 12、13 节及依赖远程 C/S 的
-> 验收要求已被 `docs/gui-migration-handoff.md` 和 GUI migration spec
-> 取代；数据模型、编辑功能和实验语义仍是迁移等价性清单。
+> **Migration note (2026-08-27):** The body of this document records historical
+> feature facts for the v0.2.2 TUI. The next major version will migrate to a
+> local egui/wgpu GUI and remove the TUI, Kitty/half-block rendering, `server`,
+> `connect`, SSH, and the remote protocol. Sections 12 and 13, together with
+> acceptance requirements that depend on remote client/server operation, are
+> superseded by `docs/gui-migration-handoff.md` and the GUI migration
+> specification. The data model, editing features, and experiment semantics
+> remain the feature-parity inventory for the migration.
 
-> 对应版本：v0.2.2（工作树提交 `271b79e`）
-> 文档性质：产品功能清单、状态核对表、缺陷清单。
-> 本文只把代码中已经存在的能力标为“已实现”；设计稿或口头约定不会冒充成已完成。
+> Reference version: v0.2.2 (worktree commit `271b79e`)
+> Document purpose: product feature inventory, status checklist, and defect list.
+> This document marks a capability as implemented only when it exists in code;
+> designs and verbal agreements must not be presented as completed work.
 
-## 1. 状态标记
+## 1. Status legend
 
-| 标记 | 含义 |
+| Mark | Meaning |
 | --- | --- |
-| ✅ | 已有实现，且至少有自动测试或实际交互证据 |
-| 🧪 | 已有实现，但仍缺完整的真实用户级 agentic 验收 |
-| ⚠️ | 已实现但存在已复现缺陷，不能视为验收通过 |
-| ⏳ | 已确认需求，但尚未完整实现或验证 |
-| ❌ | 明确不支持、已取消，或旧文档中的过时要求 |
+| ✅ | Implemented, with automated-test or actual-interaction evidence |
+| 🧪 | Implemented, but still missing complete real user-level agentic acceptance |
+| ⚠️ | Implemented with a reproduced defect; not accepted |
+| ⏳ | Confirmed requirement, but not fully implemented or verified |
+| ❌ | Explicitly unsupported, cancelled, or obsolete legacy requirement |
 
-## 2. 产品定位和运行方式
+## 2. Product role and launch modes
 
-### 2.1 单一可执行文件
+### 2.1 Single executable
 
-- ✅ 一个 `cellarium` 二进制同时承担本地程序、远端服务器和 C/S 客户端。
-- ✅ `cellarium`：在当前设备直接模拟并渲染。
-- ✅ `cellarium server`：从 stdin/stdout 运行远端协议服务器。
-- ✅ `cellarium connect <ssh-host>`：通过 SSH 启动远端 server，在本机渲染与交互。
-- ✅ `--ssh-command <path>`：指定 SSH 程序，也可用 `CELLARIUM_SSH_COMMAND`。
-- ✅ `--kernel <path>`：直接加载核定义。
-- ✅ `--experiment <path>`：直接加载实验。
-- ✅ `--save-experiment <path>`：把当前实验写出。
-- ✅ `--version` / `-V`。
-- ✅ 协议两端版本不兼容时拒绝连接，不静默误读。
+- ✅ One `cellarium` binary currently provides direct local operation, the
+  remote server, and the client/server client.
+- ✅ `cellarium`: simulate and render directly on the current device.
+- ✅ `cellarium server`: run the remote protocol server over stdin/stdout.
+- ✅ `cellarium connect <ssh-host>`: start the remote server through SSH and
+  render and interact locally.
+- ✅ `--ssh-command <path>`: select the SSH executable; also configurable with
+  `CELLARIUM_SSH_COMMAND`.
+- ✅ `--kernel <path>`: load a kernel definition directly.
+- ✅ `--experiment <path>`: load an experiment directly.
+- ✅ `--save-experiment <path>`: write the current experiment.
+- ✅ `--version` / `-V`.
+- ✅ Reject incompatible protocol versions instead of silently decoding them
+  incorrectly.
 
-### 2.2 平台和计算后端
+### 2.2 Platforms and compute backends
 
-- ✅ Linux x86_64 / ARM64 发布物。
-- ✅ macOS x86_64 / ARM64 发布物。
-- ✅ Windows x86_64 / ARM64 发布物。
-- ✅ Linux 二进制动态检测 CUDA；有可用 NVIDIA/CUDA 时使用 GPU。
-- ✅ CUDA 不可用时自动回退 CPU。
-- ✅ macOS、Windows 使用 CPU 后端。
-- ✅ 内置 Conway 和 Lenia/Orbium 规则，可在模拟界面切换。
-- 🧪 自定义 basis、多通道、多核实验同时支持 CPU 与 CUDA；仍需要每个稳定版做 CPU/CUDA 数值一致性与真实运行验收。
+- ✅ Linux x86_64 and ARM64 artifacts.
+- ✅ macOS x86_64 and ARM64 artifacts.
+- ✅ Windows x86_64 and ARM64 artifacts.
+- ✅ Linux binaries detect CUDA dynamically and use an available NVIDIA/CUDA
+  GPU.
+- ✅ Automatically fall back to CPU when CUDA is unavailable.
+- ✅ macOS and Windows currently use the CPU backend.
+- ✅ Built-in Conway and Lenia/Orbium rules can be selected from the simulation
+  screen.
+- 🧪 Custom-basis, multi-channel, and multi-kernel experiments support both CPU
+  and CUDA. Every stable release still requires numerical-consistency and real
+  runtime acceptance on both paths.
 
-## 3. 核心数据模型
+## 3. Core data model
 
-### 3.1 名词
+### 3.1 Terms
 
-| 名词 | 含义 |
+| Term | Meaning |
 | --- | --- |
-| World | 当前模拟状态，包含每个逻辑格子的各通道数值 |
-| Tiling | 周期密铺几何，包括平移基向量、原型多边形、中心晶胞内实例及接缝 |
-| Basis polygon | 一个晶胞内具有独立状态语义的多边形；不是颜色通道 |
-| Channel | 每个 basis polygon 上的一层标量状态 |
-| Binding | 一个 `(basis polygon, 输出通道)` 对 |
-| RuleSet | 某个 Binding 使用的完整规则：核列表、Growth 程序、参数和更新模式 |
-| Kernel | 从某个源通道采样并卷积，生成一个传给 Growth 的标量输入 |
-| Growth | 根据 `self`、所有核输入和参数计算下一步 Value 或 Rate |
+| World | Current simulation state containing every channel value for every logical cell |
+| Tiling | Periodic tiling geometry: translation basis vectors, prototype polygons, central-cell instances, and seams |
+| Basis polygon | A polygon with independent state semantics inside one unit cell; it is not a color channel |
+| Channel | One scalar state layer on every basis polygon |
+| Binding | One `(basis polygon, output channel)` pair |
+| RuleSet | The complete rule for a Binding: kernels, Growth program, parameters, and update mode |
+| Kernel | Samples and convolves a source channel to produce one scalar Growth input |
+| Growth | Computes the next Value or Rate from `self`, every kernel input, and parameters |
 
-### 3.2 数量关系（必须以此为准）
+### 3.2 Cardinality rules
 
-设：
+Let:
 
-- `B` = 中心晶胞内 basis polygon 数量；
-- `C_active` = 非冻结通道数量；
-- `K(b,c)` = Binding `(basis=b, channel=c)` 的核数量。
+- `B` be the number of basis polygons in the central unit cell;
+- `C_active` be the number of non-frozen channels;
+- `K(b,c)` be the kernel count for Binding `(basis=b, channel=c)`.
 
-则：
+Then:
 
-1. ✅ Growth / RuleSet Binding 的逻辑数量为 `B × C_active`。
-2. ✅ 每个 Binding 都有自己的 Growth 程序。
-3. ✅ 每个 Binding 默认有 1 个核；用户必须显式添加更多核。
-4. ✅ 某个 Growth 的核参数数量是该 Binding 的 `K(b,c)`，不是全局通道数。
-5. ✅ Growth 函数总参数数量是 `1 + K(b,c)`：一个 `self` 加每个核一个标量。
-6. ✅ 核的 source channel 可以与输出 channel 不同，因此支持跨通道耦合。
-7. ✅ 多个 Binding 初始可共享同一个 RuleSet；编辑其中一个时按 copy-on-write 分离，降低多 basis、多通道的编辑负担。
+1. ✅ The logical number of Growth/RuleSet bindings is `B × C_active`.
+2. ✅ Every Binding has its own Growth program.
+3. ✅ Every Binding has one kernel by default; more kernels require explicit
+   user action.
+4. ✅ A Growth program has `K(b,c)` kernel parameters, not the global channel
+   count.
+5. ✅ Its total argument count is `1 + K(b,c)`: one `self` plus one scalar
+   per kernel.
+6. ✅ A kernel's source channel may differ from its output channel, enabling
+   cross-channel coupling.
+7. ✅ Multiple Bindings may initially share one RuleSet. Editing one detaches it
+   through copy-on-write to reduce multi-basis and multi-channel editing effort.
 
-例子：
+Examples:
 
-| 晶胞内多边形 | 活跃通道 | Growth Binding | 默认有效核总数 |
+| Polygons in unit cell | Active channels | Growth Bindings | Default effective kernels |
 | ---: | ---: | ---: | ---: |
 | 1 | 1 | 1 | 1 |
 | 1 | 3 | 3 | 3 |
 | 2 | 1 | 2 | 2 |
 | 2 | 3 | 6 | 6 |
 
-这里“默认有效核总数”按每个 Binding 一个核计算；用户给任一 Binding 添加第二个核后，总数再增加。
+"Default effective kernels" assumes one kernel per Binding. Adding a second
+kernel to any Binding increases the total by one.
 
-### 3.3 默认值
+### 3.3 Defaults
 
-- ✅ 默认实验是单通道 Lenia/Orbium，256×256、周期边界。
-- ✅ 默认通道数 1。
-- ✅ 默认每个 Binding 的核数 1。
-- ✅ 新增通道和新增核都需要用户显式操作。
-- ✅ 没有自定义 Tiling 时，默认模拟仍是兼容的方形 RasterGrid。
-- ✅ 进入 Tiling 并选择“New blank”时画布为空；不会暗中生成一个方形密铺。
+- ✅ The default experiment is single-channel Lenia/Orbium with a 256×256
+  periodic world.
+- ✅ Default channel count: 1.
+- ✅ Default kernel count per Binding: 1.
+- ✅ Adding a channel or kernel requires an explicit user action.
+- ✅ Without a custom Tiling, simulation uses the compatible square RasterGrid.
+- ✅ Selecting New blank in Tiling produces an empty canvas and does not
+  silently create a square tiling.
 
-## 4. 模拟主界面
+## 4. Main simulation screen
 
-### 4.1 模拟控制
+### 4.1 Simulation controls
 
-- ✅ 暂停/继续：`Space` 或 `P`。
-- ✅ 单步：`N` 或 `Enter`。
-- ✅ 重置：`R`。
-- ✅ 随机化：`A`。
-- ✅ 清空：`C`。
-- ✅ 切换 Conway：`1`。
-- ✅ 切换 Lenia：`2`。
-- ✅ 进入 Workbench：`W`。
-- ✅ 退出：`Q`、`Esc` 或 `Ctrl+C`。
+- ✅ Pause/resume: `Space` or `P`.
+- ✅ Single step: `N` or `Enter`.
+- ✅ Reset: `R`.
+- ✅ Randomize: `A`.
+- ✅ Clear: `C`.
+- ✅ Select Conway: `1`.
+- ✅ Select Lenia: `2`.
+- ✅ Enter Workbench: `W`.
+- ✅ Quit: `Q`, `Esc`, or `Ctrl+C`.
 
-### 4.2 视口交互
+### 4.2 Viewport interaction
 
-- ✅ 左键绘制，拖动可连续绘制。
-- ✅ 右键擦除，拖动可连续擦除。
-- ✅ 中键拖动画布。
-- ✅ 滚轮以指针位置为中心缩放。
-- ✅ 鼠标检查某个格子的精确值。
-- ✅ 自适应填充可用画布；缩放和平移状态保留。
-- ⚠️ 这些路径历史上出现过坐标偏移、缩放闪烁、初始画面缩成小块等问题；当前代码有针对性修复，但稳定版仍需完整 agentic 回归后才能关闭风险。
+- ✅ Left-button paint with continuous dragging.
+- ✅ Right-button erase with continuous dragging.
+- ✅ Middle-button canvas pan.
+- ✅ Wheel zoom centered at the pointer.
+- ✅ Inspect the exact value of a cell with the pointer.
+- ✅ Fit to available canvas while preserving pan and zoom state.
+- ⚠️ These paths have historically suffered from coordinate offsets, zoom
+  flicker, and an initially tiny image. Targeted fixes exist, but the risk
+  remains open until a complete stable-release agentic regression passes.
 
-### 4.3 状态与性能指标
+### 4.3 Status and performance metrics
 
-- ✅ 当前规则、运行/暂停、tick、世界尺寸、zoom、inspect 和显示协议。
-- ✅ Direct 模式显示后端 step 和 UI/render 开销。
-- ✅ C/S 模式区分：
-  - server simulation rate；
-  - snapshot receive rate；
-  - UI draw rate；
-  - fresh RGBA graphics rate；
-  - 可观测时的 Kitty presentation/consume rate；
-  - input sequence / ack。
-- ✅ 指标使用独立事件源，不再把 UI 重绘次数当作新图像帧率。
+- ✅ Show current rule, running/paused state, tick, world size, zoom, inspect
+  value, and display protocol.
+- ✅ Direct mode shows backend-step and UI/render costs.
+- ✅ Client/server mode distinguishes:
+  - server simulation rate;
+  - snapshot receive rate;
+  - UI draw rate;
+  - fresh RGBA graphics rate;
+  - Kitty presentation/consume rate when observable;
+  - input sequence and acknowledgement.
+- ✅ Metrics use independent event sources instead of treating every UI redraw
+  as a new graphics frame.
 
-## 5. Workbench 总体交互
+## 5. General Workbench interaction
 
-### 5.1 布局
+### 5.1 Layout
 
-- ✅ 左栏 Experiment outline：World、Tiling、Channels、Kernels、Growth、Experiment。
-- ✅ 中栏 Canvas：当前 section 的主要可视化和编辑区。
-- ✅ 右栏 Inspector：当前对象、状态、快捷键、诊断和语法帮助。
-- ✅ 宽终端显示三栏；窄终端隐藏 Inspector，工具栏最多折成四行。
-- ✅ outline 项和工具栏动作可以鼠标点击。
-- ✅ `T` 或点击切换 section。
-- ✅ `Tab` / `Shift+Tab` 在 Outline、Canvas、Inspector 之间切焦点。
-- ✅ Inspector 内容可滚轮上下滚动。
+- ✅ Left Experiment outline: World, Tiling, Channels, Kernels, Growth, and
+  Experiment.
+- ✅ Center Canvas: primary visualization and editor for the current section.
+- ✅ Right Inspector: current object, state, shortcuts, diagnostics, and syntax
+  help.
+- ✅ Wide terminals show three columns; narrow terminals hide the Inspector and
+  wrap the toolbar to at most four rows.
+- ✅ Outline items and toolbar actions are pointer-clickable.
+- ✅ `T` or a click changes section.
+- ✅ `Tab` / `Shift+Tab` moves focus among Outline, Canvas, and Inspector.
+- ✅ The Inspector scrolls vertically with the wheel.
 
-### 5.2 草稿事务
+### 5.2 Draft transactions
 
-- ✅ Workbench 同时保存 authoritative（已应用）与 draft（编辑中）实验。
-- ✅ 状态：Clean、Dirty、Invalid。
-- ✅ `Ctrl+Z` / `Ctrl+Y`：撤销/重做。
-- ✅ `Ctrl+R`：把 draft 恢复为 authoritative。
-- ✅ `Ctrl+Enter`：验证、Apply，并开始运行。
-- ✅ Invalid draft 禁止 Apply，不覆盖远端有效实验。
-- ✅ C/S Apply 带 base revision；远端状态冲突不会静默覆盖。
-- ✅ 远端回传 authoritative 实验元数据，客户端镜像 basis、channel、RuleSet、kernel、Growth 等编辑状态。
-- ✅ `W` 离开 Workbench 回到模拟；旧 Workbench graphics placement 应被删除。
+- ✅ Workbench stores both the authoritative applied experiment and the current
+  draft.
+- ✅ Status values: Clean, Dirty, Invalid.
+- ✅ `Ctrl+Z` / `Ctrl+Y`: undo/redo.
+- ✅ `Ctrl+R`: restore the draft from authoritative state.
+- ✅ `Ctrl+Enter`: validate, Apply, and start running.
+- ✅ An Invalid draft cannot Apply or overwrite the valid remote experiment.
+- ✅ Client/server Apply carries a base revision; a remote conflict is never
+  overwritten silently.
+- ✅ The remote side returns authoritative experiment metadata so the client can
+  mirror basis, channel, RuleSet, kernel, Growth, and editor state.
+- ✅ `W` leaves Workbench for simulation; old Workbench graphics placements
+  must be deleted.
 
-## 6. World 编辑器
+## 6. World editor
 
-- ✅ 显示当前/草稿世界。
-- ✅ `]` 切换编辑通道。
-- ✅ `V` 切换 Composite 与选中通道视图。
-- ✅ 左键绘制、右键擦除、中键平移、滚轮缩放。
-- ✅ World 草稿修改可撤销/重做。
-- 🧪 自定义 polygon/basis 模拟使用实际多边形几何渲染，不应重新显示成方格；需继续作为每版真实视觉验收项。
+- ✅ Display the current or draft world.
+- ✅ `]` selects the editing channel.
+- ✅ `V` switches between Composite and selected-channel views.
+- ✅ Left paint, right erase, middle pan, and wheel zoom.
+- ✅ World draft edits support undo and redo.
+- 🧪 Custom polygon/basis simulation must render actual polygon geometry rather
+  than reverting to squares. Keep this in every release's real visual journey.
 
-## 7. Tiling / 晶胞编辑器
+## 7. Tiling and unit-cell editor
 
-### 7.1 创建入口
+### 7.1 Creation entry points
 
-- ✅ 默认可从空白开始：`B` / New blank。
-- ✅ 预设：
-  - Square；
-  - Equilateral triangles（一个晶胞两个三角形 basis）；
-  - Regular hexagon；
-  - Octagon + square（4.8.8 密铺，一个晶胞两个 basis）。
-- ✅ `P` 循环预设。
-- ✅ `D` 进入绘制形状工具。
-- ✅ `A` 添加新 basis polygon。
-- ✅ `N` 切换 basis。
-- ✅ `+` / `-` 调整规则多边形边数（3–64）。
-- ✅ `0` 把密铺适配到画布。
+- ✅ Start from blank with `B` / New blank.
+- ✅ Presets:
+  - Square;
+  - Equilateral triangles, with two triangle bases per unit cell;
+  - Regular hexagon;
+  - Octagon + square, the 4.8.8 tiling with two bases per unit cell.
+- ✅ `P` cycles presets.
+- ✅ `D` enters the draw-shape tool.
+- ✅ `A` adds a basis polygon.
+- ✅ `N` selects the next basis.
+- ✅ `+` / `-` changes regular-polygon side count from 3 to 64.
+- ✅ `0` fits the tiling to the canvas.
 
-### 7.2 自由绘制
+### 7.2 Free drawing
 
-- ✅ 鼠标逐点绘制自定义多边形。
-- ✅ 开放路径显示指针预览线。
-- ✅ 点击第一个顶点、双击或 `Enter` 关闭多边形。
-- ✅ `Esc` 取消当前绘制。
-- ✅ 绘制期间 `Ctrl+Z` 删除刚放置的顶点，`Ctrl+Y` 恢复。
-- ✅ 放置顶点时立即拒绝：
-  - 与已有顶点重合；
-  - 新边和已有开放路径相交/接触；
-  - 非有限坐标；
-  - 超过 64 个顶点。
-- ✅ 闭合时验证：至少 3 点、逆时针、非零面积、无零长度边、无自交。
-- 🧪 关闭动作过去有“说明写了但操作不生效”的缺陷；当前实现具备三种关闭路径，仍需每版用真实鼠标和键盘验证。
+- ✅ Draw a custom polygon point by point with the pointer.
+- ✅ An open path shows a preview line to the pointer.
+- ✅ Close a polygon by clicking its first vertex, double-clicking, or pressing
+  `Enter`.
+- ✅ `Esc` cancels the current construction.
+- ✅ During construction, `Ctrl+Z` removes the most recently placed vertex and
+  `Ctrl+Y` restores it.
+- ✅ Reject immediately when placing a vertex that:
+  - coincides with an existing vertex;
+  - makes the new edge intersect or touch the existing open path;
+  - has non-finite coordinates;
+  - exceeds the 64-vertex limit.
+- ✅ On closure validate at least three points, counter-clockwise orientation,
+  nonzero area, no zero-length edge, and no self-intersection.
+- 🧪 Closure once had a defect where documented actions did nothing. All three
+  closure paths exist now, but every release must verify them with real pointer
+  and keyboard input.
 
-### 7.3 周期晶胞显示和选择
+### 7.3 Periodic-unit-cell display and selection
 
-- ✅ 中央晶胞内的可编辑 basis polygon 强调显示。
-- ✅ 周围周期邻接副本降低透明度显示，用于理解真实密铺，而不是只画横平竖直的矩形网格。
-- ✅ 正六边形使用非正交平移向量；Octagon + square 显示混合多边形。
-- ✅ 点击中央或周期副本都能映射回对应 basis。
-- ✅ 选择、拖动顶点、右键删除、滚轮缩放、中键平移。
+- ✅ Emphasize editable basis polygons in the central unit cell.
+- ✅ Render neighboring periodic copies at reduced opacity to communicate the
+  real tiling instead of showing only an axis-aligned rectangular grid.
+- ✅ A regular hexagon uses non-orthogonal translation vectors; Octagon + square
+  shows mixed polygons.
+- ✅ Clicking either the central representative or a periodic copy maps back to
+  the corresponding basis.
+- ✅ Select, drag vertices, right-click delete, wheel zoom, and middle-button pan.
 
-### 7.4 密铺辅助与约束
+### 7.4 Tiling assistance and constraints
 
-- ✅ 只允许完整 edge-to-edge 接缝。
-- ❌ T 型接缝明确不支持；任何旧文档里“允许 T-junction”的内容已过时。
-- ✅ 验证周期覆盖：gap、overlap、crossing、open seam、方向/退化问题、Euler 拓扑一致性。
-- ✅ `S` Solve seams：从接近的完整边提出候选配对，联合优化顶点和平移向量，得到精确周期密铺。
-- ✅ 解算后保存接缝约束；继续拖动一个受约束顶点时，相关顶点和晶格向量联动，尽量保持密铺。
-- ✅ 显示求解接缝数、最大位移、残差和诊断。
-- ⚠️ 求解器是“从足够接近的完整边开始”的辅助器，不是任意乱画形状的全局组合搜索器；找不到完整边对时会要求用户先把对应边摆近。
-- 🧪 “用户粗摆 → 自动消除缝隙 → 联动微调”的完整体验已有算法骨架和单测，但仍缺覆盖复杂多多边形晶胞的完整 agentic 验收。
+- ✅ Allow only complete edge-to-edge seams.
+- ❌ T-junctions are explicitly unsupported. Any legacy document that permits
+  them is obsolete.
+- ✅ Validate periodic coverage for gaps, overlaps, crossings, open seams,
+  orientation/degeneracy problems, and Euler-topology consistency.
+- ✅ `S` Solve seams: propose pairings among nearby complete edges and jointly
+  optimize vertices and translation vectors into an exact periodic tiling.
+- ✅ Preserve seam constraints after solving. Dragging one constrained vertex
+  then moves related vertices and lattice vectors together to preserve tiling
+  as far as possible.
+- ✅ Display solved seam count, maximum displacement, residual, and diagnostics.
+- ⚠️ The solver assists from sufficiently close complete edges; it is not a
+  global combinatorial search over arbitrary sketches. If no complete edge pair
+  can be found, ask the user to move corresponding edges closer first.
+- 🧪 The complete "rough layout → remove gaps automatically → constrained fine
+  tuning" flow has an algorithmic skeleton and unit tests, but still lacks full
+  agentic acceptance for complex multi-polygon unit cells.
 
-## 8. Channels / 通道编辑器
+## 8. Channels editor
 
-### 8.1 通道管理
+### 8.1 Channel management
 
-- ✅ 默认一个 `state` 通道。
-- ✅ `A` 添加通道。
-- ✅ `Del` 删除选中通道。
-- ✅ `]` 选择下一个通道。
-- ✅ Inspector 中每个通道有独立可点击行。
-- ✅ `F` 冻结/解冻：冻结通道不再拥有需要更新的 Growth Binding。
-- ✅ `X` 显示/隐藏通道。
+- ✅ One `state` channel by default.
+- ✅ `A` adds a channel.
+- ✅ `Del` removes the selected channel.
+- ✅ `]` selects the next channel.
+- ✅ Every channel has its own clickable Inspector row.
+- ✅ `F` freezes or thaws a channel. Frozen channels no longer own Growth
+  Bindings that require updates.
+- ✅ `X` shows or hides a channel.
 
-### 8.2 颜色和合成
+### 8.2 Color and composition
 
-- ✅ `V` 在 Composite 与单通道视图之间切换。
-- ✅ `C` 循环颜色预设。
-- ✅ `E` 输入精确 RGB 颜色。
-- ✅ 单通道默认使用黑底高对比浅色。
-- ✅ 三通道默认 RGB。
-- ✅ 域内背景纯黑。
-- ✅ 域外区域保留深色背景，用来区分实际模拟域。
-- ✅ 颜色、可见性、opacity 是持久化实验数据。
-- ✅ Channels Canvas 显示真实运行状态，而不是随机占位噪声。
-- ✅ 自定义非矩形密铺使用与 Simulation 一致的 polygon scene，而不是把 256×256 栅格强行斜切。
+- ✅ `V` switches between Composite and single-channel views.
+- ✅ `C` cycles color presets.
+- ✅ `E` enters an exact RGB color.
+- ✅ One channel defaults to a high-contrast light color on black.
+- ✅ Three channels default to RGB.
+- ✅ The in-domain background is pure black.
+- ✅ The out-of-domain region retains a dark background to distinguish the
+  actual simulation domain.
+- ✅ Color, visibility, and opacity are persistent experiment data.
+- ✅ The Channels Canvas shows real running state rather than random placeholder
+  noise.
+- ✅ Custom non-rectangular tilings use the same polygon scene as Simulation
+  rather than shearing a 256×256 raster.
 
-### 8.3 已知生命周期缺陷
+### 8.3 Known lifecycle defects
 
-- ⚠️ 删除通道后再添加，当前 `WorkbenchState::add_channel` 可能按长度生成重复名称（例如第二个 `channel_3`），使草稿变为 Invalid。
-- ⚠️ 上述操作后 Undo 可能让 `selected_channel` 仍指向已不存在的通道，Inspector 显示 `selected: —`。
-- ⚠️ 已归一化的多 basis 规则中冻结通道时，旧 RuleSet/default/binding 清理不完整，可能留下指向 frozen channel 的规则并使草稿 Invalid。
-- ⚠️ 因此 Channel 的正常新增/显示路径可用，但“删除→新增→Undo”和“冻结/解冻”目前不能算验收通过。
+- ⚠️ After deleting and then adding a channel,
+  `WorkbenchState::add_channel` may derive a duplicate name from the length,
+  such as a second `channel_3`, making the draft Invalid.
+- ⚠️ Undo after that sequence may leave `selected_channel` pointing to a
+  missing channel, causing the Inspector to show `selected: —`.
+- ⚠️ Freezing a channel in a normalized multi-basis rule can leave incomplete
+  RuleSet/default/binding cleanup and references to the frozen channel, making
+  the draft Invalid.
+- ⚠️ Therefore the ordinary add/display path works, but
+  "delete → add → undo" and freeze/thaw are not accepted.
 
-## 9. Kernels / 核编辑器
+## 9. Kernels editor
 
-### 9.1 归属和路由
+### 9.1 Ownership and routing
 
-- ✅ Kernel 隶属于选中的 `(basis, output channel)` RuleSet。
-- ✅ 默认一个核，更多核必须 `A` 显式添加。
-- ✅ `Del` 删除选中核。
-- ✅ `]` 切换核。
-- ✅ `S` 更改 source channel。
-- ✅ `U` 更改 output channel / Binding。
-- ✅ 删除会导致 Growth 程序引用缺失的核时拒绝删除，不留下半坏状态。
-- ✅ RuleSet 共享、local override、copy-on-write 分离和恢复默认。
+- ✅ A Kernel belongs to the selected `(basis, output channel)` RuleSet.
+- ✅ One kernel exists by default; `A` explicitly adds more.
+- ✅ `Del` removes the selected kernel.
+- ✅ `]` selects the next kernel.
+- ✅ `S` changes the source channel.
+- ✅ `U` changes the output channel or Binding.
+- ✅ Reject deletion when it would leave a missing Growth reference; never
+  create a partially invalid state.
+- ✅ RuleSet sharing, local override, copy-on-write detachment, and reset to
+  default.
 
-### 9.2 可视化
+### 9.2 Visualization
 
-- ✅ 栅格核和周期 polygon/basis 核都用高分辨率 graphics 可视化。
-- ✅ 周期核的一个数值单元是一个 basis polygon；不会把六边形核重新画成方格。
-- ✅ 画出 active、zero、inactive/support 外和空白格子的不同状态。
-- ✅ 选中格、源 basis、offset、anchor 和数值在 Inspector 中显示。
-- ✅ 大核支持缩放和平移，每个内部 cell 都应可到达。
-- ✅ `0` 适配核到画布。
+- ✅ High-resolution graphics visualize both raster kernels and periodic
+  polygon/basis kernels.
+- ✅ One numeric unit in a periodic kernel is one basis polygon; a hexagonal
+  kernel is not redrawn as squares.
+- ✅ Visually distinguish active, zero, inactive/outside-support, and empty cells.
+- ✅ Show the selected cell, source basis, offset, anchor, and numeric value in
+  the Inspector.
+- ✅ Large kernels support pan and zoom so every internal cell remains reachable.
+- ✅ `0` fits the kernel to the canvas.
 
-### 9.3 数值和支持域编辑
+### 9.3 Values and support editing
 
-- ✅ `M` 在 Weights 与 Support 工具间切换。
-- ✅ 左键/拖动绘制权重；右键设为 0。
-- ✅ 选中 active cell 后滚轮调整浮点值：
-  - 普通步长 ±0.05；
-  - Shift ±0.005；
-  - Ctrl ±0.5。
-- ✅ inactive/空白位置滚轮用于缩放，不会误改值。
-- ✅ `E` 或 `Enter` 打开精确浮点输入，支持提交、取消和非法值诊断。
-- ✅ `R` 编辑 stencil 尺寸与 anchor。
-- ✅ Support 工具控制核的形状/激活掩码，不只是修改值。
+- ✅ `M` switches between Weights and Support tools.
+- ✅ Left-button drag paints weights; right button sets zero.
+- ✅ After selecting an active cell, wheel changes its floating-point value:
+  - normal step: ±0.05;
+  - Shift: ±0.005;
+  - Ctrl: ±0.5.
+- ✅ Wheel over an inactive or empty position zooms and cannot change a value
+  accidentally.
+- ✅ `E` or `Enter` opens exact floating-point input with commit, cancel, and
+  invalid-value diagnostics.
+- ✅ `R` edits stencil dimensions and anchor.
+- ✅ The Support tool controls kernel shape and activation mask rather than only
+  changing values.
 
-### 9.4 核预设和采样几何
+### 9.4 Presets and sampling geometry
 
-- ✅ `P` 按当前 support 生成 Gaussian 权重。
-- ✅ `G` 精确编辑 Gaussian sigma。
-- ✅ `Q` 切换两种采样度量：
-  - **Affine / LatticeAffine**：按晶格坐标采样，形状会随晶格仿射变换；
-  - **World / WorldEuclidean**：按屏幕/世界中的真实 polygon 位置距离采样，在六边形等非正交密铺上保持直观的圆形/高斯形状。
-- ✅ Potential 保留卷积原始加权和，不自动除以核权重总和。
-- ⚠️ Kernel 页面历史上出现过点击选不中部分六边形、外圈颜色误导、空核全黑等问题；当前代码包含共同坐标变换、inactive 锁定和空状态提示，但仍需完整 agentic 回归确认。
+- ✅ `P` generates Gaussian weights over the current support.
+- ✅ `G` edits Gaussian sigma exactly.
+- ✅ `Q` switches between two sampling metrics:
+  - **Affine / LatticeAffine** samples in lattice coordinates and deforms with
+    the lattice affine transform;
+  - **World / WorldEuclidean** samples by the real polygon positions in world
+    space, preserving an intuitive circular/Gaussian shape on hexagonal and
+    other non-orthogonal tilings.
+- ✅ Potential remains the raw weighted convolution sum and is not divided by
+  the total kernel weight.
+- ⚠️ The Kernel page has historically suffered from unselectable hexagons,
+  misleading outer-ring colors, and an entirely black empty kernel. Shared
+  coordinate transforms, inactive locking, and empty-state messages now exist,
+  but complete agentic regression is still required.
 
-## 10. Growth / 生长函数编辑器
+## 10. Growth editor
 
-### 10.1 Binding 和签名
+### 10.1 Binding and signature
 
-- ✅ 编辑目标明确显示为 `basis B / channel C`。
-- ✅ 完整签名显示在 Canvas 和 Inspector：
+- ✅ The target is shown explicitly as `basis B / channel C`.
+- ✅ The full signature appears in both Canvas and Inspector:
 
   ```text
   fn growth(self: Scalar, k1: Scalar, ..., kN: Scalar) -> Rate|Value
   ```
 
-- ✅ `self` 是目标 basis/通道当前值。
-- ✅ 每个 `kN` 是该 RuleSet 中对应 Kernel 的原始卷积结果。
-- ✅ 参数（例如 `mu`、`sigma`）作为外部只读标量参与表达式。
-- ✅ Kernel 数变化后签名和输入数量同步变化。
+- ✅ `self` is the current value of the target basis/channel.
+- ✅ Each `kN` is the raw convolution result of the corresponding Kernel in
+  that RuleSet.
+- ✅ Parameters such as `mu` and `sigma` are external read-only scalars.
+- ✅ The signature and input count update when the kernel count changes.
 
-### 10.2 更新模式
+### 10.2 Update modes
 
-- ✅ `M` 切换：
-  - **Rate**：`next = clamp(self + dt × result, 0, 1)`；
-  - **Value**：`next = clamp(result, 0, 1)`。
-- ✅ `dt` 在 Experiment 中编辑。
-- ✅ `clamp(x, lo, hi)` 表示低于 lo 取 lo，高于 hi 取 hi。
-- ✅ Potential 不会在进入 Growth 前自动归一化。
+- ✅ `M` switches between:
+  - **Rate**: `next = clamp(self + dt × result, 0, 1)`;
+  - **Value**: `next = clamp(result, 0, 1)`.
+- ✅ Experiment edits `dt`.
+- ✅ `clamp(x, lo, hi)` returns `lo` below `lo` and `hi` above `hi`.
+- ✅ Potential is not automatically normalized before entering Growth.
 
-### 10.3 语言
+### 10.3 Language
 
-- ✅ Rust 风格表达式语言，不是完整 Rust。
-- ✅ 最后一个无分号表达式是 block / program 的结果。
-- ✅ `let name = expression;`。
-- ✅ `if condition { expression } else { expression }`，else 必须存在。
-- ✅ 数字、`true`、`false`、`pi`、`e`。
-- ✅ 单行 `// comment`。
-- ✅ 运算：`+`、`-`、`*`、`/`、`^`、`!`。
-- ✅ 比较：`==`、`!=`、`<`、`<=`、`>`、`>=`。
-- ✅ 逻辑：`&&`、`||`。
-- ✅ 内置函数：
-  - `sqrt(x)`、`abs(x)`、`exp(x)`、`log(x)`；
-  - `sin(x)`、`cos(x)`、`tanh(x)`；
-  - `floor(x)`、`ceil(x)`、`round(x)`、`sign(x)`；
-  - `min(a,b)`、`max(a,b)`、`step(edge,x)`；
-  - `clamp(x,lo,hi)`、`smoothstep(lo,hi,x)`；
-  - `mix(a,b,t)`、`gauss(x,mu,sigma)`。
-- ❌ 当前语言没有 `return`、循环、可变变量或副作用；分支值由分支最后表达式产生。
-- ✅ 类型检查、未知变量/函数、参数数量、条件类型和结果类型诊断。
-- ✅ 数值区间危险分析（例如潜在非有限值）。
+- ✅ Rust-like expression language, not complete Rust.
+- ✅ The final expression without a semicolon is the block or program result.
+- ✅ `let name = expression;`.
+- ✅ `if condition { expression } else { expression }`; `else` is required.
+- ✅ Numbers, `true`, `false`, `pi`, and `e`.
+- ✅ Single-line `// comment`.
+- ✅ Arithmetic: `+`, `-`, `*`, `/`, `^`, and `!`.
+- ✅ Comparisons: `==`, `!=`, `<`, `<=`, `>`, and `>=`.
+- ✅ Logical operators: `&&` and `||`.
+- ✅ Built-ins:
+  - `sqrt(x)`, `abs(x)`, `exp(x)`, `log(x)`;
+  - `sin(x)`, `cos(x)`, `tanh(x)`;
+  - `floor(x)`, `ceil(x)`, `round(x)`, `sign(x)`;
+  - `min(a,b)`, `max(a,b)`, `step(edge,x)`;
+  - `clamp(x,lo,hi)`, `smoothstep(lo,hi,x)`;
+  - `mix(a,b,t)`, `gauss(x,mu,sigma)`.
+- ❌ The language currently has no `return`, loops, mutable variables, or side
+  effects. A branch value is the branch's final expression.
+- ✅ Diagnostics cover type errors, unknown variables/functions, argument
+  counts, condition types, and result types.
+- ✅ Analyze dangerous numeric ranges, including possible non-finite values.
 
-### 10.4 文本编辑体验
+### 10.4 Text-editing experience
 
-- ✅ `E` 开始/结束源码编辑，`Esc` 完成。
-- ✅ 多行编辑、可见光标、选择高亮。
-- ✅ 方向键、Home/End、按词移动。
-- ✅ Backspace/Delete、换行。
-- ✅ Shift 扩展选择。
-- ✅ `Ctrl+A` 全选，`Ctrl+U` 删除到行首。
-- ✅ 每次编辑实时重新解析、类型检查和刷新诊断。
-- ✅ 右侧 Inspector 提供可滚动的语法、内置函数、签名、模式、变量含义和参数帮助。
+- ✅ `E` starts or finishes source editing; `Esc` finishes.
+- ✅ Multi-line editing, visible caret, and selection highlight.
+- ✅ Arrow keys, Home/End, and word movement.
+- ✅ Backspace/Delete and newline.
+- ✅ Shift extends selection.
+- ✅ `Ctrl+A` selects all; `Ctrl+U` deletes to line start.
+- ✅ Every edit reparses, type-checks, and refreshes diagnostics live.
+- ✅ The right Inspector provides scrollable syntax, built-ins, signature, mode,
+  variable meanings, and parameter help.
 
-### 10.5 精细 graphics 图
+### 10.5 High-resolution graphics plot
 
-- ✅ 0 或 1 个核输入：精细像素曲线图。
-- ✅ 2 个及以上核输入：以前两个核为 x/y 轴的 2D heatmap，其余参数固定。
-- ✅ 图中显示坐标轴、范围、曲线/颜色结果和零值参考。
-- ✅ `d` / `D` 精确编辑 plot min/max。
-- ✅ 默认 plot domain 根据核权重和输入范围推导，不固定死为 [0,1]。
-- ✅ 非法程序保留最后一张有效图，但明确标记 stale，并显示源码 span 诊断。
-- ⚠️ Growth 图历史上出现过“整条平线/空图”问题；等值判断如 `potential == 2/6` 本身也只在精确采样点命中，图必须呈现孤立阈值标记而不能静默看似恒零。此项仍是稳定版 agentic 必测项。
+- ✅ With zero or one kernel input, render a high-resolution pixel curve.
+- ✅ With two or more kernel inputs, render a 2D heatmap over the first two while
+  holding the rest fixed.
+- ✅ Show axes, ranges, curve/color output, and zero reference.
+- ✅ `d` / `D` edits the plot minimum/maximum exactly.
+- ✅ Derive the default plot domain from kernel weights and input ranges instead
+  of fixing it to [0,1].
+- ✅ An invalid program retains the last valid plot, marks it stale explicitly,
+  and shows source-span diagnostics.
+- ⚠️ Growth plots have historically appeared as flat lines or empty. Equality
+  conditions such as `potential == 2/6` only hit exact sample points; the plot
+  must show isolated threshold markers rather than silently appearing
+  identically zero. This remains mandatory in stable-release agentic testing.
 
-## 11. Experiment / 应用、运行和持久化
+## 11. Experiment, Apply & Run, and persistence
 
-### 11.1 实验检查与运行
+### 11.1 Experiment inspection and execution
 
-- ✅ 汇总世界尺寸、basis 数、通道数、RuleSet/Binding 数、有效核总数、Growth 数、dt、seed 和诊断。
-- ✅ `D` 精确编辑模拟 dt。
-- ✅ `Ctrl+Enter` 是 **Apply & Run**，不是只保存：
-  1. 验证整个 draft；
-  2. 编译 topology/RuleSet/Growth；
-  3. 发送远端 Apply（C/S）或替换本地 backend；
-  4. 清空暂停状态并开始运行；
-  5. 收到新 revision/ack 后把 draft 标为 Clean。
-- ✅ Apply 失败保持原 authoritative 实验可运行。
+- ✅ Summarize world dimensions, basis count, channel count,
+  RuleSet/Binding count, total effective kernels, Growth count, `dt`, seed,
+  and diagnostics.
+- ✅ `D` edits simulation `dt` exactly.
+- ✅ `Ctrl+Enter` means **Apply & Run**, not merely save:
+  1. validate the complete draft;
+  2. compile topology, RuleSets, and Growth;
+  3. send remote Apply in client/server mode or replace the local backend;
+  4. clear paused state and start running;
+  5. after receiving the new revision/acknowledgement, mark the draft Clean.
+- ✅ Failed Apply leaves the original authoritative experiment runnable.
 
-### 11.2 默认持久化
+### 11.2 Default persistence
 
-- ✅ 数据目录：
-  - 若 `XDG_DATA_HOME` 是绝对路径：`$XDG_DATA_HOME/cellarium/`；
-  - 否则：`$HOME/.local/share/cellarium/`。
-- ✅ `workbench.ron`：active、draft、active revision、base revision。
-- ✅ `experiment.ron`：可独立加载/运行的实验。
-- ✅ `Ctrl+S` 保存 active/workspace。
-- ✅ `Ctrl+E` 导出 draft。
-- ✅ `Ctrl+L` 加载 draft。
-- ✅ 定时自动保存 Workbench。
-- ✅ 原子写入：临时文件、sync、rename；Unix 下新文件权限 0600。
-- ✅ RON 文件带格式版本；未知新版本拒绝读取。
-- ✅ 旧格式实验有受控迁移边界，不静默误解新字段。
+- ✅ Data directory:
+  - if `XDG_DATA_HOME` is absolute: `$XDG_DATA_HOME/cellarium/`;
+  - otherwise: `$HOME/.local/share/cellarium/`.
+- ✅ `workbench.ron`: active, draft, active revision, and base revision.
+- ✅ `experiment.ron`: a self-contained loadable and runnable experiment.
+- ✅ `Ctrl+S` saves active/workspace state.
+- ✅ `Ctrl+E` exports the draft.
+- ✅ `Ctrl+L` loads a draft.
+- ✅ Periodic automatic Workbench save.
+- ✅ Atomic writes through temporary file, sync, and rename; new Unix files use
+  mode 0600.
+- ✅ RON files contain a format version; reject unknown newer versions.
+- ✅ Legacy experiment formats have a controlled migration boundary and never
+  silently reinterpret new fields.
 
-## 12. 图形、终端与降级
+## 12. Graphics, terminals, and fallback
 
-- ✅ 支持 Kitty graphics、Sixel、iTerm2 graphics 和 half-block。
-- ✅ 检测到 Kitty 或其它受支持图形协议时默认使用 graphics。
-- ✅ Kitty 本地 Unix 优先共享内存传帧；失败时回退 inline graphics。
-- ✅ graphics 全部不可用时回退 half-block。
-- ✅ C/S 模式在本机完成高分辨率渲染，服务器只做模拟并发送逻辑快照。
-- ✅ 最新帧优先队列：积压时丢弃过时中间帧，输入不等待旧图像编码。
-- ✅ Workbench section 切换、resize、离开、协议降级和退出时删除旧 Kitty placement。
-- ✅ half-block 与 graphics 使用同一个控制器和逻辑坐标变换，降级不应失去鼠标/键盘交互。
-- 🧪 Direct `kitten ssh` 仍支持高精度 graphics，但性能和交互延迟要与 C/S 独立测量。
+> Historical for the TUI; removed by the GUI migration.
 
-## 13. 远端 C/S
+- ✅ Kitty graphics, Sixel, iTerm2 graphics, and half-block are supported.
+- ✅ When Kitty or another supported graphics protocol is detected, graphics is
+  the default.
+- ✅ On local Unix Kitty, prefer shared-memory frame transfer and fall back to
+  inline graphics.
+- ✅ If all graphics protocols are unavailable, fall back to half-block.
+- ✅ In client/server mode the local client performs high-resolution rendering;
+  the server simulates and sends logical snapshots.
+- ✅ A latest-frame-first queue drops obsolete intermediate frames under
+  backlog, so input does not wait for old image encoding.
+- ✅ Delete old Kitty placements on Workbench section change, resize, exit,
+  protocol fallback, and leaving Workbench.
+- ✅ Half-block and graphics share the same controller and logical coordinate
+  transform, so fallback must preserve pointer and keyboard interaction.
+- 🧪 Direct `kitten ssh` retains high-resolution graphics, but performance and
+  interaction latency must be measured independently from client/server mode.
 
-- ✅ SSH 子进程通过 stdin/stdout 承载版本化二进制协议。
-- ✅ server 负责 GPU/CPU step；client 负责终端 UI、graphics 和输入。
-- ✅ latest-only snapshot，避免网络抖动堆积旧状态。
-- ✅ 每条输入带 sequence；server 回传 `applied_input_seq`，可测真实端到端输入 ack。
-- ✅ Apply 带 revision；远端返回 authoritative ExperimentSpec 和选中编辑元数据。
-- ✅ 客户端本地乐观反馈与 server ack 分开统计。
-- ✅ 断开、退出和测试清理应只终止本次会话进程，不残留多 server、Kitty image 或共享内存对象。
+## 13. Remote client/server mode
 
-## 14. 测试与发布门禁
+> Historical for the TUI; removed by the GUI migration.
 
-### 14.1 自动测试
+- ✅ An SSH subprocess carries the versioned binary protocol over stdin/stdout.
+- ✅ The server performs GPU/CPU steps; the client owns terminal UI, graphics,
+  and input.
+- ✅ Latest-only snapshots prevent network jitter from accumulating stale state.
+- ✅ Every input carries a sequence number and the server returns
+  `applied_input_seq`, enabling true end-to-end input-acknowledgement
+  measurement.
+- ✅ Apply carries a revision; the remote side returns authoritative
+  ExperimentSpec and selected editor metadata.
+- ✅ Client-side optimistic feedback and server acknowledgement are measured
+  separately.
+- ✅ Disconnect, exit, and test cleanup must terminate only the current session
+  and leave no extra server, Kitty image, or shared-memory object.
 
-- ✅ Rust 单元测试覆盖模型、parser/typecheck、kernel、tiling、solver、渲染变换、历史和协议。
-- ✅ CPU/CUDA 后端路径有测试。
-- ✅ PTY E2E 覆盖协议、键鼠字节、Apply ack、Kitty 命令消费和 half-block。
-- ✅ GitHub Actions 构建多 OS/架构单一二进制并发布 SHA256SUMS。
+## 14. Test and release gates
 
-### 14.2 Agentic 用户级测试
+### 14.1 Automated tests
 
-- ✅ 已有真实测试框架：Xvfb → Openbox → Kitty → 发布版 ARM64 client → tinker server。
-- ✅ Agent 必须看真实 framebuffer，依据最新截图选择坐标，发送真实 X11 键鼠事件，再从视觉上判断结果。
-- ✅ 每个动作要求 before/after PNG 和语义观察，不允许只看静态测试或 hash 就算通过。
-- ✅ Kitty 与 half-block 都必须走关键旅程。
-- ✅ 本机树莓派只运行预编译 Release 客户端，不本地构建；GPU/性能计算放在 tinker。
-- ⚠️ v0.2.2 最近的 Channel/Growth 数量 agentic 旅程复现了本文件第 8.3 节缺陷，所以当前整体结论不是 PASS。
+- ✅ Rust unit tests cover the model, parser/type checker, kernels, tiling,
+  solver, render transforms, history, and protocol.
+- ✅ CPU and CUDA backend paths have tests.
+- ✅ PTY E2E covers protocol, pointer/keyboard bytes, Apply acknowledgement,
+  Kitty command consumption, and half-block.
+- ✅ GitHub Actions builds one binary for multiple OS/architecture combinations
+  and publishes `SHA256SUMS`.
 
-## 15. 当前必须修复的已知问题
+### 14.2 Agentic user-level testing
 
-按优先级列出当前仍未关闭的问题：
+- ✅ A real test harness exists: Xvfb → Openbox → Kitty → released ARM64 client
+  → tinker server.
+- ✅ The agent must inspect the real framebuffer, choose coordinates from the
+  latest screenshot, send real X11 pointer/keyboard events, and judge the
+  visual result.
+- ✅ Every action requires before/after PNG evidence and a semantic observation;
+  a static test or image hash alone cannot count as acceptance.
+- ✅ Both Kitty and half-block must complete critical journeys.
+- ✅ The local Raspberry Pi runs only prebuilt release clients; it never builds
+  locally. GPU/performance work runs on tinker.
+- ⚠️ The latest v0.2.2 Channel/Growth cardinality journey reproduced the
+  defects in Section 8.3, so the current overall result is not PASS.
 
-1. ⚠️ **通道删除后再新增会产生重复名称并导致 Invalid。**
-2. ⚠️ **上述路径 Undo 后 selected channel 可能悬空。**
-3. ⚠️ **冻结归一化多 basis 通道时 RuleSet/binding 清理不完整。**
-4. ⚠️ **Inspector 的数量口径不够清楚。** 当前把全局 `channels: N` 与当前 Binding 的 `kernels: K` 放在一起，用户容易误以为两者应相等。应明确显示：
-   - basis polygons；
-   - active/frozen channels；
-   - Growth bindings = B × C_active；
-   - 当前 Binding kernel count；
-   - 全部 Binding effective kernel count。
-5. 🧪 **完整稳定版 agentic 回归尚未重新通过。** 需要覆盖绘制/闭合三角形、六边形 Apply 后真实几何、RGB Channels、Kernel 支持域/浮点/精确输入、Growth 曲线/热图、Apply & Run、resize、退出清图和 half-block。
+## 15. Known issues that still require fixes
 
-## 16. 已确认但仍需继续打磨的产品能力
+Ordered by current priority:
 
-- ⏳ 更强的全局密铺辅助：当用户画出的多边形离可密铺状态较远时，给出更直观的候选边对应和可操作修复建议，而不仅是报错。
-- ⏳ 对复杂多多边形晶胞，完善“粗摆 → 求解 → 联动顶点微调”的可发现性、冲突解释和失败恢复。
-- ⏳ 给 RuleSet 的共享、local override、reset-to-default 增加更直接的可视化控制，避免用户必须从 Inspector 文本推断。
-- ⏳ Kernel active/inactive/support/zero 的图例和当前工具状态需要更醒目。
-- ⏳ Growth 多于两个核时，目前图只用前两个做 heatmap，其余固定；需要更明确的 pinned-input UI。
+1. ⚠️ **Deleting and then adding a channel can create a duplicate name and make
+   the draft Invalid.**
+2. ⚠️ **Undo after that sequence can leave the selected channel dangling.**
+3. ⚠️ **Freezing a normalized multi-basis channel can leave incomplete
+   RuleSet/binding cleanup.**
+4. ⚠️ **Inspector count scopes are unclear.** It currently places global
+   `channels: N` beside the current Binding's `kernels: K`, which suggests
+   that the values should match. It should distinguish:
+   - basis polygons;
+   - active and frozen channels;
+   - Growth Bindings = `B × C_active`;
+   - current-Binding kernel count;
+   - total effective kernel count across all Bindings.
+5. 🧪 **The complete stable-release agentic regression has not passed again.**
+   It must cover drawing and closing a triangle, true geometry after applying a
+   hexagon, RGB Channels, Kernel support/floating-point/exact entry, Growth
+   curve/heatmap, Apply & Run, resize, graphics cleanup on exit, and half-block.
 
-## 17. 已取消或过时的内容
+## 16. Confirmed capabilities that still need product refinement
 
-- ❌ 不允许 T-junction；旧的 `tests/agentic/full-journey.md` J09 和早期设计文档仍写“允许 T”，应更新。
-- ❌ “Tiling 默认已有一个方形 polygon”是旧行为；当前产品要求是默认空白，用户选择预设或从头绘制。
-- ❌ 不要求 Growth 显式 `return`；最终表达式作为结果，因而 `if/else` 可以自然产生分支值。
-- ❌ Potential 不自动归一化；保留核卷积的原始值。
-- ❌ 不把 Channel 数与 Kernel 数强行绑定。
-- ❌ 不使用字符画作为正式 Kernel/Growth 可视化；graphics 是首选，half-block 只负责可交互降级。
+- ⏳ Stronger global tiling assistance: when polygons are far from a tileable
+  arrangement, provide intuitive candidate edge correspondences and actionable
+  repair suggestions instead of only reporting errors.
+- ⏳ For complex multi-polygon cells, improve discoverability, conflict
+  explanation, and failure recovery for "rough layout → solve → constrained
+  vertex refinement."
+- ⏳ Add direct visual controls for RuleSet sharing, local override, and reset
+  to default so users do not infer state from Inspector text.
+- ⏳ Make the legend and current tool for Kernel
+  active/inactive/support/zero states more prominent.
+- ⏳ When Growth uses more than two kernels, the plot currently uses the first
+  two for a heatmap and pins the rest; provide a clearer pinned-input UI.
 
-## 18. 用户审阅区
+## 17. Cancelled or obsolete requirements
 
-请按下面几类检查是否有遗漏：
+- ❌ Do not permit T-junctions. Legacy `tests/agentic/full-journey.md` J09 and
+  early design documents that permit them must be updated.
+- ❌ "Tiling starts with a square polygon" is obsolete. A new design starts
+  blank and the user selects a preset or draws from scratch.
+- ❌ Growth does not require explicit `return`; its final expression is the
+  result, allowing `if/else` to produce branch values naturally.
+- ❌ Potential is not automatically normalized; preserve the raw kernel
+  convolution value.
+- ❌ Do not force Channel count to equal Kernel count.
+- ❌ Do not use character art as the production Kernel/Growth visualization.
+  Graphics is primary; half-block only provides an interactive fallback.
 
-- [ ] 运行方式和平台
-- [ ] 模拟主界面操作
-- [ ] World 编辑
-- [ ] 晶胞/密铺创建、验证、求解和联动编辑
-- [ ] basis polygon 与 Channel 的语义
-- [ ] Channel 数量、颜色、显示和冻结
-- [ ] RuleSet 共享/分离策略
-- [ ] Kernel 数量、路由、形状、support、数值和预设
-- [ ] Growth 签名、语法、Rate/Value 和精细图
+## 18. User review checklist
+
+Review the following categories for omissions:
+
+- [ ] Launch modes and platforms
+- [ ] Main simulation controls
+- [ ] World editing
+- [ ] Unit-cell/tiling creation, validation, solving, and constrained editing
+- [ ] Basis-polygon and Channel semantics
+- [ ] Channel cardinality, colors, visibility, and freezing
+- [ ] RuleSet sharing and detachment policy
+- [ ] Kernel cardinality, routing, shape, support, values, and presets
+- [ ] Growth signature, syntax, Rate/Value, and high-resolution plots
 - [ ] Apply & Run
-- [ ] 保存、自动保存、加载和格式迁移
-- [ ] Direct / C/S / Kitty / half-block
-- [ ] 性能指标、进程清理和测试门禁
+- [ ] Save, autosave, load, and format migration
+- [ ] Direct/client-server, Kitty, and half-block behavior
+- [ ] Performance metrics, process cleanup, and test gates
 
-如果某一项的产品语义与你的预期不同，应先修改本清单，再改实现和 agentic 旅程；这样后续不会再次出现“测试通过了，但测的不是用户真正要的功能”。
+If any product semantic differs from user intent, update this inventory before
+changing implementation or agentic journeys. This prevents another false
+"tests passed" result that validated the wrong product behavior.

@@ -877,7 +877,7 @@ mod tests {
             },
             RemoteMessage::Input {
                 sequence: 12,
-                input: InputMessage::ExpressionKey(ExpressionKey::Char('中')),
+                input: InputMessage::ExpressionKey(ExpressionKey::Char('é')),
             },
             RemoteMessage::Input {
                 sequence: 13,
