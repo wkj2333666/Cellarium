@@ -1,5 +1,12 @@
 # Cellarium
 
+> **Architecture migration notice (2026-08-27):** the next major version is
+> replacing the terminal/SSH client-server interface with a local native
+> egui/wgpu GUI and local CUDA → portable GPU → CPU compute fallback. The
+> current v0.2.2 commands below describe the released legacy product. See
+> [GUI migration handoff](docs/gui-migration-handoff.md) for the approved
+> target and implementation entry points.
+
 Cellarium is a GPU-accelerated cellular automata laboratory with an interactive
 terminal UI. It supports Conway-style automata, Lenia/Orbium, editable kernels,
 custom rule programs, and CPU/CUDA simulation backends.
