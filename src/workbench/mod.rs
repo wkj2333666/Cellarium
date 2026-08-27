@@ -1,6 +1,7 @@
 pub mod camera_fit;
 mod channel_editor;
 mod command;
+pub mod decision;
 mod experiment_editor;
 mod growth_editor;
 pub mod growth_graph;

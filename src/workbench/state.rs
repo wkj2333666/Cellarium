@@ -70,13 +70,24 @@ pub struct SeamSolveSummary {
     pub max_residual: f64,
 }
 
+#[derive(Clone, Copy, Debug)]
+struct WorkbenchSelection {
+    channel: ChannelId,
+    basis: BasisId,
+    kernel: Option<KernelId>,
+    prototype: Option<PrototypeId>,
+}
+
 #[derive(Clone, Debug)]
 pub struct WorkbenchState {
     authoritative: ExperimentSpec,
     draft: ExperimentSpec,
     history: History,
+    selection_undo: Vec<WorkbenchSelection>,
+    selection_redo: Vec<WorkbenchSelection>,
     section: WorkbenchSection,
     focus: WorkbenchFocus,
+    decision: Option<super::decision::DecisionPanel>,
     status: DraftStatus,
     selected_channel: ChannelId,
     selected_basis: BasisId,
@@ -168,8 +179,11 @@ impl WorkbenchState {
             authoritative: spec.clone(),
             draft: spec,
             history: History::default(),
+            selection_undo: Vec::new(),
+            selection_redo: Vec::new(),
             section: WorkbenchSection::World,
             focus: WorkbenchFocus::Outline,
+            decision: None,
             status: DraftStatus::Clean,
             selected_channel,
             selected_basis,
@@ -220,6 +234,25 @@ impl WorkbenchState {
     }
     pub fn set_focus(&mut self, focus: WorkbenchFocus) {
         self.focus = focus;
+    }
+    pub fn decision(&self) -> Option<&super::decision::DecisionPanel> {
+        self.decision.as_ref()
+    }
+    pub fn present_decision(&mut self, decision: super::decision::DecisionPanel) {
+        self.decision = Some(decision);
+    }
+    pub fn cancel_decision(&mut self) {
+        self.decision = None;
+    }
+    pub fn choose_decision(&mut self, id: &str) -> Result<super::decision::DecisionChoice, String> {
+        let choice = self
+            .decision
+            .as_ref()
+            .ok_or_else(|| "no decision is active".to_string())?
+            .choose(id)?
+            .clone();
+        self.decision = None;
+        Ok(choice)
     }
     pub fn status(&self) -> DraftStatus {
         self.status
@@ -589,6 +622,7 @@ impl WorkbenchState {
         })
         .map_err(|error| error.to_string())?;
         self.cancel_color_editor();
+        self.cancel_decision();
         Ok(color)
     }
     pub fn tiling_tool(&self) -> super::tiling_editor::TilingTool {
@@ -1056,17 +1090,21 @@ impl WorkbenchState {
         Ok(next)
     }
     pub fn execute(&mut self, command: DraftCommand) -> Result<(), HistoryError> {
+        let selection = self.selection_snapshot();
         self.history.execute(&mut self.draft, command)?;
+        self.selection_undo.push(selection);
+        self.selection_redo.clear();
         self.status = DraftStatus::Dirty;
         Ok(())
     }
     pub fn undo(&mut self) -> Result<(), HistoryError> {
         self.finish_tiling_drag();
         self.tiling_constraints.clear();
+        let current = self.selection_snapshot();
         self.history.undo(&mut self.draft)?;
-        self.refresh_rule_selection();
-        self.growth_editor =
-            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+        let restored = self.selection_undo.pop().unwrap_or(current);
+        self.selection_redo.push(current);
+        self.restore_selection(restored);
         self.status = if self.draft == self.authoritative {
             DraftStatus::Clean
         } else {
@@ -1077,10 +1115,11 @@ impl WorkbenchState {
     pub fn redo(&mut self) -> Result<(), HistoryError> {
         self.finish_tiling_drag();
         self.tiling_constraints.clear();
+        let current = self.selection_snapshot();
         self.history.redo(&mut self.draft)?;
-        self.refresh_rule_selection();
-        self.growth_editor =
-            editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+        let restored = self.selection_redo.pop().unwrap_or(current);
+        self.selection_undo.push(current);
+        self.restore_selection(restored);
         self.status = DraftStatus::Dirty;
         Ok(())
     }
@@ -1094,7 +1133,10 @@ impl WorkbenchState {
         self.kernel_sigma_editing = false;
         self.cancel_kernel_resize_editor();
         self.cancel_color_editor();
+        self.cancel_decision();
         self.history.clear();
+        self.selection_undo.clear();
+        self.selection_redo.clear();
         self.status = DraftStatus::Clean;
         self.tiling_construction.clear();
         self.tiling_pointer = None;
@@ -1114,6 +1156,8 @@ impl WorkbenchState {
         self.cancel_kernel_resize_editor();
         self.cancel_color_editor();
         self.history.clear();
+        self.selection_undo.clear();
+        self.selection_redo.clear();
         self.status = DraftStatus::Clean;
         self.reconcile_selection_to_draft();
     }
@@ -1238,6 +1282,23 @@ impl WorkbenchState {
         self.refresh_rule_selection();
         self.growth_editor =
             editor_for_basis(&self.draft, self.selected_basis, self.selected_channel);
+    }
+
+    fn selection_snapshot(&self) -> WorkbenchSelection {
+        WorkbenchSelection {
+            channel: self.selected_channel,
+            basis: self.selected_basis,
+            kernel: self.selected_kernel,
+            prototype: self.selected_prototype,
+        }
+    }
+
+    fn restore_selection(&mut self, selection: WorkbenchSelection) {
+        self.selected_channel = selection.channel;
+        self.selected_basis = selection.basis;
+        self.selected_kernel = selection.kernel;
+        self.selected_prototype = selection.prototype;
+        self.reconcile_selection_to_draft();
     }
 
     pub fn selected_legacy_kernel(&self) -> Option<&KernelSlot> {
@@ -1571,8 +1632,8 @@ impl WorkbenchState {
                 }));
             Some(KernelId(0))
         };
-        self.selected_channel = id;
         self.replace_draft(next)?;
+        self.selected_channel = id;
         self.tiling_constraints.clear();
         self.refresh_rule_selection();
         self.selected_kernel = selected_kernel.or(self.selected_kernel);
@@ -1584,6 +1645,12 @@ impl WorkbenchState {
             return Err("an experiment must retain at least one channel".into());
         }
         let removed = self.selected_channel;
+        let removed_position = self
+            .draft
+            .channels
+            .iter()
+            .position(|channel| channel.id == removed)
+            .unwrap_or(0);
         let mut next = self.draft.clone();
         if !next.rules.is_empty()
             && next.rules.sets.iter().any(|rule| {
@@ -1621,9 +1688,15 @@ impl WorkbenchState {
                 .collect::<std::collections::BTreeSet<_>>();
             next.rules.sets.retain(|rule| referenced.contains(&rule.id));
         }
-        self.selected_channel = next.channels[0].id;
+        let nearest = next
+            .channels
+            .get(removed_position)
+            .or_else(|| next.channels.last())
+            .expect("channel minimum was checked")
+            .id;
         self.replace_draft(next)
             .map_err(|error| error.to_string())?;
+        self.selected_channel = nearest;
         self.refresh_rule_selection();
         Ok(())
     }
@@ -2217,8 +2290,9 @@ impl WorkbenchState {
         let command = DraftCommand::ReplaceDraft(Box::new(draft));
         if self.tiling_drag_active {
             self.history.coalesce_execute(&mut self.draft, command)?;
+            self.selection_redo.clear();
         } else {
-            self.history.execute(&mut self.draft, command)?;
+            self.execute(command)?;
             self.tiling_drag_active = true;
         }
         self.status = DraftStatus::Dirty;
@@ -2459,6 +2533,40 @@ mod tests {
         );
         assert_eq!(state.selected_kernel(), Some(kernels[0].id));
         crate::sim::experiment_model::validate_structure(state.draft()).unwrap();
+    }
+
+    #[test]
+    fn deleting_a_selected_middle_channel_selects_nearest_and_restores_selection_on_undo() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        state.add_channel().unwrap();
+        state.add_channel().unwrap();
+        state.set_selected_channel(ChannelId(1)).unwrap();
+
+        state.remove_selected_channel().unwrap();
+
+        assert_eq!(state.selected_channel(), ChannelId(2));
+        state.undo().unwrap();
+        assert_eq!(state.selected_channel(), ChannelId(1));
+        state.redo().unwrap();
+        assert_eq!(state.selected_channel(), ChannelId(2));
+    }
+
+    #[test]
+    fn decision_stays_visible_across_section_changes_until_cancelled() {
+        let mut state = WorkbenchState::new(ExperimentSpec::single_channel_lenia(8, 8));
+        state.present_decision(crate::workbench::decision::DecisionPanel::new(
+            "Cannot delete",
+            "Growth reads k1",
+            vec![crate::workbench::decision::DecisionChoice::new(
+                "cancel", "Cancel",
+            )],
+        ));
+
+        state.select_section(WorkbenchSection::Growth);
+
+        assert_eq!(state.decision().unwrap().detail, "Growth reads k1");
+        state.cancel_decision();
+        assert!(state.decision().is_none());
     }
 
     #[test]
