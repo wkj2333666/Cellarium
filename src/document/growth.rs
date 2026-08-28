@@ -4,7 +4,7 @@
 //! views of one thing. Keeping them here means the Workbench, the editor and
 //! the plot all read the same answer rather than each deriving its own.
 
-use crate::sim::experiment_model::{ExperimentSpec, KernelId, UpdateMode};
+use crate::sim::experiment_model::{ChannelId, ExperimentSpec, KernelId, UpdateMode};
 use crate::sim::growth::typecheck;
 use crate::sim::growth::types::ExternalSymbols;
 use crate::sim::ruleset::BindingKey;
@@ -147,6 +147,32 @@ pub fn analyze(
         })
 }
 
+/// The channel a rule-set updates, in the words the user gave it.
+///
+/// A refusal has to say which program to go and fix. "rule-set 4" is an id the
+/// user never chose and cannot see anywhere on screen; the channel it writes to
+/// is named on its own card.
+fn rule_set_owner(spec: &ExperimentSpec, rule: &crate::sim::ruleset::RuleSet) -> String {
+    if let Some(shared) = &rule.shared_name {
+        return shared.clone();
+    }
+    spec.rules
+        .bindings
+        .iter()
+        .find(|binding| binding.rule_set == rule.id)
+        .map(|binding| channel_named(spec, binding.output))
+        .unwrap_or_else(|| format!("rule-set {}", rule.id.0))
+}
+
+/// A channel's name, or a description of it when it has none.
+fn channel_named(spec: &ExperimentSpec, channel: ChannelId) -> String {
+    spec.channels
+        .iter()
+        .find(|entry| entry.id == channel)
+        .map(|entry| entry.name.clone())
+        .unwrap_or_else(|| format!("channel {}", channel.0))
+}
+
 /// Every growth program in the experiment that does not compile.
 ///
 /// Structural validation checks that the pieces fit together; it does not read
@@ -170,8 +196,8 @@ pub fn invalid_programs(spec: &ExperimentSpec) -> Vec<String> {
             };
             if let Err(diagnostics) = typecheck::compile(&rule.growth.source, &externals) {
                 problems.push(format!(
-                    "rule-set {} growth does not compile: {}",
-                    rule.id.0,
+                    "the growth program for {} does not compile: {}",
+                    rule_set_owner(spec, rule),
                     join(&rule.growth.source, diagnostics)
                 ));
             }
@@ -191,8 +217,8 @@ pub fn invalid_programs(spec: &ExperimentSpec) -> Vec<String> {
         };
         if let Err(diagnostics) = typecheck::compile(&growth.source, &externals) {
             problems.push(format!(
-                "channel {} growth does not compile: {}",
-                growth.target.0,
+                "the growth program for {} does not compile: {}",
+                channel_named(spec, growth.target),
                 join(&growth.source, diagnostics)
             ));
         }
