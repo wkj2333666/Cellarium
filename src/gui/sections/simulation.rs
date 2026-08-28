@@ -321,6 +321,7 @@ fn recording_bar(app: &mut CellariumGui, ui: &mut Ui) {
         if ui
             .add_enabled(frames > 0, egui::Button::new("Clear take"))
             .on_hover_text("Discard every recorded frame and free the memory")
+            .on_disabled_hover_text("Nothing has been recorded yet")
             .clicked()
         {
             app.recording_mut().clear();

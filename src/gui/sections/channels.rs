@@ -181,19 +181,23 @@ fn colour(app: &mut CellariumGui, ui: &mut Ui) {
         // Exact values, for a colour no preset covers. The fields open on the
         // channel's own colour: a picker that starts somewhere else is asking
         // the user to re-enter what they already have before they can nudge it.
-        if let Some(DisplayColor::Custom(rgb)) = &current {
-            app.set_channel_colour_draft([rgb.red, rgb.green, rgb.blue]);
-        } else if current.is_some() {
-            let index = app
-                .spec()
-                .channels
-                .iter()
-                .position(|channel| channel.id == selected)
-                .unwrap_or(0);
-            let palette = automatic_palette(app.spec().channels.len());
-            if let Some(colour) = palette.get(index) {
-                app.set_channel_colour_draft([colour.red, colour.green, colour.blue]);
+        let effective = match &current {
+            Some(DisplayColor::Custom(rgb)) => Some([rgb.red, rgb.green, rgb.blue]),
+            Some(_) => {
+                let index = app
+                    .spec()
+                    .channels
+                    .iter()
+                    .position(|channel| channel.id == selected)
+                    .unwrap_or(0);
+                automatic_palette(app.spec().channels.len())
+                    .get(index)
+                    .map(|colour| [colour.red, colour.green, colour.blue])
             }
+            None => None,
+        };
+        if let Some(effective) = effective {
+            app.seed_channel_colour_draft(selected, effective);
         }
         let mut rgb = app.channel_colour_draft();
         let mut changed = false;
@@ -209,6 +213,12 @@ fn colour(app: &mut CellariumGui, ui: &mut Ui) {
         if changed {
             app.set_channel_colour_draft(rgb);
         }
+        ui.horizontal(|ui| {
+            let (rect, _) = ui.allocate_exact_size(egui::vec2(12.0, 12.0), egui::Sense::hover());
+            ui.painter()
+                .rect_filled(rect, 2.0, Color32::from_rgb(rgb[0], rgb[1], rgb[2]));
+            ui.label("preview");
+        });
         if ui.button("Set exact colour").clicked() {
             app.set_selected_channel_rgb(rgb[0], rgb[1], rgb[2]);
             ui.close();
@@ -225,6 +235,7 @@ fn colour(app: &mut CellariumGui, ui: &mut Ui) {
             egui::Button::new("Automatic colour"),
         )
         .on_hover_text("Return this channel to its slot in the palette")
+        .on_disabled_hover_text("This channel is already using its palette colour")
         .clicked()
     {
         app.set_selected_channel_automatic_colour();

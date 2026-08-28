@@ -272,6 +272,12 @@ pub struct CellariumGui {
     /// Working RGB for the colour popover, so dragging the fields does not
     /// write a new draft on every pixel of movement.
     channel_colour_draft: [u8; 3],
+    /// The channel and colour the draft above was last seeded from.
+    ///
+    /// The picker has to open on the channel's own colour, but seeding it every
+    /// frame overwrites whatever the user is in the middle of typing, which
+    /// left the exact-colour fields impossible to change at all.
+    channel_colour_seed: Option<(ChannelId, [u8; 3])>,
     kernel_canvas: KernelCanvasState,
     kernel_popover: NumericPopover,
     /// A destructive kernel edit waiting for the user's answer, with the
@@ -383,6 +389,7 @@ impl CellariumGui {
             tiling_canvas: TilingCanvasState::default(),
             channel_canvas: ChannelCanvasState::default(),
             channel_colour_draft: [236, 240, 246],
+            channel_colour_seed: None,
             kernel_canvas: KernelCanvasState::new(),
             kernel_popover: NumericPopover::default(),
             kernel_decision: None,
@@ -1365,8 +1372,20 @@ impl CellariumGui {
         self.channel_colour_draft = rgb;
     }
 
+    /// Open the exact-colour fields on a channel's own colour.
+    ///
+    /// Only when that colour is not the one they were opened on: re-seeding
+    /// every frame would discard each keystroke as it was made.
+    pub fn seed_channel_colour_draft(&mut self, channel: ChannelId, rgb: [u8; 3]) {
+        if self.channel_colour_seed != Some((channel, rgb)) {
+            self.channel_colour_seed = Some((channel, rgb));
+            self.channel_colour_draft = rgb;
+        }
+    }
+
     pub fn set_selected_channel_rgb(&mut self, red: u8, green: u8, blue: u8) {
         self.channel_colour_draft = [red, green, blue];
+        self.channel_colour_seed = None;
         self.dispatch_document(DocumentCommand::SetSelectedChannelColor(
             crate::document::custom_color(red, green, blue),
         ));

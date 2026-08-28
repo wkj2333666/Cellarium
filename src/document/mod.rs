@@ -152,6 +152,22 @@ pub struct DocumentController {
     coalesce_next_edit: bool,
 }
 
+/// The reasons, as sentences, without repeating one the user has already read.
+///
+/// The validator reports a problem per binding, and bindings come one per
+/// channel, so a single underlying fault reached the status bar as the same
+/// sentence twice over.
+fn distinct_reasons<E: std::fmt::Display>(errors: Vec<E>) -> Vec<String> {
+    let mut reasons: Vec<String> = Vec::new();
+    for error in errors {
+        let reason = error.to_string();
+        if !reasons.contains(&reason) {
+            reasons.push(reason);
+        }
+    }
+    reasons
+}
+
 impl DocumentController {
     pub fn new(spec: ExperimentSpec) -> Self {
         let selection = EditorSelection::initial(&spec);
@@ -391,9 +407,8 @@ impl DocumentController {
             .draft
             .clone()
             .normalize_rules()
-            .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())?;
-        validate_structure(&candidate)
-            .map_err(|errors| errors.iter().map(ToString::to_string).collect::<Vec<_>>())?;
+            .map_err(distinct_reasons)?;
+        validate_structure(&candidate).map_err(distinct_reasons)?;
         // Structure says the pieces fit; this says the programs can run. An
         // experiment applied without it fails later, in the backend, where the
         // user has no way to connect the failure to what they typed.

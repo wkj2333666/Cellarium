@@ -148,15 +148,16 @@ fn append_basis(
             .checked_add(1)
             .ok_or("prototype id exhausted")?,
     );
+    // An untiled draft is not unbound: `basis_ids` reports the implicit
+    // `BasisId(0)`, and every binding and weight plane an Apply normalized is
+    // keyed to it. Numbering the first real basis from one instead would strand
+    // all of them the moment a tiling appeared, so the first basis adopts the
+    // implicit id rather than inventing a new one.
     let basis = BasisId(
-        tiling
-            .instances
-            .iter()
-            .map(|entry| entry.id.0)
-            .max()
-            .unwrap_or(0)
-            .checked_add(1)
-            .ok_or("basis id exhausted")?,
+        match tiling.instances.iter().map(|entry| entry.id.0).max() {
+            Some(highest) => highest.checked_add(1).ok_or("basis id exhausted")?,
+            None => 0,
+        },
     );
     tiling.prototypes.push(TilePrototype {
         id: prototype,
@@ -254,6 +255,29 @@ fn bind_active_channels(next: &mut ExperimentSpec, basis: BasisId) -> Result<(),
     Ok(())
 }
 
+/// Drop the bindings and weight planes of bases the tiling no longer has.
+///
+/// Replacing a tiling renumbers its bases, and a draft that kept a binding for
+/// a basis that is gone does not validate — the user is told their rules
+/// reference a missing basis, in an error naming an id they never chose, and
+/// the experiment cannot be applied until they undo. Adding a basis is already
+/// handled where it is added; this is the other half.
+fn retire_missing_bases(next: &mut ExperimentSpec) {
+    let surviving = next.basis_ids();
+    next.rules
+        .bindings
+        .retain(|binding| surviving.contains(&binding.basis));
+    for rule in &mut next.rules.sets {
+        for kernel in &mut rule.kernels {
+            if let KernelSpatialDefinition::Periodic(definition) = &mut kernel.spatial {
+                definition
+                    .planes
+                    .retain(|basis, _| surviving.contains(basis));
+            }
+        }
+    }
+}
+
 /// Replace the whole tiling with a preset unit cell.
 pub fn apply_preset(
     draft: &ExperimentSpec,
@@ -300,6 +324,7 @@ pub fn apply_preset(
             }
         }
     }
+    retire_missing_bases(&mut next);
     Ok(next)
 }
 
@@ -415,5 +440,67 @@ mod tests {
             assert_eq!(tiling.translation_a, expected.translation_a, "{preset:?}");
             assert_eq!(tiling.translation_b, expected.translation_b, "{preset:?}");
         }
+    }
+
+    /// A draft with more than one channel carries rule bindings, and those
+    /// bindings are keyed by basis. Adding a tiling renumbers the bases, so a
+    /// binding made while the draft was untiled has to survive the change or
+    /// the user is left with an experiment that cannot be applied.
+    fn two_channel_untiled() -> ExperimentSpec {
+        let spec = blank();
+        let spec = crate::document::channels::add_channel(&spec)
+            .expect("a second channel")
+            .spec;
+        // Applying is what turns the legacy representation into the bindings
+        // that a basis renumbering can orphan, so the draft under test is the
+        // one the user actually has after their first Apply.
+        spec.normalize_rules().expect("a normalized draft")
+    }
+
+    #[test]
+    fn an_untiled_draft_binds_the_implicit_basis() {
+        let spec = two_channel_untiled();
+        assert_eq!(spec.basis_ids(), vec![BasisId(0)]);
+        assert!(
+            spec.rules.bindings.iter().any(|b| b.basis == BasisId(0)),
+            "a channel added while untiled binds the implicit basis"
+        );
+    }
+
+    #[test]
+    fn a_preset_does_not_orphan_the_bindings_the_draft_already_had() {
+        for preset in TilingPreset::ALL {
+            let tiled = apply_preset(&two_channel_untiled(), preset, 1.0).unwrap();
+            crate::sim::experiment_model::validate_structure(&tiled).unwrap_or_else(|errors| {
+                panic!(
+                    "{preset:?} left the draft invalid: {}",
+                    errors
+                        .iter()
+                        .map(|error| error.to_string())
+                        .collect::<Vec<_>>()
+                        .join("; ")
+                )
+            });
+        }
+    }
+
+    #[test]
+    fn drawing_the_first_basis_does_not_orphan_existing_bindings() {
+        let commit = finish_polygon(
+            &two_channel_untiled(),
+            &triangle(),
+            ConstructionTarget::NewBasis,
+        )
+        .unwrap();
+        crate::sim::experiment_model::validate_structure(&commit.spec).unwrap_or_else(|errors| {
+            panic!(
+                "drawing the first basis left the draft invalid: {}",
+                errors
+                    .iter()
+                    .map(|error| error.to_string())
+                    .collect::<Vec<_>>()
+                    .join("; ")
+            )
+        });
     }
 }

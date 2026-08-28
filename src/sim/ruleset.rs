@@ -427,7 +427,7 @@ pub enum RuleSetError {
     },
     #[error("binding {0:?} is duplicated")]
     DuplicateBinding(BindingKey),
-    #[error("binding references missing basis {0:?}")]
+    #[error("a rule is bound to basis {}, which the tiling no longer has", .0.0)]
     MissingBasis(BasisId),
     #[error("binding targets missing or frozen channel {0:?}")]
     InvalidBindingOutput(ChannelId),

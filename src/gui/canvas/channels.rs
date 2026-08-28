@@ -300,13 +300,21 @@ pub fn render_channel_canvas(
                 .get(index)
                 .map(|channel| channel.name.as_str())
                 .unwrap_or("channel");
-            painter.text(
-                origin + egui::vec2(4.0, 2.0),
-                egui::Align2::LEFT_TOP,
-                name,
+            // On a plate, because the caption is drawn over the channel it
+            // names: pale text on a bright channel dissolves into it, and a
+            // caption that is only legible over dark cells does not do its job.
+            let galley = painter.layout_no_wrap(
+                name.to_owned(),
                 egui::FontId::proportional(12.0),
                 theme::SELECTION,
             );
+            let at = origin + egui::vec2(4.0, 2.0);
+            painter.rect_filled(
+                egui::Rect::from_min_size(at, galley.size()).expand(3.0),
+                3.0,
+                Color32::from_black_alpha(190),
+            );
+            painter.galley(at, galley, theme::SELECTION);
         }
     }
 

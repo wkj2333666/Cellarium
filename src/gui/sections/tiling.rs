@@ -53,6 +53,7 @@ fn toolbar(app: &mut CellariumGui, ui: &mut Ui) {
             if ui
                 .add_enabled(selected.is_some(), egui::Button::new("Redraw selected"))
                 .on_hover_text("Replace the selected polygon with a new outline")
+                .on_disabled_hover_text("Click a polygon on the canvas to select it first")
                 .clicked()
                 && let Some(prototype) = selected
             {
@@ -105,6 +106,7 @@ fn construction_controls(app: &mut CellariumGui, ui: &mut Ui) {
     if ui
         .add_enabled(can_undo, egui::Button::new("Undo point"))
         .on_hover_text("Remove the last placed vertex")
+        .on_disabled_hover_text("No vertex has been placed yet")
         .clicked()
     {
         app.tiling_canvas_mut().undo_point();
@@ -113,6 +115,7 @@ fn construction_controls(app: &mut CellariumGui, ui: &mut Ui) {
     if ui
         .add_enabled(can_redo, egui::Button::new("Redo point"))
         .on_hover_text("Put back the vertex that was undone")
+        .on_disabled_hover_text("No vertex has been undone")
         .clicked()
     {
         app.tiling_canvas_mut().redo_point();
@@ -120,6 +123,7 @@ fn construction_controls(app: &mut CellariumGui, ui: &mut Ui) {
     if ui
         .add_enabled(placed >= 3, egui::Button::new("Finish polygon"))
         .on_hover_text("Close the outline and add it to the unit cell")
+        .on_disabled_hover_text("Place at least three vertices to close an outline")
         .clicked()
     {
         app.finish_tiling_polygon();
@@ -140,6 +144,7 @@ fn seams(app: &mut CellariumGui, ui: &mut Ui) {
     if ui
         .add_enabled(has_tiling, egui::Button::new("Solve seams"))
         .on_hover_text("Propose the full-edge pairs that glue the tiling together")
+        .on_disabled_hover_text("Pick a preset or draw a polygon first — there is no tiling yet")
         .clicked()
         && let Some(draft) = app.spec().tiling.clone()
     {

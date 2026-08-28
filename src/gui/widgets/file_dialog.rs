@@ -126,6 +126,7 @@ impl FileDialog {
                 if ui
                     .add_enabled(self.directory.parent().is_some(), egui::Button::new("Up"))
                     .on_hover_text("Go to the folder above")
+                    .on_disabled_hover_text("This is the top of the filesystem")
                     .clicked()
                     && let Some(parent) = self.directory.parent()
                 {
@@ -194,6 +195,7 @@ impl FileDialog {
                 let ready = !self.file_name.trim().is_empty();
                 if ui
                     .add_enabled(ready, egui::Button::new(self.kind.confirm()))
+                    .on_disabled_hover_text("Type a file name first")
                     .clicked()
                 {
                     outcome = self.confirm();
