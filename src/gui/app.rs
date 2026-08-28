@@ -1739,6 +1739,7 @@ mod tests {
 
     #[test]
     fn a_started_gui_reports_its_backend_and_reaches_the_worker() {
+        let _one = crate::test_backend_guard::one_backend_at_a_time();
         let mut model = CellariumGui::new(ExperimentSpec::single_channel_lenia(8, 8));
         assert!(model.snapshot().is_some(), "worker should be running");
         // Auto picks the best backend this machine offers, so assert that the
@@ -1762,6 +1763,7 @@ mod tests {
 
     #[test]
     fn a_running_simulation_keeps_publishing_new_ticks() {
+        let _one = crate::test_backend_guard::one_backend_at_a_time();
         let mut model = CellariumGui::new(ExperimentSpec::single_channel_lenia(8, 8));
         model.dispatch(ShellAction::ToggleRunning);
         assert!(model.running_intent(), "pressing Run records the intent");
@@ -1773,6 +1775,7 @@ mod tests {
 
     #[test]
     fn requiring_the_cpu_runs_on_the_cpu() {
+        let _one = crate::test_backend_guard::one_backend_at_a_time();
         let mut model = CellariumGui::new(ExperimentSpec::single_channel_lenia(8, 8));
         model.select_backend(BackendPolicy::RequireCpu);
         assert!(model.status().backend.starts_with("CPU"));

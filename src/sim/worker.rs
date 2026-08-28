@@ -675,6 +675,7 @@ mod tests {
 
     #[test]
     fn a_failed_backend_hands_over_to_the_next_auto_candidate_and_keeps_running() {
+        let _one = crate::test_backend_guard::one_backend_at_a_time();
         use crate::sim::backend_selector::{BackendPolicy, Candidate};
         let (plan, _) = tiny_plan();
         let fallback = crate::sim::worker::BackendFallback::new(
@@ -702,6 +703,7 @@ mod tests {
 
     #[test]
     fn an_explicit_requirement_pauses_instead_of_changing_backend_kind() {
+        let _one = crate::test_backend_guard::one_backend_at_a_time();
         use crate::sim::backend_selector::{BackendPolicy, Candidate};
         let (plan, _) = tiny_plan();
         let fallback = crate::sim::worker::BackendFallback::new(
