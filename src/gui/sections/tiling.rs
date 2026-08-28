@@ -100,7 +100,7 @@ fn construction_controls(app: &mut CellariumGui, ui: &mut Ui) {
         })
         .color(theme::state_color(theme::State::Draft)),
     );
-    ui.label(format!("{placed} vertices"));
+    ui.label(theme::plural(placed, "vertex", "vertices"));
     let can_undo = app.tiling_canvas().can_undo_point();
     if ui
         .add_enabled(can_undo, egui::Button::new("Undo point"))
@@ -181,11 +181,11 @@ fn coverage(app: &CellariumGui, ui: &mut Ui) {
         Err(diagnostics) => (
             theme::State::Invalid,
             "does not tile",
-            diagnostics
-                .iter()
-                .map(|entry| entry.message.clone())
-                .collect::<Vec<_>>()
-                .join("; "),
+            // One problem is a thing to fix; forty are a wall of text over the
+            // drawing the user needs to look at to fix them. The rest are
+            // counted, not listed, and they are usually the same problem seen
+            // from every repeat of the lattice anyway.
+            summarize(&diagnostics),
         ),
     };
     ui.label(
@@ -193,6 +193,20 @@ fn coverage(app: &CellariumGui, ui: &mut Ui) {
             .color(theme::state_color(state)),
     )
     .on_hover_text(detail);
+}
+
+/// The first few problems, and a count of the rest.
+fn summarize(diagnostics: &[crate::sim::tiling::TilingDiagnostic]) -> String {
+    const SHOWN: usize = 3;
+    let mut lines: Vec<String> = diagnostics
+        .iter()
+        .take(SHOWN)
+        .map(|entry| entry.message.clone())
+        .collect();
+    if diagnostics.len() > SHOWN {
+        lines.push(format!("and {} more like these", diagnostics.len() - SHOWN));
+    }
+    lines.join("\n")
 }
 
 fn canvas(app: &mut CellariumGui, ui: &mut Ui) {
@@ -261,16 +275,8 @@ fn proposal_bar(app: &mut CellariumGui, ui: &mut Ui, count: usize, residual: f64
 }
 
 fn readout(app: &CellariumGui, ui: &mut Ui, hovered: Option<crate::sim::tiling::Vec2>) {
-    if let Some(notice) = app.notice() {
-        ui.add(
-            egui::Label::new(
-                RichText::new(notice).color(theme::state_color(theme::State::Invalid)),
-            )
-            .truncate(),
-        )
-        .on_hover_text(notice);
-        return;
-    }
+    // General messages belong in the status bar, where every workspace can see
+    // them. This line is for what the tiling canvas itself is saying.
     if let Some(reason) = &app.tiling_canvas().rejection {
         ui.add(
             egui::Label::new(

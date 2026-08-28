@@ -66,6 +66,37 @@ impl CellState {
             CellState::Inactive => theme::KERNEL_INACTIVE,
         }
     }
+
+    /// The cell's colour with its weight shown as intensity.
+    ///
+    /// A view called "weights" has to distinguish them. `magnitude` is the
+    /// cell's share of the largest weight in the stencil, so a flat kernel
+    /// reads flat and a ring kernel shows its ring. The floor keeps the
+    /// smallest non-zero weight visibly different from an active zero rather
+    /// than fading into the background.
+    pub fn shaded(self, magnitude: f32) -> egui::Color32 {
+        match self {
+            CellState::Positive | CellState::Negative => {
+                let base = self.color();
+                let t = MIN_SHADE + (1.0 - MIN_SHADE) * magnitude.clamp(0.0, 1.0).sqrt();
+                egui::Color32::from_rgb(
+                    lerp_channel(theme::KERNEL_WEIGHT_FLOOR.r(), base.r(), t),
+                    lerp_channel(theme::KERNEL_WEIGHT_FLOOR.g(), base.g(), t),
+                    lerp_channel(theme::KERNEL_WEIGHT_FLOOR.b(), base.b(), t),
+                )
+            }
+            other => other.color(),
+        }
+    }
+}
+
+/// Faintest a non-zero weight is ever drawn, as a fraction of full colour.
+const MIN_SHADE: f32 = 0.28;
+
+fn lerp_channel(from: u8, to: u8, t: f32) -> u8 {
+    (from as f32 + (to as f32 - from as f32) * t)
+        .round()
+        .clamp(0.0, 255.0) as u8
 }
 
 pub fn classify(weight: f32, active: bool) -> CellState {
@@ -103,6 +134,28 @@ impl KernelStencil {
 
     pub fn state(&self, x: usize, y: usize) -> CellState {
         classify(self.weight(x, y), self.is_active(x, y))
+    }
+
+    /// Largest absolute weight among the contributing cells.
+    pub fn peak_magnitude(&self) -> f32 {
+        (0..self.height)
+            .flat_map(|y| (0..self.width).map(move |x| (x, y)))
+            .filter(|(x, y)| self.is_active(*x, *y))
+            .map(|(x, y)| self.weight(x, y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    /// This cell's weight as a fraction of the stencil's largest.
+    ///
+    /// Relative rather than absolute because kernels are normalized: a
+    /// sum-to-one kernel over a thousand cells holds weights near 0.001, and
+    /// an absolute scale would render all of them black.
+    pub fn relative_magnitude(&self, x: usize, y: usize) -> f32 {
+        let peak = self.peak_magnitude();
+        if peak <= 0.0 {
+            return 0.0;
+        }
+        self.weight(x, y).abs() / peak
     }
 
     /// Sum of the weights that actually contribute. Shown beside the canvas
@@ -213,7 +266,11 @@ pub fn render_kernel_canvas(
                 transform.world_to_screen([x as f64 + 1.0, y as f64 + 1.0]),
             );
             let state_of = stencil.state(x, y);
-            painter.rect_filled(cell.shrink(0.5), 0.0, state_of.color());
+            painter.rect_filled(
+                cell.shrink(0.5),
+                0.0,
+                state_of.shaded(stencil.relative_magnitude(x, y)),
+            );
             if state_of == CellState::Inactive {
                 // An inactive cell keeps a faint outline so the stencil's shape
                 // stays visible instead of dissolving into the background.

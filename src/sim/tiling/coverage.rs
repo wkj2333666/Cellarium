@@ -66,18 +66,27 @@ pub fn validate_periodic_tiling(
             })),
         }
     }
+    // Stated as a share of the unit cell. "covers 78% of the unit cell, so 22%
+    // is left bare" is something a user can act on; two areas in scientific
+    // notation is something they have to do arithmetic on first.
     if raw_face_area < patch_area - tolerance {
+        let share = raw_face_area / patch_area;
         diagnostics.push(diagnostic(
             "coverage_gap",
             format!(
-                "periodic faces cover area {raw_face_area:.12e}; patch area is {patch_area:.12e}"
+                "the tiles cover {:.0}% of the unit cell, leaving {:.0}% bare",
+                share * 100.0,
+                (1.0 - share) * 100.0
             ),
         ));
     } else if raw_face_area > patch_area + tolerance {
+        let share = raw_face_area / patch_area;
         diagnostics.push(diagnostic(
             "coverage_overlap",
             format!(
-                "periodic faces cover area {raw_face_area:.12e}; patch area is {patch_area:.12e}"
+                "the tiles cover {:.0}% of the unit cell, so they overlap by {:.0}%",
+                share * 100.0,
+                (share - 1.0) * 100.0
             ),
         ));
     }

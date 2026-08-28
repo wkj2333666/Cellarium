@@ -172,7 +172,7 @@ pub fn invalid_programs(spec: &ExperimentSpec) -> Vec<String> {
                 problems.push(format!(
                     "rule-set {} growth does not compile: {}",
                     rule.id.0,
-                    join(diagnostics)
+                    join(&rule.growth.source, diagnostics)
                 ));
             }
         }
@@ -193,24 +193,100 @@ pub fn invalid_programs(spec: &ExperimentSpec) -> Vec<String> {
             problems.push(format!(
                 "channel {} growth does not compile: {}",
                 growth.target.0,
-                join(diagnostics)
+                join(&growth.source, diagnostics)
             ));
         }
     }
     problems
 }
 
-fn join(diagnostics: Vec<crate::sim::growth::typecheck::TypeDiagnostic>) -> String {
+/// Say what is wrong in a sentence, naming the text it is wrong about.
+///
+/// The compiler's own codes are stable identifiers meant for us. `unknown_symbol`
+/// tells a user neither what a symbol is nor which one we mean, and it is the
+/// only thing they get when their program will not run. `offending` is the
+/// source text the diagnostic covers, so the sentence can quote it.
+pub fn describe_diagnostic(code: &str, offending: &str) -> String {
+    let offending = offending.trim();
+    let quoted = |fallback: &str| {
+        if offending.is_empty() {
+            fallback.to_string()
+        } else {
+            format!("`{offending}`")
+        }
+    };
+    match code {
+        "unknown_symbol" => format!(
+            "{} is not one of this program's inputs",
+            quoted("that name")
+        ),
+        "unknown_function" => format!("there is no function called {}", quoted("that")),
+        "wrong_arity" => format!(
+            "{} was given the wrong number of arguments",
+            quoted("that call")
+        ),
+        "expected_expression" => "a value is missing here".to_string(),
+        "expected_identifier" => "a name was expected here".to_string(),
+        "expected_semicolon" => "this line needs a `;` to end it".to_string(),
+        "expected_equal" => "this definition needs an `=`".to_string(),
+        "expected_left_brace" => "a `{` was expected here".to_string(),
+        "expected_right_brace" => "a `}` is missing".to_string(),
+        "expected_right_paren" => "a `)` is missing".to_string(),
+        "expected_else" => "this `if` needs a matching `else`".to_string(),
+        "expected_bool" => "this has to be a true-or-false test".to_string(),
+        "expected_scalar" => "this has to be a number".to_string(),
+        "branch_type_mismatch" => "the two branches produce different kinds of value".to_string(),
+        "missing_result_expression" => "the program never produces a result".to_string(),
+        "duplicate_binding" => format!("{} is defined twice", quoted("this name")),
+        "reserved_binding" => format!("{} is a reserved name", quoted("this name")),
+        "invalid_character" => format!("{} is not valid here", quoted("this character")),
+        "invalid_number" => format!("{} is not a number this program can read", quoted("this")),
+        "unexpected_token" => format!("{} does not belong here", quoted("this")),
+        "division_by_zero" => "this always divides by zero".to_string(),
+        "log_domain" => {
+            "this takes the logarithm of a value that can be zero or negative".to_string()
+        }
+        "sqrt_domain" => "this takes the square root of a value that can be negative".to_string(),
+        "critical_thresholds" => "this compares values that are too close to separate".to_string(),
+        // An unmapped code is still shown rather than swallowed: a user seeing
+        // a bare code can quote it, where silence tells them nothing at all.
+        other => other.replace('_', " "),
+    }
+}
+
+/// Render diagnostics for a message the user reads outside the editor.
+///
+/// Byte offsets are the wrong coordinates for a person: the editor shows lines
+/// and columns, so a refusal that cites `47..50` describes a position the user
+/// cannot find on screen.
+fn join(source: &str, diagnostics: Vec<crate::sim::growth::typecheck::TypeDiagnostic>) -> String {
     diagnostics
         .into_iter()
         .map(|diagnostic| {
+            let (line, column) = line_and_column(source, diagnostic.span.start);
+            let offending = source
+                .get(diagnostic.span.start..diagnostic.span.end)
+                .unwrap_or("");
             format!(
-                "{} at {}..{}",
-                diagnostic.code, diagnostic.span.start, diagnostic.span.end
+                "line {line}, column {column}: {}",
+                describe_diagnostic(diagnostic.code, offending)
             )
         })
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// One-based line and column of a byte offset.
+fn line_and_column(source: &str, offset: usize) -> (usize, usize) {
+    let clamped = offset.min(source.len());
+    let before = &source[..clamped];
+    let line = before.matches('\n').count() + 1;
+    let column = before
+        .rfind('\n')
+        .map(|index| before[index + 1..].chars().count())
+        .unwrap_or_else(|| before.chars().count())
+        + 1;
+    (line, column)
 }
 
 /// Replace the growth source of a binding.

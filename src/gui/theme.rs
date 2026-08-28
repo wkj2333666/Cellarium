@@ -26,6 +26,10 @@ pub const KERNEL_ACTIVE_ZERO: Color32 = Color32::from_rgb(122, 130, 146);
 /// stencil's shape stays legible without the cell claiming to hold a value.
 pub const KERNEL_INACTIVE: Color32 = Color32::from_rgb(18, 22, 34);
 pub const KERNEL_ANCHOR: Color32 = Color32::from_rgb(226, 178, 66);
+/// What a weight fades towards as it approaches zero. Darker than
+/// [`KERNEL_ACTIVE_ZERO`] so the faintest real weight still reads as carrying
+/// something, and never so dark that it is mistaken for an absent cell.
+pub const KERNEL_WEIGHT_FLOOR: Color32 = Color32::from_rgb(30, 38, 54);
 
 /// Tiling canvas. The unit cell is opaque and its periodic copies are
 /// translucent, so what is editable is visibly distinct from what is context.
@@ -69,6 +73,18 @@ pub enum State {
     Live,
     Invalid,
     Stale,
+}
+
+/// Pluralize a count for a label the user reads.
+///
+/// "1 channels" and "1 vertices" are small errors that make a careful interface
+/// look careless, and they appear wherever a count is formatted by hand.
+pub fn plural(count: usize, singular: &str, plural: &str) -> String {
+    if count == 1 {
+        format!("{count} {singular}")
+    } else {
+        format!("{count} {plural}")
+    }
 }
 
 #[cfg(test)]

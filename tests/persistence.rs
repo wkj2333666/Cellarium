@@ -28,24 +28,38 @@ fn an_experiment_saves_reopens_and_keeps_what_was_edited() {
     let mut first = app(&root);
     first.set_growth_source("self * 0.25");
     first.save_experiment_as(&path);
-    assert_eq!(first.notice(), None, "saving must succeed");
+    // A successful save confirms itself. Silence is what made saving feel like
+    // nothing had happened.
+    let notice = first.notice().expect("a save reports where it went");
+    assert!(notice.contains("experiment.ron"), "{notice}");
     assert_eq!(first.experiment_path(), Some(path.as_path()));
 
     // A second session opens the file and finds the same experiment.
     let mut second = app(&root);
     second.open_experiment(&path);
-    assert_eq!(second.notice(), None);
+    let notice = second.notice().expect("opening reports what was opened");
+    assert!(notice.contains("experiment.ron"), "{notice}");
     assert_eq!(second.growth_source(), "self * 0.25");
     assert_eq!(second.experiment_path(), Some(path.as_path()));
 }
 
 #[test]
-fn saving_without_a_path_says_so_rather_than_writing_somewhere_arbitrary() {
+fn saving_without_a_path_asks_where_rather_than_writing_somewhere_arbitrary() {
     let root = temp_root("no-path");
     let mut app = app(&root);
     app.save_experiment();
-    let notice = app.notice().expect("a save with no path must report why");
-    assert!(notice.contains("no path"), "{notice}");
+    // Save on an unnamed experiment asks where to put it. Reporting "this
+    // experiment has no path yet" and stopping told the user to use a control
+    // that did not exist, which left no way at all to save from the window.
+    assert!(
+        app.file_dialog_open(),
+        "an unnamed experiment asks for a name instead of refusing"
+    );
+    assert_eq!(
+        app.experiment_path(),
+        None,
+        "and nothing is written until the user answers"
+    );
 }
 
 #[test]
@@ -80,12 +94,12 @@ fn opening_replaces_the_view_state_that_described_the_old_experiment() {
     app.save_experiment_as(&path);
 
     // Leave view state behind that belongs to the experiment being replaced.
-    app.world_canvas_mut().brush_radius = 9;
+    app.world_canvas_mut().brush.radius = 9;
     app.kernel_canvas_mut().selected_cell = Some((3, 4));
     app.open_experiment(&path);
 
     assert_ne!(
-        app.world_canvas().brush_radius,
+        app.world_canvas().brush.radius,
         9,
         "a zoom or selection from the previous experiment must not carry over"
     );
@@ -120,7 +134,7 @@ fn an_old_format_file_opens_without_being_rewritten_on_the_way_in() {
 
     let mut app = app(&root);
     app.open_experiment(&path);
-    assert_eq!(app.notice(), None);
+    assert!(app.notice().is_some_and(|notice| notice.contains("opened")));
     // The experiment that comes back is the experiment that went in: opening
     // does not normalize on the user's behalf.
     assert_eq!(app.spec(), &spec);

@@ -5,6 +5,7 @@
 //! Workbench and the egui GUI both drive it through typed [`DocumentCommand`]
 //! transactions.
 
+pub mod brush;
 pub mod channel_cards;
 pub mod channels;
 pub mod command;
@@ -12,6 +13,7 @@ pub mod growth;
 pub mod history;
 pub mod kernels;
 pub mod persistence;
+pub mod recording;
 pub mod selection;
 pub mod tiling;
 
@@ -84,6 +86,13 @@ pub enum DocumentCommand {
     SetSelectedChannelFrozen(bool),
     SetSelectedGrowthMode(UpdateMode),
     SetSelectedGrowthSource(String),
+    /// A keystroke in the growth editor.
+    ///
+    /// Separate from [`DocumentCommand::SetSelectedGrowthSource`] because it
+    /// folds into the edit before it: typing produces one command per
+    /// character, and undoing a typed expression one character at a time is
+    /// not an undo anybody can use.
+    TypeGrowthSource(String),
     SetSimulationDt(f32),
     /// Close a construction path into a basis polygon.
     FinishTilingPolygon {
@@ -139,6 +148,8 @@ pub struct DocumentController {
     selection_undo: Vec<EditorSelection>,
     selection_redo: Vec<EditorSelection>,
     next_request_id: u64,
+    /// Whether the next source edit continues the run of typing before it.
+    coalesce_next_edit: bool,
 }
 
 impl DocumentController {
@@ -155,6 +166,7 @@ impl DocumentController {
             selection_undo: Vec::new(),
             selection_redo: Vec::new(),
             next_request_id: 1,
+            coalesce_next_edit: false,
         }
     }
 
@@ -276,6 +288,18 @@ impl DocumentController {
                 self.transact(next, |_| {})?;
                 Ok(self.record(vec![Affected::Growth]))
             }
+            DocumentCommand::TypeGrowthSource(source) => {
+                let next = growth::set_source(&self.draft, self.binding(), &source)
+                    .map_err(DocumentError::Rejected)?;
+                // Consecutive keystrokes fold into one undoable edit; anything
+                // else in between ends the run, so Undo steps back over what
+                // was typed rather than over each letter.
+                let merge = self.coalesce_next_edit;
+                self.coalesce_next_edit = true;
+                self.draft_command_coalescing(DraftCommand::ReplaceDraft(Box::new(next)), merge)?;
+                self.selection.normalize(&self.draft);
+                Ok(self.record(vec![Affected::Growth]))
+            }
             DocumentCommand::SetSimulationDt(dt) => {
                 if !dt.is_finite() || dt <= 0.0 || dt > 10.0 {
                     return Err(DocumentError::Rejected(
@@ -377,6 +401,13 @@ impl DocumentController {
         if !programs.is_empty() {
             return Err(programs);
         }
+        // And this says the geometry the kernels are built on is real. The
+        // Tiling workspace shows the same verdict; Apply has to reach the same
+        // conclusion or one of the two is lying to the user.
+        let coverage = tiling::coverage_problems(&candidate);
+        if !coverage.is_empty() {
+            return Err(coverage);
+        }
         let request_id = self.next_request_id;
         self.next_request_id += 1;
         Ok(ApplyCandidate {
@@ -420,11 +451,38 @@ impl DocumentController {
         Ok(())
     }
 
+    /// A draft edit that may fold into the previous one.
+    ///
+    /// The selection stack follows the same rule: a folded edit must not push
+    /// another selection frame, or Undo would step through selections that
+    /// never corresponded to a separate edit.
+    fn draft_command_coalescing(
+        &mut self,
+        command: DraftCommand,
+        merge: bool,
+    ) -> Result<(), DocumentError> {
+        let selection = self.selection.clone();
+        let mut folded = false;
+        self.history
+            .coalesce_execute(&mut self.draft, command, |previous| {
+                folded = merge && matches!(previous, DraftCommand::ReplaceDraft(_));
+                folded
+            })?;
+        if !folded {
+            self.selection_undo.push(selection);
+        }
+        self.selection_redo.clear();
+        self.selection.normalize(&self.draft);
+        self.status = self.derive_status();
+        Ok(())
+    }
+
     fn transact(
         &mut self,
         next: ExperimentSpec,
         adjust: impl FnOnce(&mut EditorSelection),
     ) -> Result<(), DocumentError> {
+        self.coalesce_next_edit = false;
         self.draft_command(DraftCommand::ReplaceDraft(Box::new(next)))?;
         adjust(&mut self.selection);
         self.selection.normalize(&self.draft);
@@ -542,6 +600,46 @@ mod tests {
         assert_eq!(doc.audit_snapshot(), before);
         doc.execute(DocumentCommand::SetSimulationDt(0.25)).unwrap();
         assert_eq!(doc.draft().simulation_dt, 0.25);
+    }
+
+    #[test]
+    fn typing_folds_into_one_undo_but_a_different_edit_starts_a_new_one() {
+        let mut document = DocumentController::new(ExperimentSpec::single_channel_lenia(8, 8));
+        let before = document.draft().clone();
+
+        // Four keystrokes of one word.
+        for source in ["s", "se", "sel", "self"] {
+            document
+                .execute(DocumentCommand::TypeGrowthSource(source.into()))
+                .unwrap();
+        }
+        assert_eq!(
+            document.audit_snapshot().undo_depth,
+            1,
+            "a typed run is one undoable edit, not one per character"
+        );
+        document.undo().unwrap();
+        assert_eq!(
+            document.draft(),
+            &before,
+            "undoing the run returns to before the first keystroke"
+        );
+
+        // An unrelated edit between two runs keeps them apart.
+        document
+            .execute(DocumentCommand::TypeGrowthSource("a".into()))
+            .unwrap();
+        document
+            .execute(DocumentCommand::SetSimulationDt(0.25))
+            .unwrap();
+        document
+            .execute(DocumentCommand::TypeGrowthSource("ab".into()))
+            .unwrap();
+        assert_eq!(
+            document.audit_snapshot().undo_depth,
+            3,
+            "an edit of another kind ends the run rather than absorbing it"
+        );
     }
 
     #[test]

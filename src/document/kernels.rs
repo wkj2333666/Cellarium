@@ -24,9 +24,12 @@ pub struct KernelCardModel {
     pub source_channel: ChannelId,
     pub width: usize,
     pub height: usize,
-    /// Cells that actually contribute, which is what makes a thumbnail honest
-    /// about the kernel's real support rather than its bounding box.
-    pub active_cells: usize,
+    /// Cells the kernel samples: the support the Support tool edits, which is
+    /// what the canvas legend and the inspector both call active.
+    pub support_cells: usize,
+    /// Cells that carry a weight other than zero. A cell can be in the support
+    /// and still contribute nothing, which is a state the canvas draws.
+    pub weighted_cells: usize,
     pub periodic: bool,
     pub selected: bool,
 }
@@ -53,7 +56,7 @@ pub fn binding_kernels(
             .iter()
             .enumerate()
             .map(|(index, kernel)| {
-                let (width, height, active, periodic) = shape_of(&kernel.spatial);
+                let (width, height, support, weighted, periodic) = shape_of(&kernel.spatial);
                 KernelCardModel {
                     id: kernel.id,
                     ordinal: index + 1,
@@ -62,7 +65,8 @@ pub fn binding_kernels(
                     source_channel: kernel.source_channel,
                     width,
                     height,
-                    active_cells: active,
+                    support_cells: support,
+                    weighted_cells: weighted,
                     periodic,
                     selected: selected == Some(kernel.id),
                 }
@@ -84,7 +88,8 @@ pub fn binding_kernels(
                 source_channel: kernel.source,
                 width: definition.width,
                 height: definition.height,
-                active_cells: raster_active(definition),
+                support_cells: raster_support(definition),
+                weighted_cells: raster_weighted(definition),
                 periodic: false,
                 selected: selected == Some(kernel.id),
             }
@@ -92,16 +97,23 @@ pub fn binding_kernels(
         .collect()
 }
 
-fn shape_of(spatial: &KernelSpatialDefinition) -> (usize, usize, usize, bool) {
+fn shape_of(spatial: &KernelSpatialDefinition) -> (usize, usize, usize, usize, bool) {
     match spatial {
         KernelSpatialDefinition::Raster(definition) => (
             definition.width,
             definition.height,
-            raster_active(definition),
+            raster_support(definition),
+            raster_weighted(definition),
             false,
         ),
         KernelSpatialDefinition::Periodic(definition) => {
-            let active = definition
+            let in_mask = |plane: &crate::sim::basis_kernel::BasisWeightPlane, index: usize| {
+                plane
+                    .mask
+                    .as_ref()
+                    .is_none_or(|mask| mask.get(index).copied().unwrap_or(true))
+            };
+            let support = definition
                 .planes
                 .values()
                 .map(|plane| {
@@ -109,41 +121,67 @@ fn shape_of(spatial: &KernelSpatialDefinition) -> (usize, usize, usize, bool) {
                         .values
                         .iter()
                         .enumerate()
-                        .filter(|(index, value)| {
-                            **value != 0.0
-                                && plane
-                                    .mask
-                                    .as_ref()
-                                    .is_none_or(|mask| mask.get(*index).copied().unwrap_or(true))
-                        })
+                        .filter(|(index, _)| in_mask(plane, *index))
                         .count()
                 })
                 .sum();
-            (definition.width, definition.height, active, true)
+            let weighted = definition
+                .planes
+                .values()
+                .map(|plane| {
+                    plane
+                        .values
+                        .iter()
+                        .enumerate()
+                        .filter(|(index, value)| **value != 0.0 && in_mask(plane, *index))
+                        .count()
+                })
+                .sum();
+            (definition.width, definition.height, support, weighted, true)
         }
     }
 }
 
-fn raster_active(definition: &crate::sim::kernel::KernelDefinition) -> usize {
+/// Cells the kernel samples.
+///
+/// The support: whether the cell is in the mask, not whether its weight happens
+/// to be non-zero. The canvas draws a masked-in cell holding zero as
+/// `active zero` and the inspector reads it back as active, so a count that
+/// excluded it would contradict the same screen it sits on — and it would never
+/// move when the Support tool switched a cell on.
+fn raster_support(definition: &crate::sim::kernel::KernelDefinition) -> usize {
     match &definition.values {
         KernelValues::Explicit(values) => values
             .iter()
             .enumerate()
-            .filter(|(index, value)| {
-                **value != 0.0
-                    && definition
-                        .mask
-                        .as_ref()
-                        .is_none_or(|mask| mask.get(*index).copied().unwrap_or(true))
-            })
+            .filter(|(index, _)| in_raster_mask(definition, *index))
             .count(),
-        // An expression fills its whole stencil unless masked out.
         KernelValues::Expression(_) => definition
             .mask
             .as_ref()
             .map(|mask| mask.iter().filter(|active| **active).count())
             .unwrap_or(definition.width * definition.height),
     }
+}
+
+/// Cells that carry a weight other than zero.
+fn raster_weighted(definition: &crate::sim::kernel::KernelDefinition) -> usize {
+    match &definition.values {
+        KernelValues::Explicit(values) => values
+            .iter()
+            .enumerate()
+            .filter(|(index, value)| **value != 0.0 && in_raster_mask(definition, *index))
+            .count(),
+        // An expression fills its whole stencil unless masked out.
+        KernelValues::Expression(_) => raster_support(definition),
+    }
+}
+
+fn in_raster_mask(definition: &crate::sim::kernel::KernelDefinition, index: usize) -> bool {
+    definition
+        .mask
+        .as_ref()
+        .is_none_or(|mask| mask.get(index).copied().unwrap_or(true))
 }
 
 /// Append a kernel to a binding and give it a place in the growth signature.
@@ -742,7 +780,7 @@ mod tests {
     fn a_new_kernel_starts_as_the_identity_not_a_copy_of_its_neighbour() {
         let spec = normalized();
         let key = binding(&spec);
-        let template = binding_kernels(&spec, key, None)[0].active_cells;
+        let template = binding_kernels(&spec, key, None)[0].weighted_cells;
         assert!(template > 1, "the fixture kernel has real support");
 
         let (next, id) = add_kernel(&spec, key).unwrap();
@@ -751,8 +789,8 @@ mod tests {
             .find(|card| card.id == id)
             .unwrap();
         assert_eq!(
-            card.active_cells, 1,
-            "a fresh kernel holds only the identity, never the neighbour's support"
+            card.weighted_cells, 1,
+            "a fresh kernel holds only the identity, never the neighbour's weights"
         );
     }
 
@@ -874,10 +912,10 @@ mod tests {
         // put there rather than one the fixture happened to have.
         let painted = set_active(&spec, key, kernel, key.basis, 3, 3, true).unwrap();
         let painted = set_weight(&painted, key, kernel, key.basis, 3, 3, 0.5).unwrap();
-        let before = binding_kernels(&painted, key, None)[0].active_cells;
+        let before = binding_kernels(&painted, key, None)[0].support_cells;
 
         let masked = set_active(&painted, key, kernel, key.basis, 3, 3, false).unwrap();
-        let after = binding_kernels(&masked, key, None)[0].active_cells;
+        let after = binding_kernels(&masked, key, None)[0].support_cells;
         assert_eq!(after + 1, before, "an inactive cell must stop contributing");
     }
 
@@ -889,16 +927,16 @@ mod tests {
         let key = binding(&spec);
         let kernel = binding_kernels(&spec, key, None)[0].id;
         let off = set_active(&spec, key, kernel, key.basis, 2, 2, false).unwrap();
-        let before = binding_kernels(&off, key, None)[0].active_cells;
+        let before = binding_kernels(&off, key, None)[0].support_cells;
         let painted = set_weight(&off, key, kernel, key.basis, 2, 2, 0.9).unwrap();
         assert_eq!(
-            binding_kernels(&painted, key, None)[0].active_cells,
+            binding_kernels(&painted, key, None)[0].support_cells,
             before,
             "painting must not silently switch a cell back on"
         );
         let on = set_active(&painted, key, kernel, key.basis, 2, 2, true).unwrap();
         assert_eq!(
-            binding_kernels(&on, key, None)[0].active_cells,
+            binding_kernels(&on, key, None)[0].support_cells,
             before + 1,
             "the weight was kept and counts again once support returns"
         );

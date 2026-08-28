@@ -125,8 +125,14 @@ fn editor(app: &mut CellariumGui, ui: &mut Ui) {
             // The location is stated in the coordinates the editor shows, not
             // as a byte offset the user would have to count out.
             ui.label(
-                RichText::new(format!("line {line}, column {column}: {}", diagnostic.code))
-                    .color(theme::state_color(theme::State::Invalid)),
+                RichText::new(format!(
+                    "line {line}, column {column}: {}",
+                    crate::document::growth::describe_diagnostic(
+                        &diagnostic.code,
+                        source.get(diagnostic.start..diagnostic.end).unwrap_or("")
+                    )
+                ))
+                .color(theme::state_color(theme::State::Invalid)),
             );
         }
     }

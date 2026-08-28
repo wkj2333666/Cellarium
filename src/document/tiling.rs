@@ -15,6 +15,32 @@ use crate::sim::tiling::{
     polygon, provisional_translation_lattice,
 };
 
+/// Reasons the experiment's tiling is not usable, in the user's words.
+///
+/// The Tiling workspace already computes this verdict and shows it in red. An
+/// Apply that ignored it would be giving the user two authoritative and
+/// opposite answers about the same draft — and the periodic kernels built from
+/// a basis that leaves gaps do not describe the neighbourhood they claim to.
+///
+/// An experiment with no tiling has nothing to check; the raster world is the
+/// geometry and it is always well formed.
+pub fn coverage_problems(spec: &ExperimentSpec) -> Vec<String> {
+    let Some(draft) = spec.tiling.as_ref() else {
+        return Vec::new();
+    };
+    match crate::sim::tiling::validate_coverage(draft) {
+        Ok(_) => Vec::new(),
+        Err(diagnostics) => {
+            // One sentence naming the workspace that can fix it, then the
+            // reasons themselves. A list of geometry facts with no route to the
+            // control that changes them is not actionable.
+            let mut problems = vec!["the tiling does not tile the plane".to_string()];
+            problems.extend(diagnostics.into_iter().take(3).map(|entry| entry.message));
+            problems
+        }
+    }
+}
+
 /// What a finished construction polygon becomes.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum ConstructionTarget {

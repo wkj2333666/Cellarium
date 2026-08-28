@@ -2,8 +2,11 @@
 
 use eframe::egui::{self, RichText, Ui};
 
+use crate::document::brush::{BrushKind, BrushTarget};
+use crate::document::recording::ReplayState;
 use crate::gui::app::CellariumGui;
 use crate::gui::canvas::world::{ChannelView, render_world_canvas};
+use crate::gui::theme;
 use crate::render::channels::automatic_palette;
 use crate::sim::worker::SimulationCommand;
 
@@ -93,28 +96,254 @@ fn toolbar(app: &mut CellariumGui, ui: &mut Ui) {
         app.world_canvas_mut().view = view;
 
         ui.separator();
-        ui.label("Brush");
-        let mut radius = app.world_canvas().brush_radius;
+        let capturing = app.recording().is_capturing();
         if ui
-            .add(egui::DragValue::new(&mut radius).range(0..=64).prefix("r "))
-            .on_hover_text("Brush radius in cells")
-            .changed()
+            .add(
+                egui::Button::selectable(
+                    capturing,
+                    if capturing {
+                        "Stop recording"
+                    } else {
+                        "Record"
+                    },
+                )
+                .min_size(egui::vec2(104.0, 0.0)),
+            )
+            .on_hover_text(if capturing {
+                "Stop adding frames to the take"
+            } else {
+                "Keep every frame the simulation shows, so it can be replayed"
+            })
+            .clicked()
         {
-            app.world_canvas_mut().brush_radius = radius;
+            app.toggle_recording();
         }
-        let mut value = app.world_canvas().brush_value;
+    });
+    brush_bar(app, ui);
+    // The replay controls only exist once there is a take to replay. An empty
+    // row of disabled buttons is clutter a new user has to read past.
+    if app.recording().frames() > 0 {
+        recording_bar(app, ui);
+    }
+}
+
+/// What the pointer paints with.
+///
+/// The tools are named and described where they are chosen, so picking one
+/// never requires knowing what a falloff profile is.
+fn brush_bar(app: &mut CellariumGui, ui: &mut Ui) {
+    ui.horizontal_wrapped(|ui| {
+        // egui's default slider is wide enough that three of them plus the tool
+        // buttons run past the panel and clip the last label.
+        ui.spacing_mut().slider_width = 84.0;
+        ui.label("Brush")
+            .on_hover_text("The left button paints, the right button erases");
+        let mut brush = app.world_canvas().brush;
+        let mut changed = false;
+        for kind in BrushKind::ALL {
+            if ui
+                .add(egui::Button::selectable(brush.kind == kind, kind.label()))
+                .on_hover_text(kind.hint())
+                .clicked()
+                && brush.kind != kind
+            {
+                brush.select_kind(kind);
+                changed = true;
+            }
+        }
+
+        ui.separator();
+        // A pencil is one cell by definition, so its size control is disabled
+        // rather than silently ignored.
+        let sized = brush.kind.has_radius();
+        ui.add_enabled_ui(sized, |ui| {
+            changed |= ui
+                .add(
+                    egui::DragValue::new(&mut brush.radius)
+                        .range(0..=32)
+                        .prefix("size "),
+                )
+                .on_hover_text(if sized {
+                    "Radius of the brush, in cells"
+                } else {
+                    "A pencil always covers exactly one cell"
+                })
+                .changed();
+        });
+
+        ui.separator();
+        let mut percent = (brush.flow * 100.0).round();
         if ui
-            .add(egui::Slider::new(&mut value, 0.0..=1.0).text("value"))
-            .on_hover_text("Value the left button paints")
+            .add(
+                egui::Slider::new(&mut percent, 0.0..=100.0)
+                    .suffix("%")
+                    .text("strength"),
+            )
+            .on_hover_text("How far one pass moves a cell towards the value below")
             .changed()
         {
-            app.world_canvas_mut().brush_value = value;
+            brush.flow = percent / 100.0;
+            changed = true;
+        }
+
+        // An eraser always paints zero, so offering it a value would be
+        // offering a control that does nothing.
+        ui.add_enabled_ui(brush.kind != BrushKind::Eraser, |ui| {
+            changed |= ui
+                .add(egui::Slider::new(&mut brush.value, 0.0..=1.0).text("value"))
+                .on_hover_text("The value a full-strength stroke paints")
+                .changed();
+        });
+
+        let channels = app.spec().channels.len();
+        if channels > 1 {
+            ui.separator();
+            let label = match brush.target {
+                BrushTarget::AllChannels => "All channels".to_string(),
+                BrushTarget::Channel(index) => app
+                    .spec()
+                    .channels
+                    .get(index)
+                    .map(|channel| channel.name.clone())
+                    .unwrap_or_else(|| format!("channel {}", index + 1)),
+            };
+            egui::ComboBox::from_id_salt("brush_target")
+                .selected_text(label)
+                .show_ui(ui, |ui| {
+                    changed |= ui
+                        .selectable_value(
+                            &mut brush.target,
+                            BrushTarget::AllChannels,
+                            "All channels",
+                        )
+                        .changed();
+                    for index in 0..channels {
+                        let name = app
+                            .spec()
+                            .channels
+                            .get(index)
+                            .map(|channel| channel.name.clone())
+                            .unwrap_or_else(|| format!("channel {}", index + 1));
+                        changed |= ui
+                            .selectable_value(&mut brush.target, BrushTarget::Channel(index), name)
+                            .changed();
+                    }
+                });
+            ui.label(RichText::new("paint into").weak());
+        }
+
+        if changed {
+            app.world_canvas_mut().brush = brush;
+        }
+    });
+}
+
+/// Recording the run, and playing it back.
+fn recording_bar(app: &mut CellariumGui, ui: &mut Ui) {
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().slider_width = 120.0;
+        let frames = app.recording().frames();
+        let replaying = app.recording().is_replaying();
+        ui.label(RichText::new("Take").weak());
+
+        ui.add_enabled_ui(frames > 0, |ui| {
+            let playing = app.recording().state() == ReplayState::Playing;
+            if ui
+                .add(
+                    egui::Button::new(if playing { "Pause replay" } else { "Play" })
+                        .min_size(egui::vec2(96.0, 0.0)),
+                )
+                .on_hover_text("Play the recorded frames back")
+                .clicked()
+            {
+                app.toggle_replay();
+            }
+            if ui
+                .button("<")
+                .on_hover_text("Step back one recorded frame")
+                .clicked()
+            {
+                app.recording_mut().nudge(-1);
+            }
+            if ui
+                .button(">")
+                .on_hover_text("Step forward one recorded frame")
+                .clicked()
+            {
+                app.recording_mut().nudge(1);
+            }
+
+            // The scrubber is the whole point of a replay: being able to go
+            // back to the moment something happened.
+            let mut playhead = app.recording().playhead();
+            let last = frames.saturating_sub(1);
+            if ui
+                .add(
+                    egui::Slider::new(&mut playhead, 0..=last)
+                        .text("frame")
+                        .clamping(egui::SliderClamping::Always),
+                )
+                .on_hover_text("Scrub through the take")
+                .changed()
+            {
+                app.recording_mut().seek(playhead);
+            }
+
+            let mut speed = app.recording().speed();
+            if ui
+                .add(egui::Slider::new(&mut speed, 1.0..=120.0).text("play/s"))
+                .on_hover_text("Frames per second of playback")
+                .changed()
+            {
+                app.recording_mut().set_speed(speed);
+            }
+        });
+
+        let mut rate = app.recording().capture_rate();
+        if ui
+            .add(egui::DragValue::new(&mut rate).range(1.0..=120.0).prefix("record ").suffix("/s"))
+            .on_hover_text(
+                "Frames captured per second. Frames are large, so a high rate fills memory quickly.",
+            )
+            .changed()
+        {
+            app.recording_mut().set_capture_rate(rate);
+        }
+
+        if replaying
+            && ui
+                .button("Back to live")
+                .on_hover_text("Stop replaying and show the running world again")
+                .clicked()
+        {
+            app.recording_mut().resume_live();
+        }
+        if ui
+            .add_enabled(frames > 0, egui::Button::new("Clear take"))
+            .on_hover_text("Discard every recorded frame and free the memory")
+            .clicked()
+        {
+            app.recording_mut().clear();
+        }
+
+        // What the take costs, said plainly. Frames are large, and a user who
+        // leaves recording on deserves to see the number climbing.
+        if frames > 0 {
+            ui.separator();
+            ui.label(
+                RichText::new(app.recording().summary())
+                    .weak(),
+            );
         }
     });
 }
 
 fn canvas(app: &mut CellariumGui, ui: &mut Ui) {
-    let snapshot = app.snapshot();
+    // While replaying, the canvas shows the recorded frame. Everything beside
+    // it then describes that frame, so the readouts never belong to a world the
+    // user is not looking at.
+    let replaying = app.recording().is_replaying();
+    let snapshot = app.displayed_snapshot();
     let colors = automatic_palette(app.spec().channels.len());
     // Leave a row for the hover readout, otherwise the canvas claims the whole
     // panel and the readout is clipped off the bottom edge.
@@ -130,9 +359,33 @@ fn canvas(app: &mut CellariumGui, ui: &mut Ui) {
     };
 
     if !response.edits.is_empty() {
-        // Pointer paint is batched into one ordered command per frame rather
-        // than one command per cell.
-        app.send_simulation(SimulationCommand::EditWorld(response.edits));
+        if replaying {
+            // Painting a recorded frame would either be discarded or would
+            // rewrite history. Saying so is better than accepting a stroke that
+            // quietly does nothing.
+            app.set_notice(Some(
+                "this is a recorded frame — press Back to live to paint".into(),
+            ));
+        } else {
+            // Pointer paint is batched into one ordered command per frame rather
+            // than one command per cell.
+            app.send_simulation(SimulationCommand::EditWorld(response.edits));
+        }
+    }
+
+    if replaying {
+        let frame = app.recording().playhead() + 1;
+        let total = app.recording().frames();
+        let tick = app
+            .recording()
+            .current_tick()
+            .map(|tick| tick.to_string())
+            .unwrap_or_else(|| "?".into());
+        ui.label(
+            RichText::new(format!("replaying frame {frame} of {total} — tick {tick}"))
+                .color(theme::state_color(theme::State::Stale)),
+        );
+        return;
     }
 
     if let Some((basis, x, y)) = response.hovered_cell {
@@ -147,9 +400,21 @@ fn canvas(app: &mut CellariumGui, ui: &mut Ui) {
             .map(|value| format!("({x}, {y}) basis {basis} = {value:.3}"))
             .unwrap_or_else(|| format!("({x}, {y}) basis {basis}"));
         ui.label(RichText::new(readout).weak());
+    } else if is_world_empty(snapshot.as_deref()) {
+        // A new user presses Run, sees a counter climbing beside a black
+        // square, and has no way to know the world simply has nothing in it.
+        ui.label(
+            RichText::new("the world is empty — press Randomize, or paint on it with the mouse")
+                .color(theme::state_color(theme::State::Draft)),
+        );
     } else {
         ui.label(RichText::new("hover the world to inspect a cell").weak());
     }
+}
+
+/// Whether every cell is zero, so nothing would be visible.
+fn is_world_empty(snapshot: Option<&crate::sim::worker::SimulationSnapshot>) -> bool {
+    snapshot.is_some_and(|snapshot| snapshot.cells.iter().all(|value| *value == 0.0))
 }
 
 #[cfg(test)]

@@ -140,7 +140,7 @@ fn cards(app: &CellariumGui) -> Vec<Card> {
     let mut cards = vec![
         Card {
             title: "World and lattice",
-            section: Some(Section::Simulation),
+            section: Some(Section::Tiling),
             lines: vec![
                 format!("{} x {} cells", grid.width, grid.height),
                 format!("{bases} bases in the unit cell"),
@@ -178,7 +178,7 @@ fn cards(app: &CellariumGui) -> Vec<Card> {
             format!("{} kernels", kernels.len()),
             format!(
                 "{} cells of support in total",
-                kernels.iter().map(|card| card.active_cells).sum::<usize>()
+                kernels.iter().map(|card| card.support_cells).sum::<usize>()
             ),
         ],
     });

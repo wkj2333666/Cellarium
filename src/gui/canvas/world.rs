@@ -6,6 +6,7 @@
 
 use eframe::egui::{self, Color32, ColorImage, Rect, Sense, TextureHandle, TextureOptions, Ui};
 
+use crate::document::brush::BrushSettings;
 use crate::gui::canvas::CanvasTransform;
 use crate::gui::theme;
 use crate::render::channels::{Rgb8, composite_pixel};
@@ -21,28 +22,15 @@ pub enum ChannelView {
 }
 
 /// Transient canvas state the GUI owns between frames.
+#[derive(Default)]
 pub struct WorldCanvasState {
     pub transform: Option<CanvasTransform>,
     pub view: ChannelView,
-    pub brush_radius: u32,
-    pub brush_value: f32,
+    pub brush: BrushSettings,
     texture: Option<TextureHandle>,
     /// Generation currently in the texture, so an unchanged snapshot is not
     /// re-uploaded every frame.
     uploaded: Option<u64>,
-}
-
-impl Default for WorldCanvasState {
-    fn default() -> Self {
-        Self {
-            transform: None,
-            view: ChannelView::default(),
-            brush_radius: 2,
-            brush_value: 1.0,
-            texture: None,
-            uploaded: None,
-        }
-    }
 }
 
 impl WorldCanvasState {
@@ -135,12 +123,12 @@ pub fn render_world_canvas(
         transform.pan_screen(response.drag_delta());
     }
 
-    // Left paints the brush value, right erases. Painting reads the same
-    // transform the frame drew with, so the cell edited is the cell under the
-    // cursor.
-    for (button, value) in [
-        (egui::PointerButton::Primary, state.brush_value),
-        (egui::PointerButton::Secondary, 0.0),
+    // Left paints, right erases, whatever brush is chosen. Painting reads the
+    // same transform the frame drew with, so the cell edited is the cell under
+    // the cursor.
+    for (button, erase) in [
+        (egui::PointerButton::Primary, false),
+        (egui::PointerButton::Secondary, true),
     ] {
         if !(response.dragged_by(button)
             || (response.clicked_by(button) || response.drag_started_by(button)))
@@ -153,27 +141,37 @@ pub fn render_world_canvas(
         let Some((basis, x, y)) = cell_at(&transform, pointer, snapshot) else {
             continue;
         };
-        let radius = state.brush_radius as i64;
-        for dy in -radius..=radius {
-            for dx in -radius..=radius {
-                if dx * dx + dy * dy > radius * radius {
+        let bases = snapshot.layout.bases.len();
+        for sample in state.brush.stamp() {
+            let (Some(px), Some(py)) = (
+                (x as i64 + sample.dx)
+                    .try_into()
+                    .ok()
+                    .filter(|px| *px < width),
+                (y as i64 + sample.dy)
+                    .try_into()
+                    .ok()
+                    .filter(|py| *py < height),
+            ) else {
+                continue;
+            };
+            for channel in 0..snapshot.layout.channels {
+                if !state.brush.paints_channel(channel) {
                     continue;
                 }
-                let (Some(px), Some(py)) = (
-                    (x as i64 + dx).try_into().ok().filter(|px| *px < width),
-                    (y as i64 + dy).try_into().ok().filter(|py| *py < height),
-                ) else {
-                    continue;
-                };
-                for channel in 0..snapshot.layout.channels {
-                    result.edits.push(WorldEdit {
-                        channel,
-                        basis,
-                        x: px,
-                        y: py,
-                        value,
-                    });
-                }
+                // Blend against what the cell already holds, so a partial
+                // strength means "part of the way there" rather than a flat
+                // value that ignores the stroke underneath it.
+                let index = channel * width * height * bases + (py * width + px) * bases + basis;
+                let current = snapshot.cells.get(index).copied().unwrap_or(0.0);
+                let value = state.brush.blend(current, sample.alpha, erase);
+                result.edits.push(WorldEdit {
+                    channel,
+                    basis,
+                    x: px,
+                    y: py,
+                    value,
+                });
             }
         }
     }
@@ -290,7 +288,7 @@ mod tests {
     #[test]
     fn the_default_brush_paints_a_visible_value() {
         let state = WorldCanvasState::default();
-        assert!(state.brush_value > 0.0);
-        assert!(state.brush_radius >= 1);
+        assert!(state.brush.value > 0.0);
+        assert!(state.brush.effective_radius() >= 1);
     }
 }

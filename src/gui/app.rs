@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::document::persistence::{self, GuiSettings};
+use crate::document::recording::{Recording, ReplayState};
 use crate::document::{DocumentCommand, DocumentController};
 use crate::gui::canvas::channels::{
     ChannelCanvasState, ChannelPreview, ChannelPreviewSource, ChannelView, resolve_preview,
@@ -12,6 +13,7 @@ use crate::gui::canvas::world::WorldCanvasState;
 use crate::gui::layout;
 use crate::gui::sections::simulation::SimulationControl;
 use crate::gui::widgets::decision_dialog::Decision;
+use crate::gui::widgets::file_dialog::{FileDialog, FileDialogKind, FileDialogOutcome};
 use crate::gui::widgets::numeric_popover::NumericPopover;
 use crate::sim::backend_selector::{BackendPolicy, BackendSelector};
 use crate::sim::compute_plan::compile_compute_plan;
@@ -98,6 +100,7 @@ pub enum ShellAction {
     New,
     Open,
     Save,
+    SaveAs,
     Undo,
     Redo,
     ApplyAndRun,
@@ -108,10 +111,11 @@ pub enum ShellAction {
 }
 
 impl ShellAction {
-    pub const ALL: [ShellAction; 10] = [
+    pub const ALL: [ShellAction; 11] = [
         ShellAction::New,
         ShellAction::Open,
         ShellAction::Save,
+        ShellAction::SaveAs,
         ShellAction::Undo,
         ShellAction::Redo,
         ShellAction::ApplyAndRun,
@@ -128,6 +132,7 @@ impl ShellAction {
             ShellAction::New => "action_new",
             ShellAction::Open => "action_open",
             ShellAction::Save => "action_save",
+            ShellAction::SaveAs => "action_save_as",
             ShellAction::Undo => "action_undo",
             ShellAction::Redo => "action_redo",
             ShellAction::ApplyAndRun => "action_apply_and_run",
@@ -143,6 +148,7 @@ impl ShellAction {
             ShellAction::New => "New",
             ShellAction::Open => "Open",
             ShellAction::Save => "Save",
+            ShellAction::SaveAs => "Save as",
             ShellAction::Undo => "Undo",
             ShellAction::Redo => "Redo",
             ShellAction::ApplyAndRun => "Apply & Run",
@@ -158,6 +164,7 @@ impl ShellAction {
             ShellAction::New => "Start a new experiment",
             ShellAction::Open => "Open an experiment from disk",
             ShellAction::Save => "Save the current experiment",
+            ShellAction::SaveAs => "Save the experiment to a new file",
             ShellAction::Undo => "Undo the last draft edit",
             ShellAction::Redo => "Redo the last undone draft edit",
             ShellAction::ApplyAndRun => "Compile the draft and replace the running simulation",
@@ -167,7 +174,87 @@ impl ShellAction {
             ShellAction::Backend => "Choose the compute backend",
         }
     }
+
+    /// The key that reaches this action, if it has one.
+    ///
+    /// Every one of these has a visible control; the key is an accelerator, not
+    /// the only way in. That is the promise the Help panel makes, and it is
+    /// what keeps the window usable for someone who has never read it.
+    pub fn shortcut(self) -> Option<eframe::egui::KeyboardShortcut> {
+        use eframe::egui::{Key, KeyboardShortcut, Modifiers};
+        let shortcut = match self {
+            ShellAction::New => KeyboardShortcut::new(Modifiers::COMMAND, Key::N),
+            ShellAction::Open => KeyboardShortcut::new(Modifiers::COMMAND, Key::O),
+            ShellAction::Save => KeyboardShortcut::new(Modifiers::COMMAND, Key::S),
+            ShellAction::SaveAs => {
+                KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::S)
+            }
+            ShellAction::Undo => KeyboardShortcut::new(Modifiers::COMMAND, Key::Z),
+            ShellAction::Redo => {
+                KeyboardShortcut::new(Modifiers::COMMAND.plus(Modifiers::SHIFT), Key::Z)
+            }
+            ShellAction::ApplyAndRun => KeyboardShortcut::new(Modifiers::COMMAND, Key::Enter),
+            ShellAction::ToggleRunning => KeyboardShortcut::new(Modifiers::NONE, Key::Space),
+            ShellAction::Step => KeyboardShortcut::new(Modifiers::NONE, Key::ArrowRight),
+            ShellAction::Reset => KeyboardShortcut::new(Modifiers::COMMAND, Key::R),
+            ShellAction::Backend => KeyboardShortcut::new(Modifiers::COMMAND, Key::B),
+        };
+        Some(shortcut)
+    }
+
+    /// How the shortcut reads in a menu or a help list.
+    pub fn shortcut_text(self, ctx: &eframe::egui::Context) -> Option<String> {
+        self.shortcut()
+            .map(|shortcut| ctx.format_shortcut(&shortcut))
+    }
 }
+
+/// Width and height of the world a new experiment starts with.
+pub const DEFAULT_WORLD: u32 = 256;
+
+/// Something the user asked for that would discard unsaved work.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum PendingIntent {
+    New,
+    Open,
+}
+
+/// A file name derived from the experiment's own name, so the suggested name
+/// means something before the user has typed anything.
+fn suggested_file_name(spec: &ExperimentSpec) -> String {
+    let stem: String = spec
+        .name
+        .chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let stem = stem.trim_matches('-').replace("--", "-");
+    let stem = if stem.is_empty() { "experiment" } else { &stem };
+    format!("{stem}.ron")
+}
+
+/// Whether a message reports a problem or just says what happened.
+///
+/// Colour is the first thing read in a status bar, so a successful save shown
+/// in the failure colour reads as a failure.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum NoticeLevel {
+    #[default]
+    Problem,
+    Info,
+}
+
+/// How long a status message stays on screen. Long enough to read, short
+/// enough that it never describes an action the user has forgotten making.
+const NOTICE_SECONDS: f64 = 12.0;
+
+/// How often the recovery snapshot is rewritten while the draft is dirty.
+const AUTOSAVE_SECONDS: f64 = 5.0;
 
 /// Composition root of the GUI. It owns transient view state, the document and
 /// a handle to the simulation worker. It never runs simulation work itself.
@@ -199,7 +286,24 @@ pub struct CellariumGui {
     /// Directory holding settings and the autosave.
     data_root: Option<std::path::PathBuf>,
     seam_proposals: Option<Vec<SeamProposal>>,
+    /// The open file dialog, if the user is choosing a file.
+    file_dialog: Option<FileDialog>,
+    /// What to do once the user has answered about unsaved work.
+    pending_intent: Option<PendingIntent>,
+    /// An experiment a previous session left behind, offered on startup.
+    recovery: Option<Box<ExperimentSpec>>,
+    /// Whether the draft has changed since it was last written to disk.
+    unsaved_changes: bool,
+    /// Captured frames of the run, and the playhead over them.
+    recording: Recording,
     notice: Option<String>,
+    /// When `notice` was set, on the frame clock, so it can expire.
+    notice_at: Option<f64>,
+    notice_level: NoticeLevel,
+    /// When the recovery snapshot was last written.
+    autosaved_at: f64,
+    /// Seconds since the window opened, refreshed once per frame.
+    now: f64,
     randomize_seed: u64,
     navigation: Navigation,
     inspector_tab: InspectorTab,
@@ -288,7 +392,16 @@ impl CellariumGui {
             settings: GuiSettings::default(),
             data_root: None,
             seam_proposals: None,
+            file_dialog: None,
+            pending_intent: None,
+            recovery: None,
+            unsaved_changes: false,
+            recording: Recording::default(),
             notice: None,
+            notice_at: None,
+            notice_level: NoticeLevel::default(),
+            autosaved_at: 0.0,
+            now: 0.0,
             randomize_seed: 0x2545_F491_4F6C_DD1D,
             navigation: Navigation::default(),
             inspector_tab: InspectorTab::default(),
@@ -364,6 +477,56 @@ impl CellariumGui {
         self.simulation.as_ref().map(SimulationController::snapshot)
     }
 
+    pub fn recording(&self) -> &Recording {
+        &self.recording
+    }
+
+    pub fn recording_mut(&mut self) -> &mut Recording {
+        &mut self.recording
+    }
+
+    /// Start or stop capturing frames.
+    pub fn toggle_recording(&mut self) {
+        if self.recording.is_capturing() {
+            self.recording.stop();
+            let summary = format!("recording stopped — {}", self.recording.summary());
+            self.set_info(summary);
+        } else {
+            self.recording.start();
+            self.set_info("recording — frames are kept until you stop");
+        }
+    }
+
+    pub fn toggle_replay(&mut self) {
+        match self.recording.state() {
+            ReplayState::Playing => self.recording.pause(),
+            _ => self.recording.play(),
+        }
+    }
+
+    /// The snapshot the canvas should draw.
+    ///
+    /// While replaying this is a recorded frame, so every readout beside the
+    /// canvas describes the frame on screen rather than a live world the user
+    /// is not currently looking at.
+    pub fn displayed_snapshot(&self) -> Option<Arc<SimulationSnapshot>> {
+        if self.recording.is_replaying() {
+            return self.recording.current();
+        }
+        self.snapshot()
+    }
+
+    /// Take a frame if recording, and move the playhead if replaying.
+    fn drive_recording(&mut self, dt: f64) {
+        // Paced rather than every frame: see `tick_capture_clock`.
+        if self.recording.tick_capture_clock(dt)
+            && let Some(snapshot) = self.snapshot()
+        {
+            self.recording.capture(snapshot);
+        }
+        self.recording.advance(dt);
+    }
+
     pub fn navigation(&self) -> &Navigation {
         &self.navigation
     }
@@ -397,6 +560,43 @@ impl CellariumGui {
         }
     }
 
+    /// Fire any action whose key was pressed this frame.
+    ///
+    /// Two things are deliberately not shortcuts here. While a dialog is open
+    /// it owns the keyboard, because a stray Space behind a modal would run the
+    /// simulation the user is being asked a question about. And while a text
+    /// field has focus only Command-modified keys are accelerators: Space and
+    /// the arrow keys belong to whoever is typing, and Undo belongs to the
+    /// editor holding the caret.
+    fn consume_shortcuts(&mut self, ctx: &eframe::egui::Context) {
+        if self.file_dialog.is_some()
+            || self.pending_intent.is_some()
+            || self.recovery.is_some()
+            || self.kernel_decision.is_some()
+        {
+            return;
+        }
+        let typing = ctx.egui_wants_keyboard_input();
+        let mut fired = Vec::new();
+        for action in ShellAction::ALL {
+            let Some(shortcut) = action.shortcut() else {
+                continue;
+            };
+            if typing {
+                let editing_key = matches!(action, ShellAction::Undo | ShellAction::Redo);
+                if !shortcut.modifiers.command || editing_key {
+                    continue;
+                }
+            }
+            if ctx.input_mut(|input| input.consume_shortcut(&shortcut)) {
+                fired.push(action);
+            }
+        }
+        for action in fired {
+            self.dispatch(action);
+        }
+    }
+
     pub fn dispatch(&mut self, action: ShellAction) {
         let command = match action {
             ShellAction::ToggleRunning => {
@@ -417,25 +617,38 @@ impl CellariumGui {
                 self.save_experiment();
                 None
             }
+            ShellAction::SaveAs => {
+                self.begin_save_as();
+                None
+            }
+            ShellAction::New => {
+                self.request_new();
+                None
+            }
+            ShellAction::Open => {
+                self.request_open();
+                None
+            }
             ShellAction::Undo => {
                 // Undo and Redo are document transactions, not simulation
                 // commands: they rewind the draft the user is editing.
                 match self.document.undo() {
-                    Ok(_) => self.notice = None,
-                    Err(error) => self.notice = Some(error.to_string()),
+                    Ok(_) => self.set_notice(None),
+                    Err(error) => self.set_notice(Some(error.to_string())),
                 }
                 self.channel_canvas.invalidate();
                 None
             }
             ShellAction::Redo => {
                 match self.document.redo() {
-                    Ok(_) => self.notice = None,
-                    Err(error) => self.notice = Some(error.to_string()),
+                    Ok(_) => self.set_notice(None),
+                    Err(error) => self.set_notice(Some(error.to_string())),
                 }
                 self.channel_canvas.invalidate();
                 None
-            }
-            _ => None,
+            } // Every action is listed. There is deliberately no catch-all arm:
+              // New and Open were enabled, documented buttons that did nothing
+              // for exactly as long as one silently swallowed them.
         };
         if let (Some(command), Some(simulation)) = (command, self.simulation.as_ref()) {
             // A dropped command means the worker already stopped; the status bar
@@ -465,6 +678,17 @@ impl CellariumGui {
         &self.settings
     }
 
+    /// Remember where the experiment on screen came from.
+    ///
+    /// Launching with `--experiment` is opening a file, and the path has to
+    /// survive that: without it Save has nowhere to write and can only report
+    /// that the experiment is unnamed.
+    pub fn set_experiment_path(&mut self, path: impl Into<std::path::PathBuf>) {
+        let path = path.into();
+        self.settings.remember(&path);
+        self.experiment_path = Some(path);
+    }
+
     /// Point the session at a directory for settings and autosave.
     pub fn use_data_root(&mut self, root: impl Into<std::path::PathBuf>) {
         let root = root.into();
@@ -481,9 +705,10 @@ impl CellariumGui {
                         .err()
                         .map(|errors| errors.iter().map(ToString::to_string).collect())
                         .unwrap_or_default();
-                // The same question Apply asks, so this workspace cannot report
+                // The same questions Apply asks, so this workspace cannot report
                 // a draft as ready that Apply would then refuse.
                 problems.extend(crate::document::growth::invalid_programs(&candidate));
+                problems.extend(crate::document::tiling::coverage_problems(&candidate));
                 problems
             }
             Err(errors) => errors.iter().map(ToString::to_string).collect(),
@@ -500,7 +725,7 @@ impl CellariumGui {
         let candidate = match self.document.prepare_apply() {
             Ok(candidate) => candidate,
             Err(errors) => {
-                self.notice = Some(errors.join("; "));
+                self.set_notice(Some(errors.join("; ")));
                 return;
             }
         };
@@ -509,12 +734,12 @@ impl CellariumGui {
         if !self.document.accept_apply(request, experiment) {
             // The draft moved while the candidate was being built, so the
             // candidate describes an experiment nobody asked for.
-            self.notice = Some("the draft changed while it was being applied".into());
+            self.set_notice(Some("the draft changed while it was being applied".into()));
             return;
         }
         self.restart_simulation();
         if self.startup_notice.is_none() {
-            self.notice = None;
+            self.set_notice(None);
             self.running = true;
             self.send_simulation(SimulationCommand::SetRunning(true));
         }
@@ -522,15 +747,148 @@ impl CellariumGui {
         self.autosave();
     }
 
-    /// Save to the current path, or report that there is not one yet.
+    /// Save to the current path, asking for one the first time.
+    ///
+    /// An experiment that has never been written has nowhere to go, and telling
+    /// the user to use a control that does not exist is worse than useless.
+    /// Save on an unnamed experiment is Save as.
     pub fn save_experiment(&mut self) {
         match self.experiment_path.clone() {
             Some(path) => self.save_experiment_as(path),
-            None => {
-                self.notice =
-                    Some("this experiment has no path yet; use Save as with a path".into())
+            None => self.begin_save_as(),
+        }
+    }
+
+    /// Ask where to write this experiment.
+    pub fn begin_save_as(&mut self) {
+        let suggested = suggested_file_name(self.document.draft());
+        self.file_dialog = Some(FileDialog::new(
+            FileDialogKind::Save,
+            self.experiment_path.as_deref().or_else(|| {
+                self.settings
+                    .recent
+                    .first()
+                    .map(std::path::PathBuf::as_path)
+            }),
+            &suggested,
+        ));
+    }
+
+    /// Start a new experiment, asking about unsaved work first.
+    pub fn request_new(&mut self) {
+        if self.unsaved_changes {
+            self.pending_intent = Some(PendingIntent::New);
+            return;
+        }
+        self.start_new_experiment();
+    }
+
+    /// Open an experiment, asking about unsaved work first.
+    pub fn request_open(&mut self) {
+        if self.unsaved_changes {
+            self.pending_intent = Some(PendingIntent::Open);
+            return;
+        }
+        self.begin_open();
+    }
+
+    pub fn begin_open(&mut self) {
+        self.file_dialog = Some(FileDialog::new(
+            FileDialogKind::Open,
+            self.experiment_path.as_deref().or_else(|| {
+                self.settings
+                    .recent
+                    .first()
+                    .map(std::path::PathBuf::as_path)
+            }),
+            "",
+        ));
+    }
+
+    fn start_new_experiment(&mut self) {
+        self.new_experiment(ExperimentSpec::single_channel_lenia(
+            DEFAULT_WORLD,
+            DEFAULT_WORLD,
+        ));
+        self.set_info("started a new experiment");
+    }
+
+    pub fn file_dialog_open(&self) -> bool {
+        self.file_dialog.is_some()
+    }
+
+    /// Draw the file dialog and act on the answer.
+    pub fn drive_file_dialog(&mut self, ctx: &eframe::egui::Context) {
+        let Some(dialog) = self.file_dialog.as_mut() else {
+            return;
+        };
+        let kind = dialog.kind();
+        let recent = self.settings.recent.clone();
+        match dialog.show(ctx, &recent) {
+            FileDialogOutcome::Pending => {}
+            FileDialogOutcome::Cancelled => self.file_dialog = None,
+            FileDialogOutcome::Chosen(path) => {
+                self.file_dialog = None;
+                match kind {
+                    FileDialogKind::Open => self.open_experiment(path),
+                    FileDialogKind::Save => self.save_experiment_as(path),
+                }
             }
         }
+    }
+
+    /// The question waiting on the user about unsaved work, if any.
+    pub fn pending_intent(&self) -> Option<PendingIntent> {
+        self.pending_intent
+    }
+
+    pub fn resolve_pending_intent(&mut self, proceed: bool) {
+        let Some(intent) = self.pending_intent.take() else {
+            return;
+        };
+        if !proceed {
+            return;
+        }
+        match intent {
+            PendingIntent::New => self.start_new_experiment(),
+            PendingIntent::Open => self.begin_open(),
+        }
+    }
+
+    /// An experiment a previous session left behind, waiting to be offered.
+    pub fn pending_recovery(&self) -> Option<&ExperimentSpec> {
+        self.recovery.as_deref()
+    }
+
+    /// Look for work a previous session did not save.
+    ///
+    /// The autosave is written continually and was never read back, so a
+    /// session that ended without saving lost everything it had done while a
+    /// complete copy sat on disk.
+    pub fn offer_recovery(&mut self) {
+        if self.experiment_path.is_some() {
+            // Opening a named experiment is an explicit choice of what to work
+            // on; it should not be interrupted by an older draft.
+            return;
+        }
+        self.recovery = self.recoverable().map(Box::new);
+    }
+
+    pub fn accept_recovery(&mut self) {
+        if let Some(spec) = self.recovery.take() {
+            self.new_experiment(*spec);
+            self.unsaved_changes = true;
+            self.set_info("restored the experiment from the last session");
+        }
+    }
+
+    pub fn decline_recovery(&mut self) {
+        self.recovery = None;
+        self.discard_recovery();
+    }
+
+    pub fn has_unsaved_changes(&self) -> bool {
+        self.unsaved_changes
     }
 
     pub fn save_experiment_as(&mut self, path: impl Into<std::path::PathBuf>) {
@@ -538,11 +896,20 @@ impl CellariumGui {
         match persistence::save_experiment(&path, self.document.draft()) {
             Ok(()) => {
                 self.settings.remember(&path);
-                self.experiment_path = Some(path);
+                self.experiment_path = Some(path.clone());
                 self.persist_settings();
-                self.notice = None;
+                self.unsaved_changes = false;
+                // The autosave exists to survive a session that ends without
+                // saving. Work that has been saved does not need it.
+                self.discard_recovery();
+                self.set_info(format!(
+                    "saved to {}",
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ));
             }
-            Err(error) => self.notice = Some(error.to_string()),
+            Err(error) => self.set_notice(Some(error.to_string())),
         }
     }
 
@@ -553,13 +920,19 @@ impl CellariumGui {
             Ok(spec) => {
                 self.document = DocumentController::new(spec);
                 self.settings.remember(&path);
-                self.experiment_path = Some(path);
+                self.experiment_path = Some(path.clone());
                 self.persist_settings();
-                self.notice = None;
+                self.unsaved_changes = false;
+                self.set_info(format!(
+                    "opened {}",
+                    path.file_name()
+                        .map(|name| name.to_string_lossy().into_owned())
+                        .unwrap_or_default()
+                ));
                 self.reset_view_state();
                 self.restart_simulation();
             }
-            Err(error) => self.notice = Some(error.to_string()),
+            Err(error) => self.set_notice(Some(error.to_string())),
         }
     }
 
@@ -567,7 +940,8 @@ impl CellariumGui {
     pub fn new_experiment(&mut self, spec: ExperimentSpec) {
         self.document = DocumentController::new(spec);
         self.experiment_path = None;
-        self.notice = None;
+        self.unsaved_changes = false;
+        self.set_notice(None);
         self.reset_view_state();
         self.restart_simulation();
     }
@@ -588,8 +962,25 @@ impl CellariumGui {
         if let Some(root) = self.data_root.clone()
             && let Err(error) = persistence::save_settings(&root, &self.settings)
         {
-            self.notice = Some(error.to_string());
+            self.set_notice(Some(error.to_string()));
         }
+    }
+
+    /// Write the recovery snapshot if enough time has passed and the draft has
+    /// moved since the last one.
+    ///
+    /// Autosaving only on Apply meant a draft the user had been editing for an
+    /// hour without applying was never written at all, which is exactly the
+    /// work a recovery file exists to protect.
+    fn autosave_if_due(&mut self) {
+        if !self.unsaved_changes || self.data_root.is_none() {
+            return;
+        }
+        if self.now - self.autosaved_at < AUTOSAVE_SECONDS {
+            return;
+        }
+        self.autosaved_at = self.now;
+        self.autosave();
     }
 
     /// Write a recovery snapshot. The draft is cloned first, so the copy being
@@ -600,7 +991,7 @@ impl CellariumGui {
         };
         let snapshot = self.document.draft().clone();
         if let Err(error) = persistence::write_autosave(&root, &snapshot) {
-            self.notice = Some(error.to_string());
+            self.set_notice(Some(error.to_string()));
         }
     }
 
@@ -636,7 +1027,7 @@ impl CellariumGui {
         let binding = self.selected_binding();
         match crate::document::growth::set_mode(self.spec(), binding, mode) {
             Ok(spec) => self.dispatch_document(DocumentCommand::ReplaceExperiment(Box::new(spec))),
-            Err(error) => self.notice = Some(error),
+            Err(error) => self.set_notice(Some(error)),
         }
     }
 
@@ -743,12 +1134,11 @@ impl CellariumGui {
         crate::document::growth::source_of(self.spec(), binding).unwrap_or_default()
     }
 
+    /// Take a keystroke from the source editor.
+    ///
+    /// Dispatched as a typed edit so a run of keystrokes is one undoable step.
     pub fn set_growth_source(&mut self, source: impl Into<String>) {
-        let binding = self.selected_binding();
-        match crate::document::growth::set_source(self.spec(), binding, &source.into()) {
-            Ok(spec) => self.dispatch_document(DocumentCommand::ReplaceExperiment(Box::new(spec))),
-            Err(error) => self.notice = Some(error),
-        }
+        self.dispatch_document(DocumentCommand::TypeGrowthSource(source.into()));
     }
 
     pub fn kernel_canvas(&self) -> &KernelCanvasState {
@@ -807,7 +1197,7 @@ impl CellariumGui {
                     self.select_kernel(id);
                 }
             }
-            Err(error) => self.notice = Some(error),
+            Err(error) => self.set_notice(Some(error)),
         }
     }
 
@@ -846,7 +1236,7 @@ impl CellariumGui {
                     self.dispatch_document(DocumentCommand::ReplaceExperiment(Box::new(plan.spec)))
                 }
             },
-            Err(error) => self.notice = Some(error),
+            Err(error) => self.set_notice(Some(error)),
         }
     }
 
@@ -903,7 +1293,7 @@ impl CellariumGui {
         };
         match result {
             Ok(spec) => self.dispatch_document(DocumentCommand::ReplaceExperiment(Box::new(spec))),
-            Err(error) => self.notice = Some(error),
+            Err(error) => self.set_notice(Some(error)),
         }
     }
 
@@ -911,7 +1301,7 @@ impl CellariumGui {
         let binding = self.selected_binding();
         match crate::document::kernels::set_source(self.spec(), binding, kernel, source) {
             Ok(spec) => self.dispatch_document(DocumentCommand::ReplaceExperiment(Box::new(spec))),
-            Err(error) => self.notice = Some(error),
+            Err(error) => self.set_notice(Some(error)),
         }
     }
 
@@ -1022,7 +1412,26 @@ impl CellariumGui {
     }
 
     pub fn set_notice(&mut self, notice: Option<String>) {
+        self.notice_at = notice.is_some().then_some(self.now);
+        self.notice_level = NoticeLevel::Problem;
         self.notice = notice;
+    }
+
+    /// Report something that went right, or is merely worth knowing.
+    pub fn set_info(&mut self, notice: impl Into<String>) {
+        self.notice = Some(notice.into());
+        self.notice_at = Some(self.now);
+        self.notice_level = NoticeLevel::Info;
+    }
+
+    pub fn notice_level(&self) -> NoticeLevel {
+        self.notice_level
+    }
+
+    /// Seconds a notice has left on screen, for a caller that wants to show it
+    /// fading rather than vanishing.
+    pub fn notice_age(&self) -> Option<f64> {
+        self.notice_at.map(|set_at| self.now - set_at)
     }
 
     pub fn seam_proposals(&self) -> Option<&[SeamProposal]> {
@@ -1030,14 +1439,15 @@ impl CellariumGui {
     }
 
     pub fn set_seam_proposals(&mut self, proposals: Vec<SeamProposal>) {
-        self.notice = (proposals.is_empty())
+        let empty = (proposals.is_empty())
             .then(|| "no full-edge pairs are close enough to glue".to_string());
+        self.set_notice(empty);
         self.seam_proposals = Some(proposals);
     }
 
     pub fn clear_seam_proposals(&mut self) {
         self.seam_proposals = None;
-        self.notice = None;
+        self.set_notice(None);
     }
 
     /// Hold the proposed seams. Subsequent vertex drags move whole equivalence
@@ -1049,14 +1459,17 @@ impl CellariumGui {
                 .map(|proposal| proposal.constraint)
                 .collect();
         }
-        self.notice = None;
+        self.set_notice(None);
     }
 
     /// Run one document command, reporting a rejection instead of applying it.
     pub fn dispatch_document(&mut self, command: DocumentCommand) {
         match self.document.execute(command) {
-            Ok(_) => self.notice = None,
-            Err(error) => self.notice = Some(error.to_string()),
+            Ok(_) => {
+                self.set_notice(None);
+                self.unsaved_changes = true;
+            }
+            Err(error) => self.set_notice(Some(error.to_string())),
         }
     }
 
@@ -1116,6 +1529,16 @@ impl CellariumGui {
     /// occasional long one; taking its number keeps the status bar agreeing
     /// with the thing it is reporting on.
     fn observe_frame(&mut self, ctx: &eframe::egui::Context) {
+        self.now = ctx.input(|input| input.time);
+        // A message about one action must not still be on screen many actions
+        // later. Expiry is measured from when it was set, so a notice the user
+        // has had time to read makes way for the next one.
+        if let Some(set_at) = self.notice_at
+            && self.now - set_at > NOTICE_SECONDS
+        {
+            self.notice = None;
+            self.notice_at = None;
+        }
         let dt = ctx.input(|input| input.stable_dt);
         if dt > 0.0 && dt.is_finite() {
             let instant = 1.0 / dt;
@@ -1135,9 +1558,13 @@ impl CellariumGui {
             .as_ref()
             .map(|snapshot| snapshot.backend.summary())
             .unwrap_or_else(|| "no backend".into());
+        // What the user just did comes first. A refused Apply or a failed Save
+        // has to be readable from the workspace the user was standing in, not
+        // only from the one section that happens to render `notice` inline.
         let notice = self
-            .startup_notice
+            .notice
             .clone()
+            .or_else(|| self.startup_notice.clone())
             .or_else(|| self.fallback_notice.clone())
             .or_else(|| {
                 snapshot
@@ -1145,8 +1572,15 @@ impl CellariumGui {
                     .and_then(|snapshot| snapshot.error.as_ref())
                     .map(|error| error.message.clone())
             });
+        let replay = self.recording.is_replaying().then(|| ReplayStatus {
+            frame: self.recording.playhead() + 1,
+            frames: self.recording.frames(),
+            tick: self.recording.current_tick().unwrap_or(0),
+        });
         StatusLine {
             backend,
+            notice_level: self.notice_level,
+            replay,
             tick: snapshot.as_ref().map(|snapshot| snapshot.tick).unwrap_or(0),
             simulation_hz: snapshot
                 .as_ref()
@@ -1160,11 +1594,27 @@ impl CellariumGui {
 }
 
 /// Steps per second implied by the newest step, or zero when nothing has run.
+///
+/// A paused simulation reports zero rather than the rate of whatever it last
+/// did. After a single Step the old stats are still the newest ones, and
+/// reporting them leaves the bar claiming a speed the simulation is not moving
+/// at — for as long as the user leaves it paused.
 fn step_rate(snapshot: &SimulationSnapshot) -> f32 {
+    if !snapshot.running {
+        return 0.0;
+    }
     if snapshot.step_stats.elapsed_micros == 0 || snapshot.step_stats.steps == 0 {
         return 0.0;
     }
     snapshot.step_stats.steps as f32 * 1_000_000.0 / snapshot.step_stats.elapsed_micros as f32
+}
+
+/// Where the playhead is, for a bar that has to describe a recorded frame.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct ReplayStatus {
+    pub frame: usize,
+    pub frames: usize,
+    pub tick: u64,
 }
 
 /// The bottom status bar contents. Values are placeholders until the simulation
@@ -1172,7 +1622,10 @@ fn step_rate(snapshot: &SimulationSnapshot) -> f32 {
 #[derive(Clone, Debug, PartialEq)]
 pub struct StatusLine {
     pub backend: String,
+    pub notice_level: NoticeLevel,
     pub tick: u64,
+    /// Set while a recorded frame is on screen instead of the live world.
+    pub replay: Option<ReplayStatus>,
     pub simulation_hz: f32,
     pub frame_hz: f32,
     pub draft_clean: bool,
@@ -1190,11 +1643,18 @@ impl eframe::App for CellariumGui {
         // intent counts as running too: the frame that presses Run still sees
         // the old paused snapshot, and without this the display would freeze
         // until some unrelated input arrived.
-        if self.running || self.running() {
+        let dt = ui.ctx().input(|input| input.stable_dt).clamp(0.0, 0.25) as f64;
+        self.drive_recording(dt);
+        if self.running || self.running() || self.recording.state() == ReplayState::Playing {
             ui.ctx()
                 .request_repaint_after(std::time::Duration::from_millis(16));
         }
+        self.consume_shortcuts(ui.ctx());
         layout::draw(self, ui);
+        // Modals last, so they sit above the workspace they interrupt.
+        self.drive_file_dialog(ui.ctx());
+        layout::modals(self, ui.ctx());
+        self.autosave_if_due();
     }
 }
 

@@ -33,7 +33,8 @@ was rejected. If a GPU probe is what hangs on a particular machine, start with
 
 ## Workspaces
 
-- **Simulation** — run, step, reset, randomize and paint directly into the world.
+- **Simulation** — run, step, reset, randomize, paint directly into the world
+  with a choice of brushes, and record a run to replay it frame by frame.
 - **Tiling** — design the periodic unit cell: draw polygons, use a preset, solve
   the seams that glue them together, and drag vertices with those seams held.
 - **Channels** — add, colour, hide, freeze and delete the scalar fields, and
@@ -46,7 +47,48 @@ was rejected. If a GPU probe is what hangs on a particular machine, start with
   straight to the workspace that owns each problem.
 
 Every editing operation has a control you can reach with the pointer. Keyboard
-shortcuts only accelerate actions that are already visible.
+shortcuts only accelerate actions that are already visible; the Help tab lists
+every one of them with its key.
+
+## Painting
+
+The Simulation workspace paints into the live world with the left button and
+erases with the right, whichever tool is chosen:
+
+- **Pencil** — one cell, hard edge, painted fully.
+- **Pen** — a hard-edged disc.
+- **Brush** — a disc that fades out towards its edge.
+- **Airbrush** — a soft disc that builds up while the button is held.
+- **Eraser** — a hard-edged disc that paints zero.
+
+`size` sets the radius in cells, and `strength` sets how far one pass moves a
+cell towards the value beside it: at 70% a cell ends up 70% of the way there, so
+a second pass takes it further and a soft edge stays soft. In a world with more
+than one channel, a picker chooses whether a stroke goes into all of them or
+one.
+
+## Recording a run
+
+Press **Record** to keep the frames a run produces, then **Play** to watch them
+back, scrub to any frame, or step through one at a time. Playback has its own
+frame rate, so a run computed at several hundred hertz is watchable.
+
+Frames are whole copies of the world and they are large. Capture is paced —
+thirty frames a second by default, adjustable — and the take reports how many
+frames and how much memory it holds. When it reaches its budget the oldest
+frames are dropped and the take says how many it let go. Replaying shows a
+recorded frame rather than the live world, and says so; **Back to live** returns.
+
+## Saving your work
+
+**Save**, **Save as** and **Open** use a file browser inside the window, which
+also lists the experiments opened recently. An experiment that has never been
+saved is given a name derived from itself, and Save on an unnamed experiment
+asks where to put it rather than refusing.
+
+While a draft has unsaved changes it is written to a recovery file every few
+seconds. If a session ends without saving, the next start offers that work back
+and names what it was; declining discards it.
 
 ## Building
 

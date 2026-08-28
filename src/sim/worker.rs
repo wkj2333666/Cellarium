@@ -121,7 +121,7 @@ impl SimulationController {
         mut backend: Box<dyn LocalBackend>,
         fallback: Option<BackendFallback>,
     ) -> Result<Self, BackendFailure> {
-        let first = snapshot_of(backend.as_mut(), 0, false, StepStats::default(), None)?;
+        let first = snapshot_of(backend.as_mut(), 0, false, StepStats::default(), None, 0)?;
         let latest = Arc::new(RwLock::new(Arc::new(first)));
         let published = Arc::new(AtomicU64::new(1));
         let (commands, inbox) = channel();
@@ -218,6 +218,10 @@ fn run_worker(
     let mut running = false;
     let mut generation = 1;
     let mut error = None;
+    // Steps already computed when the world was last put back to its initial
+    // state. Subtracted from the backend's counter so `tick` is the age of the
+    // state on screen.
+    let mut tick_origin = 0_u64;
     let initial = backend.readback().ok();
     // The last state the running backend confirmed. A replacement backend
     // resumes from here, so at most the unconfirmed in-flight step is lost.
@@ -278,6 +282,7 @@ fn run_worker(
                             message: failure.to_string(),
                         });
                     }
+                    tick_origin = backend.tick();
                     publish = true;
                 }
                 SimulationCommand::Randomize { seed } => {
@@ -343,8 +348,14 @@ fn run_worker(
         }
 
         if publish
-            && let Ok(snapshot) =
-                snapshot_of(backend.as_mut(), generation, running, stats, error.clone())
+            && let Ok(snapshot) = snapshot_of(
+                backend.as_mut(),
+                generation,
+                running,
+                stats,
+                error.clone(),
+                tick_origin,
+            )
         {
             generation += 1;
             *latest.write().expect("snapshot lock") = Arc::new(snapshot);
@@ -395,11 +406,16 @@ fn snapshot_of(
     running: bool,
     step_stats: StepStats,
     error: Option<RuntimeNotice>,
+    tick_origin: u64,
 ) -> Result<SimulationSnapshot, BackendFailure> {
     let state = backend.readback()?;
     Ok(SimulationSnapshot {
         generation,
-        tick: backend.tick(),
+        // The age of the world on display, not the number of steps this
+        // process has ever computed. Reset puts the initial state back, so a
+        // counter that kept climbing would be describing a world that is no
+        // longer there.
+        tick: backend.tick().saturating_sub(tick_origin),
         running,
         backend: backend.descriptor().clone(),
         layout: state.layout,

@@ -50,16 +50,31 @@ impl History {
         Ok(())
     }
 
+    /// Run a command, folding it into the previous entry when `merge` allows.
+    ///
+    /// Typing produces one command per keystroke. Recorded individually, undoing
+    /// a typed expression costs one click per character, which is not an undo a
+    /// person can use. Folding keeps the entry's original inverse, so undoing
+    /// the merged run returns to before the first keystroke of it.
+    ///
+    /// `merge` is only consulted when there is a previous entry, and the caller
+    /// decides using both that entry's command and its own idea of whether the
+    /// two edits belong together.
     pub fn coalesce_execute(
         &mut self,
         draft: &mut ExperimentSpec,
         forward: DraftCommand,
+        merge: impl FnOnce(&DraftCommand) -> bool,
     ) -> Result<(), HistoryError> {
         let inverse = forward.apply(draft).map_err(HistoryError::Edit)?;
-        if let Some(entry) = self.undo.last_mut() {
-            entry.forward = forward;
-        } else {
-            self.undo.push(Entry { forward, inverse });
+        match self.undo.last_mut() {
+            Some(entry) if merge(&entry.forward) => entry.forward = forward,
+            _ => {
+                if self.undo.len() == MAX_HISTORY {
+                    self.undo.remove(0);
+                }
+                self.undo.push(Entry { forward, inverse });
+            }
         }
         self.redo.clear();
         Ok(())
@@ -135,6 +150,7 @@ mod tests {
             .coalesce_execute(
                 &mut draft,
                 DraftCommand::ReplaceDraft(Box::new(last.clone())),
+                |previous| matches!(previous, DraftCommand::ReplaceDraft(_)),
             )
             .unwrap();
 
@@ -142,5 +158,30 @@ mod tests {
         assert_eq!(draft, before);
         history.redo(&mut draft).unwrap();
         assert_eq!(draft, last);
+    }
+
+    #[test]
+    fn a_refused_merge_keeps_the_two_edits_separate() {
+        let mut draft = ExperimentSpec::single_channel_lenia(2, 2);
+        let mut history = History::default();
+        let mut first = draft.clone();
+        first.channels[0].initial[0] = 0.25;
+        history
+            .execute(&mut draft, DraftCommand::ReplaceDraft(Box::new(first)))
+            .unwrap();
+        let mut last = draft.clone();
+        last.channels[0].initial[0] = 0.75;
+        history
+            .coalesce_execute(
+                &mut draft,
+                DraftCommand::ReplaceDraft(Box::new(last)),
+                |_| false,
+            )
+            .unwrap();
+        assert_eq!(
+            history.undo_depth(),
+            2,
+            "a caller that declines the merge gets two undoable edits"
+        );
     }
 }

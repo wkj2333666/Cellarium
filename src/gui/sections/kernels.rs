@@ -39,11 +39,11 @@ fn cards(app: &mut CellariumGui, ui: &mut Ui) {
                 // another at a glance: where it sits, what it reads and how
                 // much of its stencil actually contributes.
                 .subtitle(format!(
-                    "#{} · {}x{} · {} active",
-                    model.ordinal, model.width, model.height, model.active_cells
+                    "#{} · {}x{} · {} in support",
+                    model.ordinal, model.width, model.height, model.support_cells
                 ))
                 .selected(model.selected)
-                .dimmed(model.active_cells == 0)
+                .dimmed(model.support_cells == 0)
                 .action(
                     CardAction::new(
                         "Delete",

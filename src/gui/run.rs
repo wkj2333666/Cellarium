@@ -4,7 +4,7 @@ use crate::gui::app::CellariumGui;
 use crate::sim::experiment::load_experiment_model;
 use crate::sim::experiment_model::ExperimentSpec;
 
-const DEFAULT_WORLD: u32 = 256;
+use crate::gui::app::DEFAULT_WORLD;
 
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct GuiLaunchOptions {
@@ -49,6 +49,7 @@ fn data_root() -> Option<std::path::PathBuf> {
 
 pub fn run(options: GuiLaunchOptions) -> Result<(), GuiStartupError> {
     let spec = initial_spec(&options)?;
+    let opened_from = options.experiment.clone();
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Cellarium")
@@ -71,6 +72,14 @@ pub fn run(options: GuiLaunchOptions) -> Result<(), GuiStartupError> {
             if let Some(root) = data_root() {
                 app.use_data_root(root);
             }
+            // Launching with a path is opening that file: Save has to know
+            // where to write without asking again.
+            if let Some(path) = opened_from {
+                app.set_experiment_path(path);
+            }
+            // And a session that ended without saving gets its work offered
+            // back rather than left on disk unread.
+            app.offer_recovery();
             Ok(Box::new(app))
         }),
     )

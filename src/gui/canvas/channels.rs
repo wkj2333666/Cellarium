@@ -157,6 +157,8 @@ pub struct ChannelCanvasState {
     /// What is currently in the texture, so an unchanged preview is not
     /// re-uploaded every frame.
     uploaded: Option<u64>,
+    /// Size of the image the current transform was fitted to.
+    laid_out: Option<[usize; 2]>,
 }
 
 impl ChannelCanvasState {
@@ -182,14 +184,22 @@ pub struct ChannelCanvasInput<'a> {
     pub generation: u64,
 }
 
+/// What the pointer found, alongside the preview that was drawn.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ChannelCanvasOutcome {
+    pub preview: ChannelPreview,
+    /// Channel index, cell and value under the pointer.
+    pub hovered: Option<(usize, usize, usize, f32)>,
+}
+
 pub fn render_channel_canvas(
     ui: &mut Ui,
     size: egui::Vec2,
     input: &ChannelCanvasInput<'_>,
     state: &mut ChannelCanvasState,
-) -> ChannelPreview {
+) -> ChannelCanvasOutcome {
     let preview = resolve_preview(state.source, input.active, input.draft, input.snapshot);
-    let (rect, _response) = ui.allocate_exact_size(size, Sense::hover());
+    let (rect, response) = ui.allocate_exact_size(size, Sense::hover());
     let painter = ui.painter_at(rect);
     painter.rect_filled(rect, 0.0, theme::DOMAIN_EXTERIOR);
 
@@ -201,19 +211,50 @@ pub fn render_channel_canvas(
             egui::FontId::proportional(14.0),
             theme::state_color(theme::State::Invalid),
         );
-        return preview;
+        return ChannelCanvasOutcome {
+            preview,
+            hovered: None,
+        };
+    }
+
+    // Hiding a channel takes its pane away rather than leaving a pane the
+    // control claims is hidden. Composite already drops hidden channels; a
+    // grid that kept drawing them would be contradicting the same switch.
+    let panes: Vec<usize> = (0..preview.channels)
+        .filter(|channel| is_visible(input, *channel))
+        .collect();
+    if state.view == ChannelView::Grid && panes.is_empty() {
+        painter.text(
+            rect.center(),
+            egui::Align2::CENTER_CENTER,
+            "every channel is hidden — press Show on a channel to see it",
+            egui::FontId::proportional(14.0),
+            theme::state_color(theme::State::Draft),
+        );
+        return ChannelCanvasOutcome {
+            preview,
+            hovered: None,
+        };
     }
 
     // Grid lays the channels out side by side, so the drawn image is wider.
     let columns = match state.view {
-        ChannelView::Grid => grid_columns(preview.channels),
+        ChannelView::Grid => grid_columns(panes.len()),
         _ => 1,
     };
     let rows = match state.view {
-        ChannelView::Grid => preview.channels.div_ceil(columns),
+        ChannelView::Grid => panes.len().div_ceil(columns),
         _ => 1,
     };
     let image_size = [preview.width * columns, preview.height * rows];
+
+    // Switching to Grid, or hiding a channel, changes the shape of the drawn
+    // image. A transform fitted to the old shape leaves panes clipped off the
+    // edge, so a changed shape refits rather than making the user press Fit.
+    if state.laid_out != Some(image_size) {
+        state.transform = None;
+        state.laid_out = Some(image_size);
+    }
 
     let transform = match &mut state.transform {
         Some(transform) => {
@@ -228,7 +269,7 @@ pub fn render_channel_canvas(
         }
     };
 
-    upload(ui, input, &preview, image_size, columns, state);
+    upload(ui, input, &preview, image_size, columns, &panes, state);
     let board = Rect::from_min_max(
         transform.world_to_screen([0.0, 0.0]),
         transform.world_to_screen([image_size[0] as f64, image_size[1] as f64]),
@@ -246,9 +287,9 @@ pub fn render_channel_canvas(
     // In Grid every pane is captioned, otherwise the user is counting tiles to
     // work out which channel is which.
     if state.view == ChannelView::Grid {
-        for index in 0..preview.channels {
-            let column = index % columns;
-            let row = index / columns;
+        for (pane, index) in panes.iter().copied().enumerate() {
+            let column = pane % columns;
+            let row = pane / columns;
             let origin = transform.world_to_screen([
                 (column * preview.width) as f64,
                 (row * preview.height) as f64,
@@ -269,11 +310,47 @@ pub fn render_channel_canvas(
         }
     }
 
-    preview
+    // Which pane the pointer is over, and the value there. The panes come from
+    // one image, so the pane is worked out with the coordinates it was drawn
+    // with. The other three canvases all report the cell under the pointer;
+    // this one left the user with pictures and no way to read a number off them.
+    let hovered = response.hover_pos().and_then(|pointer| {
+        let world = transform.screen_to_world(pointer);
+        if world[0] < 0.0 || world[1] < 0.0 {
+            return None;
+        }
+        let (image_x, image_y) = (world[0] as usize, world[1] as usize);
+        if image_x >= image_size[0] || image_y >= image_size[1] {
+            return None;
+        }
+        let channel = match state.view {
+            ChannelView::Grid => {
+                let (column, row) = (image_x / preview.width, image_y / preview.height);
+                *panes.get(row * columns + column)?
+            }
+            // Composite blends every visible channel, so the selected one is
+            // the only value it makes sense to name.
+            ChannelView::Solo | ChannelView::Composite => input.selected,
+        };
+        let x = image_x % preview.width;
+        let y = image_y % preview.height;
+        Some((channel, x, y, sample(input, &preview, channel, x, y)))
+    });
+
+    ChannelCanvasOutcome { preview, hovered }
 }
 
 fn grid_columns(channels: usize) -> usize {
     (channels as f64).sqrt().ceil().max(1.0) as usize
+}
+
+/// Whether the user has this channel switched on for display.
+fn is_visible(input: &ChannelCanvasInput<'_>, channel: usize) -> bool {
+    input
+        .draft
+        .channels
+        .get(channel)
+        .is_some_and(|entry| entry.display.visible)
 }
 
 fn upload(
@@ -282,14 +359,21 @@ fn upload(
     preview: &ChannelPreview,
     image_size: [usize; 2],
     columns: usize,
+    panes: &[usize],
     state: &mut ChannelCanvasState,
 ) {
     // The key mixes everything that changes the pixels, so a view or source
     // switch rebuilds the texture even when the values did not move.
+    // Visibility is part of the key: hiding a channel changes the pixels while
+    // the values behind them stay exactly where they were.
+    let visibility = (0..preview.channels)
+        .filter(|channel| is_visible(input, *channel))
+        .fold(0u64, |bits, channel| bits | (1u64 << (channel % 64)));
     let key = input.generation
         ^ ((state.view as u64) << 40)
         ^ ((state.source as u64) << 44)
-        ^ ((input.selected as u64) << 48);
+        ^ ((input.selected as u64) << 48)
+        ^ visibility.rotate_left(17);
     if state.uploaded == Some(key) && state.texture.is_some() {
         return;
     }
@@ -305,10 +389,11 @@ fn upload(
             }
             match state.view {
                 ChannelView::Grid => {
-                    for (channel, value) in values.iter().enumerate() {
-                        let column = channel % columns;
-                        let row = channel / columns;
-                        let color = solo_pixel(*value, input.colors, channel);
+                    for (pane, channel) in panes.iter().copied().enumerate() {
+                        let value = values.get(channel).copied().unwrap_or(0.0);
+                        let column = pane % columns;
+                        let row = pane / columns;
+                        let color = solo_pixel(value, input.colors, channel);
                         let px = column * width + x;
                         let py = row * height + y;
                         pixels[py * image_size[0] + px] =
@@ -328,12 +413,7 @@ fn upload(
                         .iter()
                         .enumerate()
                         .map(|(channel, value)| {
-                            if input
-                                .draft
-                                .channels
-                                .get(channel)
-                                .is_some_and(|entry| entry.display.visible)
-                            {
+                            if is_visible(input, channel) {
                                 *value
                             } else {
                                 0.0

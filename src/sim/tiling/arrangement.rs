@@ -80,7 +80,7 @@ impl PeriodicArrangement {
             if !basis_ids.insert(instance.id) {
                 diagnostics.push(diagnostic_at(
                     "duplicate_basis",
-                    format!("basis {:?} appears more than once", instance.id),
+                    format!("tile {} appears more than once", instance.id.0 + 1),
                     format!("basis/{}", instance.id.0),
                 ));
                 continue;
@@ -159,8 +159,10 @@ impl PeriodicArrangement {
                                 diagnostics.push(diagnostic_at(
                                     "proper_crossing",
                                     format!(
-                                        "edges {:?} and {:?} at offset {:?} cross in their interiors",
-                                        left.source, right.source, offset
+                                        "{} crosses through {} in {}",
+                                        edge_name(left.source),
+                                        edge_name(right.source),
+                                        offset_name(offset)
                                     ),
                                     edge_path(left.source),
                                 ));
@@ -172,8 +174,10 @@ impl PeriodicArrangement {
                                 diagnostics.push(diagnostic_at(
                                     "t_junction",
                                     format!(
-                                        "edge endpoint meets the interior of another edge between {:?} and {:?} at offset {:?}",
-                                        left.source, right.source, offset
+                                        "a corner of {} lands part-way along {} in {}, instead of meeting it end to end",
+                                        edge_name(left.source),
+                                        edge_name(right.source),
+                                        offset_name(offset)
                                     ),
                                     edge_path(left.source),
                                 ));
@@ -271,15 +275,18 @@ impl PeriodicArrangement {
             match candidates.as_slice() {
                 [] => diagnostics.push(diagnostic_at(
                     "unmatched_atomic_edge",
-                    format!("atomic edge {:?} has no opposite seam", fragment.source),
+                    format!(
+                        "{} has no matching edge to glue to in the next copy",
+                        edge_name(fragment.source)
+                    ),
                     edge_path(fragment.source),
                 )),
                 [(other, offset)] => twins.push((HalfEdgeId(*other), *offset)),
                 _ => diagnostics.push(diagnostic_at(
                     "competing_twins",
                     format!(
-                        "atomic edge {:?} has {} possible opposite seams",
-                        fragment.source,
+                        "{} could glue to {} different edges, so the pairing is ambiguous",
+                        edge_name(fragment.source),
                         candidates.len()
                     ),
                     edge_path(fragment.source),
@@ -520,6 +527,24 @@ fn ordered_relation_key(
 
 fn edge_path(edge: ShapeEdgeRef) -> String {
     format!("basis/{}/edge/{}", edge.basis.0, edge.edge)
+}
+
+/// Name an edge the way the user sees it on the canvas.
+///
+/// These strings reach the tiling verdict in the window, so they say "edge 2 of
+/// tile 1" rather than printing the internal reference. A reader who has to
+/// decode `ShapeEdgeRef { basis: TileId(1), edge: 2 }` is reading our notes,
+/// not a description of their drawing.
+fn edge_name(edge: ShapeEdgeRef) -> String {
+    format!("edge {} of tile {}", edge.edge + 1, edge.basis.0 + 1)
+}
+
+/// Describe which repeat of the tiling the other edge belongs to.
+fn offset_name(offset: [i32; 2]) -> String {
+    match offset {
+        [0, 0] => "the same copy".to_string(),
+        [a, b] => format!("the copy {a} across and {b} up"),
+    }
 }
 
 fn diagnostic(code: &'static str, message: impl Into<String>) -> TilingDiagnostic {

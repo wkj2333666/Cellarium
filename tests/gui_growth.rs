@@ -124,8 +124,15 @@ fn invalid_source_is_kept_reported_in_place_and_stops_the_plot() {
         gui.state().growth_scene().is_none(),
         "a program that does not compile has no plot"
     );
-    // The location is stated in editor coordinates, not as a byte offset.
-    gui.get_by_label(format!("line 1, column 7: {}", diagnostics[0].code).as_str());
+    // The location is stated in editor coordinates, not as a byte offset, and
+    // the reason is a sentence rather than the compiler's own error code: a
+    // user cannot act on `expected_expression`.
+    let described = cellarium::document::growth::describe_diagnostic(&diagnostics[0].code, "");
+    assert!(
+        !described.contains('_'),
+        "the message must read as prose, not as an identifier: {described}"
+    );
+    gui.get_by_label(format!("line 1, column 7: {described}").as_str());
 }
 
 #[test]

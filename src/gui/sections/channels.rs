@@ -11,7 +11,7 @@ use crate::gui::canvas::channels::{
 use crate::gui::theme;
 use crate::gui::widgets::object_strip::{CardAction, ObjectCard, StripHit, object_strip};
 use crate::render::channels::automatic_palette;
-use crate::sim::experiment_model::ChannelId;
+use crate::sim::experiment_model::{ChannelId, DisplayColor};
 
 /// Presets offered in the colour popover, so a usable colour is one click away
 /// and the exact fields are there when one click is not enough.
@@ -178,7 +178,23 @@ fn colour(app: &mut CellariumGui, ui: &mut Ui) {
             });
         }
         ui.separator();
-        // Exact values, for a colour no preset covers.
+        // Exact values, for a colour no preset covers. The fields open on the
+        // channel's own colour: a picker that starts somewhere else is asking
+        // the user to re-enter what they already have before they can nudge it.
+        if let Some(DisplayColor::Custom(rgb)) = &current {
+            app.set_channel_colour_draft([rgb.red, rgb.green, rgb.blue]);
+        } else if current.is_some() {
+            let index = app
+                .spec()
+                .channels
+                .iter()
+                .position(|channel| channel.id == selected)
+                .unwrap_or(0);
+            let palette = automatic_palette(app.spec().channels.len());
+            if let Some(colour) = palette.get(index) {
+                app.set_channel_colour_draft([colour.red, colour.green, colour.blue]);
+            }
+        }
         let mut rgb = app.channel_colour_draft();
         let mut changed = false;
         for (label, component) in [("R", 0), ("G", 1), ("B", 2)] {
@@ -249,7 +265,7 @@ fn canvas(app: &mut CellariumGui, ui: &mut Ui) {
         (ui.available_height() - label_height * 2.0).max(64.0),
     );
 
-    let preview = {
+    let outcome = {
         let active = app.document().active().clone();
         let draft = app.spec().clone();
         let input = ChannelCanvasInput {
@@ -263,6 +279,7 @@ fn canvas(app: &mut CellariumGui, ui: &mut Ui) {
         let state = app.channel_canvas_mut();
         render_channel_canvas(ui, size, &input, state)
     };
+    let preview = outcome.preview;
 
     // Naming the source is the whole point: draft initial values and a running
     // world look alike and mean different things.
@@ -284,19 +301,35 @@ fn canvas(app: &mut CellariumGui, ui: &mut Ui) {
             }
         }
     });
-    ui.label(
-        RichText::new(format!(
-            "{} channels, {} of {} visible",
-            preview.channels,
-            app.spec()
+    // The value under the pointer, named with the channel it belongs to. In
+    // Grid the pane decides which channel that is, so the reading always
+    // describes the picture it is over.
+    match outcome.hovered {
+        Some((channel, x, y, value)) => {
+            let name = app
+                .spec()
                 .channels
-                .iter()
-                .filter(|channel| channel.display.visible)
-                .count(),
-            app.spec().channels.len()
-        ))
-        .weak(),
-    );
+                .get(channel)
+                .map(|entry| entry.name.clone())
+                .unwrap_or_else(|| format!("channel {}", channel + 1));
+            ui.label(RichText::new(format!("{name} ({x}, {y}) = {value:.3}")).weak());
+        }
+        None => {
+            ui.label(
+                RichText::new(format!(
+                    "{}, {} of {} visible",
+                    theme::plural(preview.channels, "channel", "channels"),
+                    app.spec()
+                        .channels
+                        .iter()
+                        .filter(|channel| channel.display.visible)
+                        .count(),
+                    app.spec().channels.len()
+                ))
+                .weak(),
+            );
+        }
+    }
 }
 
 #[cfg(test)]

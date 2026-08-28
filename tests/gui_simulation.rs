@@ -130,8 +130,8 @@ fn the_channel_view_and_brush_are_pointer_settable_state() {
     app.world_canvas_mut().view = ChannelView::Solo(0);
     assert_eq!(app.world_canvas().view, ChannelView::Solo(0));
 
-    app.world_canvas_mut().brush_radius = 5;
-    app.world_canvas_mut().brush_value = 0.25;
-    assert_eq!(app.world_canvas().brush_radius, 5);
-    assert_eq!(app.world_canvas().brush_value, 0.25);
+    app.world_canvas_mut().brush.radius = 5;
+    app.world_canvas_mut().brush.value = 0.25;
+    assert_eq!(app.world_canvas().brush.radius, 5);
+    assert_eq!(app.world_canvas().brush.value, 0.25);
 }
