@@ -65,10 +65,16 @@ jobs:
       - name: Build the release executable
         run: cargo build --locked --release --no-default-features
       # Compiling proves it builds; this proves it opens, paints and exits.
+      #
+      # Software rendering only, so the result does not depend on a GPU being
+      # present: LIBGL_ALWAYS_SOFTWARE covers OpenGL, and mesa-vulkan-drivers
+      # above supplies lavapipe for Vulkan. Which of them wgpu picks is left to
+      # wgpu. Pinning WGPU_BACKEND=gl here forced the one that cannot create a
+      # device on software Mesa, and the window exited at once with "Parent
+      # device is lost" — a runner configuration failing, not the application.
       - name: Smoke the window
         env:
           LIBGL_ALWAYS_SOFTWARE: "1"
-          WGPU_BACKEND: gl
         run: ./scripts/smoke-gui.sh target/release/cellarium
       - name: Upload the captured window
         if: always()
