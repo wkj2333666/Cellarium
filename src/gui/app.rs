@@ -1060,10 +1060,18 @@ impl CellariumGui {
     /// The axes the plot uses: the user's choice if they made one, otherwise
     /// the ones the program's own references imply.
     pub fn plot_axes(&self) -> crate::document::selection::PlotAxes {
-        if let Some(chosen) = self.growth_plot.chosen_axes {
+        let signature = self.growth_signature();
+        // A chosen axis only survives while the kernel it names does. Deleting
+        // a kernel the plot was drawn against used to leave the caption naming
+        // a symbol no signature contained — "x: k0" for a kernel that had been
+        // removed — because the fallback invents a name from the dead id.
+        if let Some(chosen) = self
+            .growth_plot
+            .chosen_axes
+            .filter(|axes| axes_are_live(*axes, &signature.kernel_ids))
+        {
             return chosen;
         }
-        let signature = self.growth_signature();
         let pairs: Vec<(String, KernelId)> = signature
             .kernel_inputs
             .iter()
@@ -1649,6 +1657,24 @@ pub struct StatusLine {
     pub frame_hz: f32,
     pub draft_clean: bool,
     pub notice: Option<String>,
+}
+
+/// Whether every symbol an axis names still exists.
+///
+/// `self` is always there; a kernel is only there while the signature lists it.
+fn axes_are_live(
+    axes: crate::document::selection::PlotAxes,
+    kernels: &[crate::sim::experiment_model::KernelId],
+) -> bool {
+    use crate::document::selection::{PlotAxes, PlotSymbol};
+    let live = |symbol: PlotSymbol| match symbol {
+        PlotSymbol::SelfValue => true,
+        PlotSymbol::Kernel(id) => kernels.contains(&id),
+    };
+    match axes {
+        PlotAxes::Curve(x) => live(x),
+        PlotAxes::Heatmap(x, y) => live(x) && live(y),
+    }
 }
 
 impl eframe::App for CellariumGui {

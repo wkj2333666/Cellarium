@@ -225,6 +225,44 @@ fn choosing_the_same_symbol_for_both_axes_collapses_back_to_a_curve() {
 }
 
 #[test]
+fn an_axis_does_not_outlive_the_kernel_it_names() {
+    let (mut gui, ids) = growth_gui_with_four_kernels_source("{k0}");
+    // Draw against a kernel, then take that kernel away.
+    gui.state_mut()
+        .set_plot_axis(Axis::X, PlotSymbol::Kernel(ids[1]));
+    gui.run();
+    assert_eq!(
+        gui.state().plot_axes(),
+        PlotAxes::Curve(PlotSymbol::Kernel(ids[1]))
+    );
+
+    gui.state_mut().begin_kernel_removal(ids[1]);
+    gui.run();
+    gui.state_mut().confirm_kernel_decision();
+    gui.run();
+
+    // The axis has to fall back to something the signature still contains. A
+    // dead id survives as an invented symbol — "x: k0" for a kernel nobody can
+    // see — which names a thing the user cannot find anywhere on screen.
+    let live: Vec<KernelId> = gui
+        .state()
+        .kernel_cards()
+        .into_iter()
+        .map(|card| card.id)
+        .collect();
+    assert!(!live.contains(&ids[1]), "the kernel was deleted");
+    match gui.state().plot_axes() {
+        PlotAxes::Curve(PlotSymbol::Kernel(id)) | PlotAxes::Heatmap(PlotSymbol::Kernel(id), _) => {
+            assert!(
+                live.contains(&id),
+                "the plot still names a kernel that no longer exists"
+            );
+        }
+        _ => {}
+    }
+}
+
+#[test]
 fn a_two_kernel_program_defaults_to_a_heatmap() {
     let (gui, ids) = growth_gui_with_four_kernels_source("k3 * k1");
     assert_eq!(

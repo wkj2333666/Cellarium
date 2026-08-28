@@ -82,10 +82,29 @@ fn header(app: &mut CellariumGui, ui: &mut Ui) {
             {
                 app.open_kernel(id);
             }
-            for (axis, label) in [(Axis::X, "x"), (Axis::Y, "y")] {
+            // The chips say which axis this input is already on, and the one
+            // that could only decline is disabled rather than left looking
+            // clickable: a control that promises an axis and then quietly does
+            // nothing reads as an application that has stopped responding.
+            let (on_x, on_y) = match app.plot_axes() {
+                PlotAxes::Curve(x) => (x == PlotSymbol::Kernel(id), false),
+                PlotAxes::Heatmap(x, y) => {
+                    (x == PlotSymbol::Kernel(id), y == PlotSymbol::Kernel(id))
+                }
+            };
+            for (axis, label, active) in [(Axis::X, "x", on_x), (Axis::Y, "y", on_y)] {
+                // Putting one symbol on both axes plots a diagonal and says
+                // nothing, so y is unavailable while this input holds x.
+                let usable = !(axis == Axis::Y && on_x);
                 if ui
-                    .add(egui::Button::new(RichText::new(label).small()))
+                    .add_enabled(
+                        usable,
+                        egui::Button::selectable(active, RichText::new(label).small()),
+                    )
                     .on_hover_text(format!("Plot against {symbol} on the {label} axis"))
+                    .on_disabled_hover_text(format!(
+                        "{symbol} is already the x axis; put another input on y"
+                    ))
                     .clicked()
                 {
                     app.set_plot_axis(axis, PlotSymbol::Kernel(id));
@@ -93,8 +112,12 @@ fn header(app: &mut CellariumGui, ui: &mut Ui) {
             }
         }
         ui.separator();
+        let self_on_x = matches!(
+            app.plot_axes(),
+            PlotAxes::Curve(PlotSymbol::SelfValue) | PlotAxes::Heatmap(PlotSymbol::SelfValue, _)
+        );
         if ui
-            .button("self")
+            .add(egui::Button::selectable(self_on_x, "self"))
             .on_hover_text("Plot against the channel's own value")
             .clicked()
         {

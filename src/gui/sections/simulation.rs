@@ -152,24 +152,37 @@ fn brush_bar(app: &mut CellariumGui, ui: &mut Ui) {
             }
         }
 
-        ui.separator();
+        if changed {
+            app.world_canvas_mut().brush = brush;
+        }
+    });
+
+    // The numbers get a row of their own. Wrapping decides whether to move a
+    // widget down only once the one before it is placed, so a slider that
+    // starts near the right edge overhangs the panel and loses its label: at a
+    // narrow window "value" was cut in half by the properties panel. Starting
+    // this row at the left edge gives every slider the whole width to sit in.
+    ui.horizontal_wrapped(|ui| {
+        ui.spacing_mut().slider_width = 84.0;
+        let mut brush = app.world_canvas().brush;
+        let mut changed = false;
         // A pencil is one cell by definition, so its size control is disabled
         // rather than silently ignored.
         let sized = brush.kind.has_radius();
-        ui.add_enabled_ui(sized, |ui| {
-            changed |= ui
-                .add(
-                    egui::DragValue::new(&mut brush.radius)
-                        .range(0..=32)
-                        .prefix("size "),
-                )
-                .on_hover_text(if sized {
-                    "Radius of the brush, in cells"
-                } else {
-                    "A pencil always covers exactly one cell"
-                })
-                .changed();
-        });
+        // Added straight to this row rather than through `add_enabled_ui`: that
+        // builds a nested Ui, and a nested Ui does not take part in the wrapping
+        // of the row around it, so the control it holds is clipped at a narrow
+        // window instead of moving to the next line.
+        changed |= ui
+            .add_enabled(
+                sized,
+                egui::DragValue::new(&mut brush.radius)
+                    .range(0..=32)
+                    .prefix("size "),
+            )
+            .on_hover_text("Radius of the brush, in cells")
+            .on_disabled_hover_text("A pencil always covers exactly one cell")
+            .changed();
 
         ui.separator();
         let mut percent = (brush.flow * 100.0).round();
@@ -188,12 +201,14 @@ fn brush_bar(app: &mut CellariumGui, ui: &mut Ui) {
 
         // An eraser always paints zero, so offering it a value would be
         // offering a control that does nothing.
-        ui.add_enabled_ui(brush.kind != BrushKind::Eraser, |ui| {
-            changed |= ui
-                .add(egui::Slider::new(&mut brush.value, 0.0..=1.0).text("value"))
-                .on_hover_text("The value a full-strength stroke paints")
-                .changed();
-        });
+        changed |= ui
+            .add_enabled(
+                brush.kind != BrushKind::Eraser,
+                egui::Slider::new(&mut brush.value, 0.0..=1.0).text("value"),
+            )
+            .on_hover_text("The value a full-strength stroke paints")
+            .on_disabled_hover_text("An eraser always paints zero")
+            .changed();
 
         let channels = app.spec().channels.len();
         if channels > 1 {
@@ -246,58 +261,72 @@ fn recording_bar(app: &mut CellariumGui, ui: &mut Ui) {
         let replaying = app.recording().is_replaying();
         ui.label(RichText::new("Take").weak());
 
-        ui.add_enabled_ui(frames > 0, |ui| {
-            let playing = app.recording().state() == ReplayState::Playing;
-            if ui
-                .add(
-                    egui::Button::new(if playing { "Pause replay" } else { "Play" })
-                        .min_size(egui::vec2(96.0, 0.0)),
-                )
-                .on_hover_text("Play the recorded frames back")
-                .clicked()
-            {
-                app.toggle_replay();
-            }
-            if ui
-                .button("<")
-                .on_hover_text("Step back one recorded frame")
-                .clicked()
-            {
-                app.recording_mut().nudge(-1);
-            }
-            if ui
-                .button(">")
-                .on_hover_text("Step forward one recorded frame")
-                .clicked()
-            {
-                app.recording_mut().nudge(1);
-            }
+        // Each control is added to this row directly rather than inside one
+        // `add_enabled_ui`: a nested Ui does not wrap with the row around it, so
+        // a narrow window would clip the scrubber off the edge instead of
+        // moving it to the next line.
+        let has_take = frames > 0;
+        let nothing_yet = "Nothing has been recorded yet";
+        let playing = app.recording().state() == ReplayState::Playing;
+        if ui
+            .add_enabled(
+                has_take,
+                egui::Button::new(if playing { "Pause replay" } else { "Play" })
+                    .min_size(egui::vec2(96.0, 0.0)),
+            )
+            .on_hover_text("Play the recorded frames back")
+            .on_disabled_hover_text(nothing_yet)
+            .clicked()
+        {
+            app.toggle_replay();
+        }
+        if ui
+            .add_enabled(has_take, egui::Button::new("<"))
+            .on_hover_text("Step back one recorded frame")
+            .on_disabled_hover_text(nothing_yet)
+            .clicked()
+        {
+            app.recording_mut().nudge(-1);
+        }
+        if ui
+            .add_enabled(has_take, egui::Button::new(">"))
+            .on_hover_text("Step forward one recorded frame")
+            .on_disabled_hover_text(nothing_yet)
+            .clicked()
+        {
+            app.recording_mut().nudge(1);
+        }
 
-            // The scrubber is the whole point of a replay: being able to go
-            // back to the moment something happened.
-            let mut playhead = app.recording().playhead();
-            let last = frames.saturating_sub(1);
-            if ui
-                .add(
-                    egui::Slider::new(&mut playhead, 0..=last)
-                        .text("frame")
-                        .clamping(egui::SliderClamping::Always),
-                )
-                .on_hover_text("Scrub through the take")
-                .changed()
-            {
-                app.recording_mut().seek(playhead);
-            }
+        // The scrubber is the whole point of a replay: being able to go back to
+        // the moment something happened.
+        let mut playhead = app.recording().playhead();
+        let last = frames.saturating_sub(1);
+        if ui
+            .add_enabled(
+                has_take,
+                egui::Slider::new(&mut playhead, 0..=last)
+                    .text("frame")
+                    .clamping(egui::SliderClamping::Always),
+            )
+            .on_hover_text("Scrub through the take")
+            .on_disabled_hover_text(nothing_yet)
+            .changed()
+        {
+            app.recording_mut().seek(playhead);
+        }
 
-            let mut speed = app.recording().speed();
-            if ui
-                .add(egui::Slider::new(&mut speed, 1.0..=120.0).text("play/s"))
-                .on_hover_text("Frames per second of playback")
-                .changed()
-            {
-                app.recording_mut().set_speed(speed);
-            }
-        });
+        let mut speed = app.recording().speed();
+        if ui
+            .add_enabled(
+                has_take,
+                egui::Slider::new(&mut speed, 1.0..=120.0).text("play/s"),
+            )
+            .on_hover_text("Frames per second of playback")
+            .on_disabled_hover_text(nothing_yet)
+            .changed()
+        {
+            app.recording_mut().set_speed(speed);
+        }
 
         let mut rate = app.recording().capture_rate();
         if ui

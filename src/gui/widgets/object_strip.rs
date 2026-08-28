@@ -99,6 +99,13 @@ pub enum StripHit {
     Add,
 }
 
+/// How wide a card's title reaches.
+///
+/// The name is the accessible control, so it is sized like the card rather than
+/// like the word: "k2" is two characters and the card it names is a hundred
+/// pixels wide.
+const TITLE_WIDTH: f32 = 84.0;
+
 /// Draw the strip and report the single thing the pointer did.
 pub fn object_strip(
     ui: &mut Ui,
@@ -140,7 +147,7 @@ fn draw_card(ui: &mut Ui, card: &ObjectCard) -> Option<StripHit> {
     } else {
         egui::Stroke::new(1.0, theme::CELL_STROKE)
     };
-    egui::Frame::group(ui.style())
+    let framed = egui::Frame::group(ui.style())
         .stroke(stroke)
         .show(ui, |ui| {
             ui.vertical(|ui| {
@@ -160,7 +167,11 @@ fn draw_card(ui: &mut Ui, card: &ObjectCard) -> Option<StripHit> {
                         title = title.strong();
                     }
                     if ui
-                        .add(egui::Button::new(title).frame(false))
+                        .add(
+                            egui::Button::new(title)
+                                .frame(false)
+                                .min_size(egui::vec2(TITLE_WIDTH, 0.0)),
+                        )
                         .on_hover_text("Select this object")
                         .clicked()
                     {
@@ -201,7 +212,37 @@ fn draw_card(ui: &mut Ui, card: &ObjectCard) -> Option<StripHit> {
                 });
             });
         });
+    // The card is what looks like the control, so the card is the control. The
+    // title alone was the click target, which for a name as short as "k2" is a
+    // dozen pixels inside a box ten times that wide: a user aiming at the card
+    // got nothing back, and nothing back is indistinguishable from an
+    // application that has stopped responding.
+    //
+    // Read from the pointer rather than registering a widget over the card: a
+    // widget on top of the card is a widget in front of its buttons, and Delete
+    // stops working the moment it has to compete for the click.
+    let clicked_inside = ui.input(|input| {
+        input.pointer.primary_clicked()
+            && input
+                .pointer
+                .interact_pos()
+                .is_some_and(|at| framed.response.rect.contains(at))
+    });
+    if let Some(selection) = background_select(hit.as_ref(), clicked_inside, card.key) {
+        hit = Some(selection);
+    }
     hit
+}
+
+/// What a click on a card's background means.
+///
+/// Whatever the card's own controls took, they keep: this only speaks when
+/// nothing inside the card answered the click first.
+fn background_select(hit: Option<&StripHit>, clicked_inside: bool, key: u64) -> Option<StripHit> {
+    match (hit, clicked_inside) {
+        (None, true) => Some(StripHit::Select(key)),
+        _ => None,
+    }
 }
 
 #[cfg(test)]
@@ -219,6 +260,31 @@ mod tests {
         assert_eq!(card.key, 7);
         assert_eq!(card.actions.len(), 2);
         assert!(!card.actions[1].enabled);
+    }
+
+    #[test]
+    fn a_click_on_the_card_selects_it() {
+        assert_eq!(
+            background_select(None, true, 3),
+            Some(StripHit::Select(3)),
+            "a click on the card is a click on the thing the card stands for"
+        );
+    }
+
+    #[test]
+    fn a_card_control_keeps_the_click_it_answered() {
+        // Delete is inside the card. If the background could speak over it, the
+        // card would select instead of deleting and the button would look dead.
+        let deleted = StripHit::Action {
+            key: 3,
+            verb: "Delete".to_string(),
+        };
+        assert_eq!(background_select(Some(&deleted), true, 3), None);
+    }
+
+    #[test]
+    fn a_click_outside_the_card_selects_nothing() {
+        assert_eq!(background_select(None, false, 3), None);
     }
 
     #[test]

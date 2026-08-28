@@ -179,6 +179,13 @@ pub struct KernelCanvasState {
     pub selected_cell: Option<(usize, usize)>,
     /// Cell whose exact value is being typed, if any.
     pub editing: Option<(usize, usize)>,
+    /// The stencil size the current transform was fitted to.
+    ///
+    /// Selecting a different channel changes the binding, and so changes the
+    /// kernel on screen, without going anywhere near the kernel strip. A view
+    /// still zoomed for the stencil before it showed one enormous cell and no
+    /// way to guess that "Fit kernel" was the way back.
+    laid_out: Option<(usize, usize)>,
 }
 
 impl KernelCanvasState {
@@ -244,6 +251,12 @@ pub fn render_kernel_canvas(
         return result;
     }
 
+    // A stencil of a different shape is a different picture, so it is framed
+    // afresh rather than inheriting the last one's zoom.
+    if state.laid_out != Some((stencil.width, stencil.height)) {
+        state.request_fit();
+        state.laid_out = Some((stencil.width, stencil.height));
+    }
     let transform = match &mut state.transform {
         Some(transform) => {
             transform.viewport = rect;
