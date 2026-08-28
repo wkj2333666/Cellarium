@@ -162,6 +162,13 @@ jobs:
     needs: [version, quality]
     # A self-hosted runner with a CUDA device. Compilation does not prove that
     # two backends agree; only running them on the same experiment does.
+    #
+    # Nothing waits for this. `continue-on-error` says a parity failure must not
+    # sink a release, but it only covers a job that runs and fails: a job whose
+    # labels match no online runner simply queues, and GitHub waits a day before
+    # giving up on it. Publishing used to list this in its `needs`, so the first
+    # release to include this job sat for twenty-four hours with every artifact
+    # already built. Parity reports; it does not gate.
     runs-on: [self-hosted, cuda]
     timeout-minutes: 45
     continue-on-error: true
@@ -179,7 +186,7 @@ jobs:
 
   release:
     name: Publish GitHub Release
-    needs: [build, parity]
+    needs: [build]
     runs-on: ubuntu-latest
     permissions:
       contents: write

@@ -112,14 +112,28 @@ fn ci_starts_the_window_and_proves_it_painted() {
 }
 
 #[test]
-fn the_release_gates_on_backend_parity_measured_on_real_hardware() {
+fn the_release_measures_backend_parity_without_letting_it_stall_publishing() {
     assert!(
         RELEASE.contains("backend_parity"),
-        "publishing must wait on a parity run"
+        "a release must still measure parity on real hardware"
     );
     assert!(
-        RELEASE.contains("needs: [build, parity]"),
-        "the release job must depend on parity"
+        RELEASE.contains("runs-on: [self-hosted, cuda]"),
+        "parity is only meaningful on a machine with a real device"
+    );
+    // Parity reports; it does not gate. `continue-on-error` already says a
+    // parity failure must not sink a release, but it only covers a job that
+    // runs and fails. A job whose labels match no online runner queues instead,
+    // and GitHub waits a day before giving up — so listing it in `needs` left
+    // the first release that included it sitting for twenty-four hours with
+    // every artifact already built.
+    assert!(
+        RELEASE.contains("needs: [build]"),
+        "publishing must not wait on a runner that may not exist"
+    );
+    assert!(
+        !RELEASE.contains("needs: [build, parity]"),
+        "publishing must not depend on parity"
     );
 }
 
