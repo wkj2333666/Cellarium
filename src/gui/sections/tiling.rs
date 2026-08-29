@@ -1,4 +1,10 @@
-//! The Tiling workspace: preset cards, polygon construction and seam solving.
+//! The Tiling workspace: preset cards, polygon construction and the seam
+//! assistant.
+//!
+//! The assistant is live. It has an opinion about the drawing at all times,
+//! including — especially — while the drawing is wrong, because that is when
+//! its opinion is worth having. The control that closes the seams moves the
+//! geometry; the readout beneath the canvas says which way and how far.
 
 use eframe::egui::{self, RichText, Ui};
 
@@ -6,12 +12,8 @@ use crate::document::DocumentCommand;
 use crate::document::tiling::ConstructionTarget;
 use crate::gui::app::CellariumGui;
 use crate::gui::canvas::tiling::render_tiling_canvas;
-use crate::gui::theme;
-use crate::sim::tiling::{TilingPreset, propose_full_edge_seams, validate_coverage};
-
-/// Tolerance a seam proposal must meet before it is offered. Edges further
-/// apart than this are not the same seam, they are two edges near each other.
-const SEAM_TOLERANCE: f64 = 1e-3;
+use crate::gui::{style, theme};
+use crate::sim::tiling::{SeamAssessment, SeamBucket, TilingPreset, Vec2, validate_coverage};
 
 pub fn preset_label(preset: TilingPreset) -> &'static str {
     match preset {
@@ -33,6 +35,9 @@ pub fn preset_hint(preset: TilingPreset) -> &'static str {
 
 pub fn draw(app: &mut CellariumGui, ui: &mut Ui) {
     toolbar(app, ui);
+    if !app.tiling_canvas().drawing() {
+        assistant_bar(app, ui);
+    }
     ui.separator();
     canvas(app, ui);
 }
@@ -42,8 +47,9 @@ fn toolbar(app: &mut CellariumGui, ui: &mut Ui) {
         if app.tiling_canvas().drawing() {
             construction_controls(app, ui);
         } else {
+            style::group_caption(ui, "DRAW");
             if ui
-                .button("Draw from scratch")
+                .add(style::secondary("Draw from scratch"))
                 .on_hover_text("Place vertices with the pointer to add a new basis polygon")
                 .clicked()
             {
@@ -51,7 +57,7 @@ fn toolbar(app: &mut CellariumGui, ui: &mut Ui) {
             }
             let selected = app.tiling_canvas().selected_prototype;
             if ui
-                .add_enabled(selected.is_some(), egui::Button::new("Redraw selected"))
+                .add_enabled(selected.is_some(), style::secondary("Redraw selected"))
                 .on_hover_text("Replace the selected polygon with a new outline")
                 .on_disabled_hover_text("Click a polygon on the canvas to select it first")
                 .clicked()
@@ -60,13 +66,12 @@ fn toolbar(app: &mut CellariumGui, ui: &mut Ui) {
                 app.tiling_canvas_mut().begin_reshape(prototype);
             }
             ui.separator();
+            style::group_caption(ui, "START FROM");
             presets(app, ui);
-            ui.separator();
-            seams(app, ui);
         }
         ui.separator();
         if ui
-            .button("Fit tiling")
+            .add(style::secondary("Fit tiling"))
             .on_hover_text("Fit the unit cell and its neighbours in view")
             .clicked()
         {
@@ -80,14 +85,14 @@ fn toolbar(app: &mut CellariumGui, ui: &mut Ui) {
 fn presets(app: &mut CellariumGui, ui: &mut Ui) {
     for preset in TilingPreset::ALL {
         if ui
-            .button(preset_label(preset))
+            .add(style::secondary(preset_label(preset)))
             .on_hover_text(preset_hint(preset))
             .clicked()
         {
             app.dispatch_document(DocumentCommand::ApplyTilingPreset { preset, scale: 1.0 });
             // A new unit cell is a new thing to frame.
             app.tiling_canvas_mut().request_fit();
-            app.tiling_canvas_mut().seams.clear();
+            app.release_seams();
         }
     }
 }
@@ -101,10 +106,12 @@ fn construction_controls(app: &mut CellariumGui, ui: &mut Ui) {
         })
         .color(theme::state_color(theme::State::Draft)),
     );
-    ui.label(theme::plural(placed, "vertex", "vertices"));
+    ui.label(style::dim_readout(theme::plural(
+        placed, "vertex", "vertices",
+    )));
     let can_undo = app.tiling_canvas().can_undo_point();
     if ui
-        .add_enabled(can_undo, egui::Button::new("Undo point"))
+        .add_enabled(can_undo, style::secondary("Undo point"))
         .on_hover_text("Remove the last placed vertex")
         .on_disabled_hover_text("No vertex has been placed yet")
         .clicked()
@@ -113,7 +120,7 @@ fn construction_controls(app: &mut CellariumGui, ui: &mut Ui) {
     }
     let can_redo = app.tiling_canvas().can_redo_point();
     if ui
-        .add_enabled(can_redo, egui::Button::new("Redo point"))
+        .add_enabled(can_redo, style::secondary("Redo point"))
         .on_hover_text("Put back the vertex that was undone")
         .on_disabled_hover_text("No vertex has been undone")
         .clicked()
@@ -121,7 +128,7 @@ fn construction_controls(app: &mut CellariumGui, ui: &mut Ui) {
         app.tiling_canvas_mut().redo_point();
     }
     if ui
-        .add_enabled(placed >= 3, egui::Button::new("Finish polygon"))
+        .add_enabled(placed >= 3, style::primary("Finish polygon"))
         .on_hover_text("Close the outline and add it to the unit cell")
         .on_disabled_hover_text("Place at least three vertices to close an outline")
         .clicked()
@@ -129,7 +136,7 @@ fn construction_controls(app: &mut CellariumGui, ui: &mut Ui) {
         app.finish_tiling_polygon();
     }
     if ui
-        .button("Cancel drawing")
+        .add(style::secondary("Cancel drawing"))
         .on_hover_text("Discard the outline and go back to selecting")
         .clicked()
     {
@@ -137,67 +144,184 @@ fn construction_controls(app: &mut CellariumGui, ui: &mut Ui) {
     }
 }
 
-/// Seam solving. A proposal is shown with its residual and is never applied
-/// until the user accepts it.
-fn seams(app: &mut CellariumGui, ui: &mut Ui) {
-    let has_tiling = app.spec().tiling.is_some();
-    if ui
-        .add_enabled(has_tiling, egui::Button::new("Solve seams"))
-        .on_hover_text("Propose the full-edge pairs that glue the tiling together")
-        .on_disabled_hover_text("Pick a preset or draw a polygon first — there is no tiling yet")
-        .clicked()
-        && let Some(draft) = app.spec().tiling.clone()
-    {
-        match propose_full_edge_seams(&draft, SEAM_TOLERANCE) {
-            Ok(proposals) => app.set_seam_proposals(proposals),
-            Err(reason) => app.set_notice(Some(reason)),
-        }
-    }
-    let accepted = app.tiling_canvas().seams.len();
-    if accepted > 0 {
-        ui.label(
-            RichText::new(format!("{accepted} seams held"))
-                .color(theme::state_color(theme::State::Live)),
-        );
-    }
-    coverage(app, ui);
-}
-
-/// Say plainly whether the drawn cell actually tiles the plane. Copies are
-/// drawn either way, so without this line a draft that leaves gaps looks
-/// finished.
+/// The assistant's standing opinion of the drawing.
 ///
-/// The verdict stays short: a coverage diagnostic runs long enough to wrap the
-/// toolbar onto a second row and collide with the controls beside it, so the
-/// detail is on hover.
-fn coverage(app: &CellariumGui, ui: &mut Ui) {
-    let Some(draft) = app.spec().tiling.as_ref() else {
+/// This row is never blank while a tiling exists. The control it replaces only
+/// spoke about drawings that were already correct: one thousandth of a unit of
+/// pointer inaccuracy and it proposed nothing at all, beside an Accept button
+/// that did nothing.
+fn assistant_bar(app: &mut CellariumGui, ui: &mut Ui) {
+    let Some(assessment) = app.seam_assessment() else {
         return;
     };
-    let (state, verdict, detail) = match validate_coverage(draft) {
-        Ok(report) => (
-            theme::State::Live,
-            "tiles the plane",
-            format!(
-                "covers {:.4} of a {:.4} unit cell with no gaps or overlaps",
-                report.covered_area, report.patch_area
+    let coverage = app
+        .spec()
+        .tiling
+        .as_ref()
+        .map(|draft| validate_coverage(draft).map_err(|issues| summarize(&issues)));
+
+    ui.horizontal_wrapped(|ui| {
+        let (state, line) = verdict(&assessment, coverage.as_ref().is_some_and(Result::is_ok));
+        ui.label(RichText::new(line).color(theme::state_color(state)))
+            .on_hover_text(hover_detail(&assessment, coverage.as_ref()));
+
+        ui.separator();
+        // Enabled whenever there is anything to act on, including a drawing
+        // that is already exact: closing an exact seam moves nothing and holds
+        // it, which is the only way to ask for linked dragging. Gating this on
+        // "something is out of true" left a correct tiling with no way to be
+        // held together at all.
+        let closeable = assessment.acceptable().next().is_some();
+        if ui
+            .add_enabled(closeable, style::primary("Close seams"))
+            .on_hover_text(
+                "Move the drawing the smallest amount that makes these edges meet, and hold \
+                 them together from now on",
+            )
+            .on_disabled_hover_text(
+                "nothing is near enough yet — drag an edge closer to the one it should meet",
+            )
+            .clicked()
+        {
+            app.close_seams();
+        }
+
+        let held = app.tiling_canvas().seams.len();
+        if held > 0
+            && ui
+                .add(style::secondary(&format!("Release {held}")))
+                .on_hover_text("Stop holding these seams, so vertices move one at a time")
+                .clicked()
+        {
+            app.release_seams();
+        }
+    });
+    hint_line(app, ui, &assessment);
+}
+
+/// The one thing the assistant has to say, seams and coverage together.
+///
+/// These were two chips side by side, and a drawing whose edges meet exactly
+/// while its tiles overlap their own copies showed a green "every seam closes"
+/// next to a red "does not tile". Both were true — closing a seam is about
+/// endpoints meeting, tiling is about interiors staying out of each other's
+/// way — but a user reading two contradictory-looking verdicts has to work out
+/// which one to believe. One sentence carries both facts and no argument.
+pub fn verdict(assessment: &SeamAssessment, tiles: bool) -> (theme::State, String) {
+    let (state, sentence) = if assessment.edge_count == 0 {
+        (theme::State::Draft, assessment.summary())
+    } else {
+        match (assessment.is_closed(), tiles) {
+            (true, true) => (
+                theme::State::Live,
+                format!(
+                    "every seam closes and the plane is covered: {} pairs holding",
+                    assessment.candidates.len()
+                ),
             ),
-        ),
-        Err(diagnostics) => (
-            theme::State::Invalid,
-            "does not tile",
-            // One problem is a thing to fix; forty are a wall of text over the
-            // drawing the user needs to look at to fix them. The rest are
-            // counted, not listed, and they are usually the same problem seen
-            // from every repeat of the lattice anyway.
-            summarize(&diagnostics),
-        ),
+            (true, false) => (
+                theme::State::Invalid,
+                "every seam meets, but the tiles still overlap their own copies".to_string(),
+            ),
+            (false, true) => (
+                theme::State::Draft,
+                format!("{} — the plane is covered", assessment.summary()),
+            ),
+            (false, false) => (assessment_state(assessment), assessment.summary()),
+        }
     };
-    ui.label(
-        RichText::new(format!("{} {verdict}", theme::state_glyph(state)))
-            .color(theme::state_color(state)),
+    // The glyph carries the state as well as the colour does. `theme` promises
+    // colour is never the only indicator, and a verdict is exactly the place
+    // that promise has to hold.
+    (state, format!("{} {sentence}", theme::state_glyph(state)))
+}
+
+fn assessment_state(assessment: &SeamAssessment) -> theme::State {
+    if assessment.is_closed() {
+        theme::State::Live
+    } else if !assessment.orphans.is_empty() {
+        theme::State::Invalid
+    } else {
+        theme::State::Draft
+    }
+}
+
+fn hover_detail(
+    assessment: &SeamAssessment,
+    coverage: Option<&Result<crate::sim::tiling::CoverageReport, String>>,
+) -> String {
+    let mut lines = vec![format!(
+        "{} boundary edges, every one of them accounted for",
+        assessment.edge_count
+    )];
+    match coverage {
+        Some(Ok(report)) => lines.push(format!(
+            "covers {:.4} of a {:.4} unit cell with no gaps or overlaps",
+            report.covered_area, report.patch_area
+        )),
+        Some(Err(detail)) => lines.push(detail.clone()),
+        None => {}
+    }
+    for candidate in assessment.candidates.iter().take(6) {
+        lines.push(format!(
+            "{}: edge {} of basis {} to edge {} of basis {}, gap {:.4}",
+            candidate.bucket.label(),
+            candidate.constraint.lhs.edge,
+            candidate.constraint.lhs.tile.0,
+            candidate.constraint.rhs.edge,
+            candidate.constraint.rhs.tile.0,
+            candidate.score.endpoint_gap,
+        ));
+    }
+    for orphan in assessment.orphans.iter().take(4) {
+        lines.push(orphan.describe());
+    }
+    lines.join("\n")
+}
+
+/// The single most useful sentence about what to do next.
+///
+/// An unpaired edge is the more serious problem, so it is named first; failing
+/// that, the seam that is furthest from closing gets its direction spelled out.
+fn hint_line(app: &CellariumGui, ui: &mut Ui, assessment: &SeamAssessment) {
+    let _ = app;
+    if assessment.is_closed() {
+        return;
+    }
+    if let Some(orphan) = assessment.orphans.first() {
+        ui.label(RichText::new(orphan.describe()).color(theme::state_color(theme::State::Invalid)));
+        return;
+    }
+    let worst = assessment
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.bucket != SeamBucket::Held)
+        .max_by(|left, right| left.score.endpoint_gap.total_cmp(&right.score.endpoint_gap));
+    if let Some(candidate) = worst {
+        ui.label(
+            RichText::new(format!(
+                "furthest seam: edge {} of basis {} needs to move {}",
+                candidate.constraint.lhs.edge,
+                candidate.constraint.lhs.tile.0,
+                describe_move(candidate.hint()),
+            ))
+            .color(theme::state_color(theme::State::Draft)),
+        );
+    }
+}
+
+/// A vector, in words a person can act on.
+///
+/// World `y` grows upwards on this canvas, so a positive `y` is described as
+/// up. A hint that names the wrong direction is worse than no hint.
+pub fn describe_move(delta: Vec2) -> String {
+    let horizontal = if delta.x >= 0.0 { "right" } else { "left" };
+    let vertical = if delta.y >= 0.0 { "up" } else { "down" };
+    format!(
+        "{:.3} {horizontal} and {:.3} {vertical}",
+        delta.x.abs(),
+        delta.y.abs()
     )
-    .on_hover_text(detail);
 }
 
 /// The first few problems, and a count of the rest.
@@ -215,11 +339,6 @@ fn summarize(diagnostics: &[crate::sim::tiling::TilingDiagnostic]) -> String {
 }
 
 fn canvas(app: &mut CellariumGui, ui: &mut Ui) {
-    if let Some(proposals) = app.seam_proposals() {
-        proposal_bar(app, ui, proposals.len(), worst_residual(app));
-        ui.separator();
-    }
-
     let draft = app.spec().tiling.clone();
     // Leave a row for the readout, otherwise the canvas claims the whole panel
     // and the readout is clipped off the bottom edge.
@@ -241,45 +360,7 @@ fn canvas(app: &mut CellariumGui, ui: &mut Ui) {
     readout(app, ui, response.hovered);
 }
 
-fn worst_residual(app: &CellariumGui) -> f64 {
-    app.seam_proposals()
-        .map(|proposals| {
-            proposals
-                .iter()
-                .map(|proposal| proposal.residual)
-                .fold(0.0_f64, f64::max)
-        })
-        .unwrap_or_default()
-}
-
-/// Accept or cancel a solve. Showing the residual next to the count is what
-/// makes "accept" an informed choice rather than a leap.
-fn proposal_bar(app: &mut CellariumGui, ui: &mut Ui, count: usize, residual: f64) {
-    ui.horizontal_wrapped(|ui| {
-        ui.label(
-            RichText::new(format!(
-                "{count} full-edge pairs proposed, worst residual {residual:.2e}"
-            ))
-            .color(theme::state_color(theme::State::Draft)),
-        );
-        if ui
-            .button("Accept seams")
-            .on_hover_text("Hold these edges together when vertices are dragged")
-            .clicked()
-        {
-            app.accept_seam_proposals();
-        }
-        if ui
-            .button("Cancel seams")
-            .on_hover_text("Discard the proposal and change nothing")
-            .clicked()
-        {
-            app.clear_seam_proposals();
-        }
-    });
-}
-
-fn readout(app: &CellariumGui, ui: &mut Ui, hovered: Option<crate::sim::tiling::Vec2>) {
+fn readout(app: &CellariumGui, ui: &mut Ui, hovered: Option<Vec2>) {
     // General messages belong in the status bar, where every workspace can see
     // them. This line is for what the tiling canvas itself is saying.
     if let Some(reason) = &app.tiling_canvas().rejection {
@@ -290,6 +371,22 @@ fn readout(app: &CellariumGui, ui: &mut Ui, hovered: Option<crate::sim::tiling::
             .truncate(),
         )
         .on_hover_text(reason);
+        return;
+    }
+    let broken = app.tiling_canvas().broken.len();
+    if broken > 0 {
+        // A drag is allowed to pull a held seam apart; what is not allowed is
+        // letting that happen silently.
+        ui.label(
+            RichText::new(format!(
+                "{} held {} no longer {} — press Close seams to draw them back together, or \
+                 Release to stop holding",
+                broken,
+                if broken == 1 { "seam" } else { "seams" },
+                if broken == 1 { "closes" } else { "close" },
+            ))
+            .color(theme::state_color(theme::State::Stale)),
+        );
         return;
     }
     match hovered {
@@ -303,10 +400,13 @@ fn readout(app: &CellariumGui, ui: &mut Ui, hovered: Option<crate::sim::tiling::
                 Some(basis) => format!("basis {}", basis.0),
                 None => "outside every tile".to_string(),
             };
-            ui.label(RichText::new(format!("({:.3}, {:.3}) {where_}", point.x, point.y)).weak());
+            ui.label(style::dim_readout(format!(
+                "({:.3}, {:.3})  {where_}",
+                point.x, point.y
+            )));
         }
         None => {
-            ui.label(RichText::new("hover the tiling to inspect it").weak());
+            ui.label(style::dim_readout("hover the tiling to inspect it"));
         }
     }
 }
@@ -324,6 +424,97 @@ mod tests {
                 assert_ne!(preset_label(*preset), preset_label(*other));
                 assert_ne!(preset_hint(*preset), preset_hint(*other));
             }
+        }
+    }
+
+    /// A hint that names the wrong direction is worse than no hint, so the
+    /// mapping from sign to word is pinned rather than assumed.
+    #[test]
+    fn a_move_is_described_in_the_direction_it_actually_goes() {
+        assert_eq!(
+            describe_move(Vec2::new(0.25, 0.5)),
+            "0.250 right and 0.500 up"
+        );
+        assert_eq!(
+            describe_move(Vec2::new(-0.25, -0.5)),
+            "0.250 left and 0.500 down"
+        );
+    }
+
+    #[test]
+    fn a_move_is_reported_as_a_magnitude_never_as_a_negative_distance() {
+        for delta in [
+            Vec2::new(-1.5, -2.5),
+            Vec2::new(-0.001, 0.001),
+            Vec2::new(3.0, -4.0),
+        ] {
+            let sentence = describe_move(delta);
+            assert!(
+                !sentence.contains('-'),
+                "a distance must not be written as negative: {sentence}"
+            );
+        }
+    }
+
+    use crate::sim::tiling::{PrototypeShape, assess_seams, build_preset, polygon};
+
+    fn drawn(preset: TilingPreset) -> crate::sim::tiling::PeriodicTilingDraft {
+        let mut draft = build_preset(preset, 1.0);
+        for prototype in &mut draft.prototypes {
+            let vertices = polygon::prototype_vertices(&prototype.shape).unwrap();
+            prototype.shape = PrototypeShape::SimplePolygon { vertices };
+        }
+        draft
+    }
+
+    /// Seams meeting and the plane being covered are different claims, and the
+    /// interface used to make them separately and in different colours.
+    #[test]
+    fn a_drawing_whose_seams_meet_but_whose_tiles_overlap_says_exactly_that() {
+        let assessment = assess_seams(&drawn(TilingPreset::Square)).unwrap();
+        assert!(assessment.is_closed());
+
+        let (state, line) = verdict(&assessment, false);
+        assert_eq!(state, theme::State::Invalid);
+        assert!(
+            line.contains("overlap"),
+            "the verdict has to name the real problem: {line}"
+        );
+        assert!(
+            !line.contains("every seam closes and"),
+            "it must not also read as finished: {line}"
+        );
+
+        let (state, line) = verdict(&assessment, true);
+        assert_eq!(state, theme::State::Live);
+        assert!(line.contains("every seam closes"), "{line}");
+    }
+
+    #[test]
+    fn an_empty_drawing_is_not_reported_as_a_failure() {
+        let mut draft = drawn(TilingPreset::Square);
+        draft.instances.clear();
+        draft.prototypes.clear();
+        let assessment = assess_seams(&draft).unwrap();
+        let (state, _) = verdict(&assessment, false);
+        assert_ne!(
+            state,
+            theme::State::Invalid,
+            "nothing drawn yet is not the same as something drawn wrong"
+        );
+    }
+
+    /// Colour is never the only state indicator, and the verdict is the line
+    /// most worth reading without it.
+    #[test]
+    fn every_verdict_carries_its_state_as_a_glyph_too() {
+        let assessment = assess_seams(&drawn(TilingPreset::Square)).unwrap();
+        for tiles in [true, false] {
+            let (state, line) = verdict(&assessment, tiles);
+            assert!(
+                line.starts_with(theme::state_glyph(state)),
+                "the verdict must be readable without colour: {line}"
+            );
         }
     }
 }

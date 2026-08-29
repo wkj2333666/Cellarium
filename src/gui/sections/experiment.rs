@@ -143,7 +143,10 @@ fn cards(app: &CellariumGui) -> Vec<Card> {
             section: Some(Section::Tiling),
             lines: vec![
                 format!("{} x {} cells", grid.width, grid.height),
-                format!("{bases} bases in the unit cell"),
+                format!(
+                    "{} in the unit cell",
+                    theme::plural(bases, "basis", "bases")
+                ),
                 format!("dt {}", spec.simulation_dt),
                 format!("seed {}", spec.seed),
             ],

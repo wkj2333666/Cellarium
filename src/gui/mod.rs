@@ -3,6 +3,7 @@ pub mod canvas;
 pub mod layout;
 pub mod run;
 pub mod sections;
+pub mod style;
 pub mod theme;
 pub mod widgets;
 

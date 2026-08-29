@@ -11,7 +11,7 @@ use crate::document::tiling::ConstructionTarget;
 use crate::gui::canvas::CanvasTransform;
 use crate::gui::theme;
 use crate::sim::tiling::{
-    BasisId, PeriodicTilingDraft, PrototypeId, PrototypeShape, SeamConstraint, Vec2,
+    BasisId, EdgeRef, PeriodicTilingDraft, PrototypeId, PrototypeShape, SeamConstraint, Vec2,
     neighbor_offsets, polygon,
     solver::{DragTarget, solve_edge_constraints},
 };
@@ -47,6 +47,9 @@ pub struct TilingCanvasState {
     pub seams: Vec<SeamConstraint>,
     /// Why the last vertex was refused, shown next to the pointer.
     pub rejection: Option<String>,
+    /// Held seams the last drag could not keep closed. A drag is never blocked
+    /// on their account; it leaves them here to be seen and repaired.
+    pub broken: Vec<SeamConstraint>,
     construction: Vec<Vec2>,
     /// Points removed by "Undo point", newest last.
     redo: Vec<Vec2>,
@@ -191,6 +194,7 @@ pub fn render_tiling_canvas(
         state.neighbor_copies = draw_neighbors(&painter, &transform, draft);
         draw_unit_cell(&painter, &transform, draft, state);
         draw_lattice_vectors(&painter, &transform, draft);
+        draw_seam_hints(&painter, &transform, draft);
     } else {
         state.neighbor_copies = 0;
         painter.text(
@@ -600,10 +604,13 @@ fn select_and_drag(
             let world = transform.screen_to_world(pointer);
             // A refused drag says why. Silently leaving the vertex where it was
             // is indistinguishable from a canvas that has stopped responding.
+            // Held seams no longer refuse anything; what they cannot follow
+            // they report, and the readout picks it up from `broken`.
             match move_vertex(draft, &state.seams, prototype, vertex, world) {
                 Ok(moved) => {
                     state.rejection = None;
-                    result.commit = Some(moved);
+                    state.broken = moved.broken;
+                    result.commit = Some(moved.draft);
                 }
                 Err(reason) => state.rejection = Some(reason),
             }
@@ -712,6 +719,106 @@ fn polygon_contains(point: Vec2, vertices: &[Vec2]) -> bool {
     inside
 }
 
+/// Draw what the seam assistant has to say, on the drawing itself.
+///
+/// An arrow runs from each edge that does not yet meet its partner towards
+/// where it has to go, and an edge with no partner at all is outlined in the
+/// invalid colour. Saying "0 pairs proposed" in a toolbar told the user
+/// nothing about *which* edges or *which way*; this is the same information
+/// placed where the problem is.
+fn draw_seam_hints(
+    painter: &egui::Painter,
+    transform: &CanvasTransform,
+    draft: &PeriodicTilingDraft,
+) {
+    let Ok(assessment) = crate::sim::tiling::assess_seams(draft) else {
+        return;
+    };
+    for candidate in &assessment.candidates {
+        if candidate.bucket == crate::sim::tiling::SeamBucket::Held {
+            continue;
+        }
+        let Some((start, end)) = edge_endpoints(draft, candidate.constraint.lhs) else {
+            continue;
+        };
+        let colour = match candidate.bucket {
+            crate::sim::tiling::SeamBucket::Ready => theme::state_color(theme::State::Draft),
+            _ => theme::state_color(theme::State::Stale).gamma_multiply(0.75),
+        };
+        // The edge itself is marked as well as the direction it must go. A
+        // gap of a hundredth of a unit draws an arrow a couple of pixels long,
+        // and a hint too small to see is not a hint; the stroke says *which*
+        // edge even when the arrow can only hint at how far.
+        painter.line_segment(
+            [world_point(transform, start), world_point(transform, end)],
+            egui::Stroke::new(2.0, colour),
+        );
+        let midpoint = (start + end) * 0.5;
+        arrow(
+            painter,
+            transform,
+            midpoint,
+            midpoint + candidate.hint(),
+            colour,
+        );
+    }
+    for orphan in &assessment.orphans {
+        let Some((start, end)) = edge_endpoints(draft, orphan.edge) else {
+            continue;
+        };
+        painter.line_segment(
+            [world_point(transform, start), world_point(transform, end)],
+            egui::Stroke::new(3.0, theme::state_color(theme::State::Invalid)),
+        );
+    }
+}
+
+fn world_point(transform: &CanvasTransform, point: Vec2) -> egui::Pos2 {
+    transform.world_to_screen([point.x, point.y])
+}
+
+fn edge_endpoints(draft: &PeriodicTilingDraft, edge: EdgeRef) -> Option<(Vec2, Vec2)> {
+    let instance = draft
+        .instances
+        .iter()
+        .find(|instance| instance.id == edge.tile)?;
+    crate::sim::tiling::snap::world_edge(draft, instance, usize::from(edge.edge))
+}
+
+/// A line with a head, so the hint reads as a direction rather than a smear.
+fn arrow(
+    painter: &egui::Painter,
+    transform: &CanvasTransform,
+    from: Vec2,
+    to: Vec2,
+    colour: egui::Color32,
+) {
+    let tail = world_point(transform, from);
+    let head = world_point(transform, to);
+    let along = head - tail;
+    let length = along.length();
+    // Below a few pixels an arrowhead is a blob on top of its own tail, which
+    // reads as a defect rather than as a hint.
+    if !length.is_finite() || length < 4.0 {
+        return;
+    }
+    let stroke = egui::Stroke::new(2.0, colour);
+    painter.line_segment([tail, head], stroke);
+    let unit = along / length;
+    let side = egui::vec2(-unit.y, unit.x);
+    let size = (length * 0.28).clamp(4.0, 11.0);
+    painter.line_segment([head, head - unit * size + side * size * 0.5], stroke);
+    painter.line_segment([head, head - unit * size - side * size * 0.5], stroke);
+}
+
+/// The outcome of dragging one vertex.
+#[derive(Clone, Debug, PartialEq)]
+pub struct VertexMove {
+    pub draft: PeriodicTilingDraft,
+    /// Held seams this move pulled apart. Empty when the solver kept up.
+    pub broken: Vec<SeamConstraint>,
+}
+
 /// Move one vertex, honouring accepted seam constraints.
 ///
 /// With seams accepted the solver moves the whole equivalence class, so an edge
@@ -723,13 +830,16 @@ pub fn move_vertex(
     prototype: PrototypeId,
     vertex: usize,
     to: [f64; 2],
-) -> Result<PeriodicTilingDraft, String> {
+) -> Result<VertexMove, String> {
     let target = Vec2::new(to[0], to[1]);
     if !target.x.is_finite() || !target.y.is_finite() {
         return Err("vertex coordinates must be finite".into());
     }
-    if !seams.is_empty() {
-        let solved = solve_edge_constraints(
+
+    // With seams held the solver moves the whole equivalence class, so an edge
+    // that was glued stays glued. This is the good case and it is tried first.
+    if !seams.is_empty()
+        && let Ok(solved) = solve_edge_constraints(
             draft,
             seams,
             Some(DragTarget {
@@ -738,21 +848,40 @@ pub fn move_vertex(
                 to: target,
             }),
         )
-        // The solver's diagnostic names half-edges and lattice offsets, which
-        // is developer detail no user can act on. What they can act on is the
-        // choice between a smaller move and releasing the seams.
-        .map_err(|_| {
-            "the held seams cannot follow this drag; try a smaller move or cancel the seams"
-                .to_string()
-        })?;
-        if solved.draft == *draft {
-            return Err(
-                "the held seams pin this vertex; cancel the seams to move it freely".into(),
-            );
-        }
-        return Ok(solved.draft);
+        && solved.draft != *draft
+    {
+        return Ok(VertexMove {
+            draft: solved.draft,
+            broken: Vec::new(),
+        });
     }
 
+    // And when it cannot keep up, the drag still happens. Refusing it — which
+    // is what this did, under "try a smaller move or cancel the seams" — makes
+    // the held seams a cage: the user cannot reach the shape they are aiming
+    // for except by throwing away every constraint first. The seams that came
+    // apart are reported instead, and can be closed again or released.
+    let free = free_move(draft, prototype, vertex, target)?;
+    let broken = seams
+        .iter()
+        .copied()
+        .filter(|seam| !crate::sim::tiling::assist::constraint_closes(&free, *seam))
+        .collect();
+    Ok(VertexMove {
+        draft: free,
+        broken,
+    })
+}
+
+/// Move the one vertex and nothing else, refusing only what stops being a
+/// polygon. This is a geometry rule rather than a seam rule: a self-crossing
+/// outline is not a shape the rest of the program can represent.
+fn free_move(
+    draft: &PeriodicTilingDraft,
+    prototype: PrototypeId,
+    vertex: usize,
+    target: Vec2,
+) -> Result<PeriodicTilingDraft, String> {
     let mut next = draft.clone();
     let entry = next
         .prototypes
@@ -940,6 +1069,60 @@ mod tests {
         }
     }
 
+    /// Held seams used to veto a drag they could not follow, which left the
+    /// user unable to reach a shape without discarding every constraint first.
+    /// The drag now happens and the seams that came apart are named.
+    #[test]
+    fn a_drag_the_held_seams_cannot_follow_still_moves_the_vertex() {
+        let draft = build_preset(TilingPreset::Square, 1.0);
+        let prototype = draft.prototypes[0].id;
+        let seams = crate::sim::tiling::propose_full_edge_seams(&draft, 1e-6)
+            .unwrap()
+            .into_iter()
+            .map(|proposal| proposal.constraint)
+            .collect::<Vec<_>>();
+        assert!(!seams.is_empty(), "the square must have seams to hold");
+
+        // A large, deliberately awkward move: far enough that the constrained
+        // solve cannot place every linked vertex consistently.
+        let moved = move_vertex(&draft, &seams, prototype, 2, [3.7, 2.9])
+            .expect("a held seam must not veto a drag");
+        let PrototypeShape::SimplePolygon { vertices } = &moved.draft.prototypes[0].shape else {
+            panic!("the preset square is a simple polygon");
+        };
+        assert_ne!(
+            vertices[2],
+            Vec2::new(1.0, 1.0),
+            "the vertex has to have actually moved"
+        );
+
+        // Whatever it could not keep, it has to name.
+        for seam in &moved.broken {
+            assert!(
+                !crate::sim::tiling::assist::constraint_closes(&moved.draft, *seam),
+                "a seam reported as broken must really be open"
+            );
+        }
+        for seam in &seams {
+            if !moved.broken.contains(seam) {
+                assert!(
+                    crate::sim::tiling::assist::constraint_closes(&moved.draft, *seam),
+                    "a seam not reported as broken must really still close"
+                );
+            }
+        }
+    }
+
+    /// Geometry rules still bite. A fold is not a shape, held seams or not.
+    #[test]
+    fn a_move_that_folds_the_polygon_is_still_refused() {
+        let draft = build_preset(TilingPreset::Square, 1.0);
+        let prototype = draft.prototypes[0].id;
+        let reason = move_vertex(&draft, &[], prototype, 2, [-1.0, -1.0])
+            .expect_err("a fold must still be refused");
+        assert!(!reason.is_empty());
+    }
+
     #[test]
     fn a_degenerate_lattice_draws_no_copies_rather_than_infinite_overlap() {
         let mut draft = build_preset(TilingPreset::Square, 1.0);
@@ -961,7 +1144,7 @@ mod tests {
         let draft = build_preset(TilingPreset::Square, 1.0);
         let prototype = draft.prototypes[0].id;
         let moved = move_vertex(&draft, &[], prototype, 2, [1.4, 1.2]).expect("a valid move");
-        let PrototypeShape::SimplePolygon { vertices } = &moved.prototypes[0].shape else {
+        let PrototypeShape::SimplePolygon { vertices } = &moved.draft.prototypes[0].shape else {
             panic!("the preset square is a simple polygon");
         };
         assert_eq!(vertices[2], Vec2::new(1.4, 1.2));

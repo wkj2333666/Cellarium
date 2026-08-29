@@ -20,7 +20,7 @@ use crate::sim::compute_plan::compile_compute_plan;
 use crate::sim::experiment_model::{ChannelId, ExperimentSpec, KernelId};
 use crate::sim::local_backend::{BackendProbe, initial_cells};
 use crate::sim::ruleset::BindingKey;
-use crate::sim::tiling::SeamProposal;
+use crate::sim::tiling::SeamAssessment;
 use crate::sim::worker::{
     BackendFallback, SimulationCommand, SimulationController, SimulationSnapshot,
 };
@@ -291,7 +291,6 @@ pub struct CellariumGui {
     settings: GuiSettings,
     /// Directory holding settings and the autosave.
     data_root: Option<std::path::PathBuf>,
-    seam_proposals: Option<Vec<SeamProposal>>,
     /// The open file dialog, if the user is choosing a file.
     file_dialog: Option<FileDialog>,
     /// What to do once the user has answered about unsaved work.
@@ -398,7 +397,6 @@ impl CellariumGui {
             experiment_path: None,
             settings: GuiSettings::default(),
             data_root: None,
-            seam_proposals: None,
             file_dialog: None,
             pending_intent: None,
             recovery: None,
@@ -1461,31 +1459,68 @@ impl CellariumGui {
         self.notice_at.map(|set_at| self.now - set_at)
     }
 
-    pub fn seam_proposals(&self) -> Option<&[SeamProposal]> {
-        self.seam_proposals.as_deref()
+    /// What the assistant currently says about the drawn tiling.
+    ///
+    /// Recomputed on demand rather than stored: the drawing changes under the
+    /// pointer, and a hint that lags the drawing by a frame points at where an
+    /// edge used to be.
+    pub fn seam_assessment(&self) -> Option<SeamAssessment> {
+        let draft = self.spec().tiling.as_ref()?;
+        crate::sim::tiling::assess_seams(draft).ok()
     }
 
-    pub fn set_seam_proposals(&mut self, proposals: Vec<SeamProposal>) {
-        let empty = (proposals.is_empty())
-            .then(|| "no full-edge pairs are close enough to glue".to_string());
-        self.set_notice(empty);
-        self.seam_proposals = Some(proposals);
-    }
-
-    pub fn clear_seam_proposals(&mut self) {
-        self.seam_proposals = None;
-        self.set_notice(None);
-    }
-
-    /// Hold the proposed seams. Subsequent vertex drags move whole equivalence
-    /// classes rather than tearing the tiling apart.
-    pub fn accept_seam_proposals(&mut self) {
-        if let Some(proposals) = self.seam_proposals.take() {
-            self.tiling_canvas.seams = proposals
-                .into_iter()
-                .map(|proposal| proposal.constraint)
-                .collect();
+    /// Move the drawing so the closeable seams actually meet, then hold them.
+    ///
+    /// The flow this replaces proposed pairs, recorded them as constraints,
+    /// and left the geometry exactly where it was — a control labelled "Solve
+    /// seams" that solved nothing the user could see. The solver had always
+    /// returned the corrected drawing; the interface discarded it.
+    pub fn close_seams(&mut self) {
+        let Some(draft) = self.spec().tiling.clone() else {
+            self.set_notice(Some("there is no tiling to close yet".into()));
+            return;
+        };
+        let Some(assessment) = self.seam_assessment() else {
+            self.set_notice(Some("the tiling could not be assessed".into()));
+            return;
+        };
+        let constraints = assessment
+            .acceptable()
+            .map(|candidate| candidate.constraint)
+            .collect::<Vec<_>>();
+        if constraints.is_empty() {
+            // Never a bare refusal: say what is in the way.
+            self.set_notice(Some(match assessment.orphans.first() {
+                Some(orphan) => orphan.describe(),
+                None => format!(
+                    "nothing is close enough to close yet — {}",
+                    assessment.summary()
+                ),
+            }));
+            return;
         }
+        match crate::sim::tiling::solve_edge_constraints(&draft, &constraints, None) {
+            Ok(solved) => {
+                let moved = solved.max_displacement;
+                let held = constraints.len();
+                self.tiling_canvas.seams = constraints;
+                self.dispatch_document(DocumentCommand::SetTilingDraft(Box::new(solved.draft)));
+                // `set_info`, not `set_notice`: the status bar paints a notice
+                // in the problem colour, and reporting a success in red is a
+                // small lie told every time the feature works.
+                self.set_info(format!(
+                    "closed {held} {}, moving the drawing by at most {moved:.4}",
+                    if held == 1 { "seam" } else { "seams" }
+                ));
+            }
+            Err(reason) => self.set_notice(Some(reason.0)),
+        }
+    }
+
+    /// Stop holding the seams, so vertices move one at a time again.
+    pub fn release_seams(&mut self) {
+        self.tiling_canvas.seams.clear();
+        self.tiling_canvas.broken.clear();
         self.set_notice(None);
     }
 

@@ -6,6 +6,7 @@ use crate::document::brush::{BrushKind, BrushTarget};
 use crate::document::recording::ReplayState;
 use crate::gui::app::CellariumGui;
 use crate::gui::canvas::world::{ChannelView, render_world_canvas};
+use crate::gui::style;
 use crate::gui::theme;
 use crate::render::channels::automatic_palette;
 use crate::sim::worker::SimulationCommand;
@@ -27,6 +28,19 @@ impl SimulationControl {
         SimulationControl::RunPause,
         SimulationControl::Step,
         SimulationControl::Reset,
+        SimulationControl::Randomize,
+        SimulationControl::Clear,
+        SimulationControl::Fit,
+    ];
+
+    /// What this toolbar draws.
+    ///
+    /// Run, Step and Reset are deliberately absent. They are in the window
+    /// toolbar directly above, and drawing them here as well produced two rows
+    /// of identically worded, identically styled buttons an arm's length apart
+    /// with nothing to say which was which. These three are the ones that act
+    /// on the world under the pointer rather than on the run.
+    pub const WORLD: [SimulationControl; 3] = [
         SimulationControl::Randomize,
         SimulationControl::Clear,
         SimulationControl::Fit,
@@ -65,9 +79,10 @@ pub fn draw(app: &mut CellariumGui, ui: &mut Ui) {
 fn toolbar(app: &mut CellariumGui, ui: &mut Ui) {
     let running = app.running();
     ui.horizontal_wrapped(|ui| {
-        for control in SimulationControl::ALL {
+        style::group_caption(ui, "WORLD");
+        for control in SimulationControl::WORLD {
             if ui
-                .button(control.label(running))
+                .add(style::secondary(control.label(running)))
                 .on_hover_text(control.tooltip())
                 .clicked()
             {
@@ -76,6 +91,7 @@ fn toolbar(app: &mut CellariumGui, ui: &mut Ui) {
         }
         ui.separator();
 
+        style::group_caption(ui, "VIEW");
         let channels = app.spec().channels.len();
         let mut view = app.world_canvas().view;
         egui::ComboBox::from_id_salt("channel_view")
@@ -136,7 +152,10 @@ fn brush_bar(app: &mut CellariumGui, ui: &mut Ui) {
         // egui's default slider is wide enough that three of them plus the tool
         // buttons run past the panel and clip the last label.
         ui.spacing_mut().slider_width = 84.0;
-        ui.label("Brush")
+        // The caption used to read "Brush", which is also the name of one of
+        // the tools it introduces, so the row said "Brush" twice at the same
+        // weight and neither occurrence explained the other.
+        style::group_caption(ui, "TOOL")
             .on_hover_text("The left button paints, the right button erases");
         let mut brush = app.world_canvas().brush;
         let mut changed = false;
@@ -185,13 +204,14 @@ fn brush_bar(app: &mut CellariumGui, ui: &mut Ui) {
             .changed();
 
         ui.separator();
+        // The label goes ahead of the slider. egui's `Slider::text` draws it
+        // afterwards, which left the row reading "100.0% strength   1.000
+        // value" — every caption attached to the wrong side, so each one
+        // looked like the tail of the field before it.
+        style::group_caption(ui, "strength");
         let mut percent = (brush.flow * 100.0).round();
         if ui
-            .add(
-                egui::Slider::new(&mut percent, 0.0..=100.0)
-                    .suffix("%")
-                    .text("strength"),
-            )
+            .add(egui::Slider::new(&mut percent, 0.0..=100.0).suffix("%"))
             .on_hover_text("How far one pass moves a cell towards the value below")
             .changed()
         {
@@ -201,10 +221,11 @@ fn brush_bar(app: &mut CellariumGui, ui: &mut Ui) {
 
         // An eraser always paints zero, so offering it a value would be
         // offering a control that does nothing.
+        style::group_caption(ui, "value");
         changed |= ui
             .add_enabled(
                 brush.kind != BrushKind::Eraser,
-                egui::Slider::new(&mut brush.value, 0.0..=1.0).text("value"),
+                egui::Slider::new(&mut brush.value, 0.0..=1.0),
             )
             .on_hover_text("The value a full-strength stroke paints")
             .on_disabled_hover_text("An eraser always paints zero")

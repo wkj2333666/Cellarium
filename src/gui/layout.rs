@@ -3,6 +3,7 @@ use eframe::egui::{self, RichText, Ui};
 use crate::gui::app::{
     CellariumGui, InspectorTab, NoticeLevel, PendingIntent, Section, ShellAction,
 };
+use crate::gui::style;
 use crate::gui::theme;
 use crate::sim::experiment_model::GeometrySpec;
 
@@ -14,45 +15,115 @@ pub fn draw(app: &mut CellariumGui, ui: &mut Ui) {
     workspace(app, ui);
 }
 
+/// The window toolbar.
+///
+/// Actions are grouped by what they do to your work — the file, the history,
+/// the run — and weighted by consequence. Before this they were eleven
+/// identical rectangles in which `Apply & Run`, the reason the application is
+/// open, looked exactly like `Save as`, and `Reset`, which throws the world
+/// away, looked exactly like `Step`.
+///
+/// This is also the only home for the transport. The Simulation workspace used
+/// to repeat Run, Step and Reset directly beneath these, at the same size and
+/// with the same words, so neither row could be described as the one that
+/// works.
 fn top_actions(app: &mut CellariumGui, ui: &mut Ui) {
     egui::Panel::top("top_actions").show(ui, |ui| {
+        ui.add_space(3.0);
         ui.horizontal_wrapped(|ui| {
-            for action in ShellAction::ALL {
-                let label = if action == ShellAction::ToggleRunning && app.running() {
-                    "Pause"
-                } else if action == ShellAction::ToggleRunning {
-                    "Run"
-                } else {
-                    action.label()
-                };
-                let hint = match action.shortcut_text(ui.ctx()) {
-                    Some(keys) => format!("{}  ({keys})", action.tooltip()),
-                    None => action.tooltip().to_string(),
-                };
-                let button = ui
-                    .add(egui::Button::new(label).min_size(egui::vec2(0.0, 24.0)))
-                    .on_hover_text(hint);
-                if button.clicked() {
-                    app.dispatch(action);
-                }
+            for action in [
+                ShellAction::New,
+                ShellAction::Open,
+                ShellAction::Save,
+                ShellAction::SaveAs,
+            ] {
+                shell_button(app, ui, action);
             }
+            ui.separator();
+            for action in [ShellAction::Undo, ShellAction::Redo] {
+                shell_button(app, ui, action);
+            }
+            ui.separator();
+            shell_button(app, ui, ShellAction::ApplyAndRun);
+            for action in [
+                ShellAction::ToggleRunning,
+                ShellAction::Step,
+                ShellAction::Reset,
+            ] {
+                shell_button(app, ui, action);
+            }
+            ui.separator();
+            shell_button(app, ui, ShellAction::Backend);
         });
+        ui.add_space(3.0);
     });
+}
+
+/// How much weight an action carries in the toolbar.
+fn action_weight(action: ShellAction) -> Weight {
+    match action {
+        // One filled button in the window. If a second ever appears here,
+        // neither of them is primary any more.
+        ShellAction::ApplyAndRun => Weight::Primary,
+        // Reset discards the running world. It has to be findable without
+        // looking like the button beside it.
+        ShellAction::Reset => Weight::Danger,
+        _ => Weight::Normal,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum Weight {
+    Primary,
+    Normal,
+    Danger,
+}
+
+fn shell_button(app: &mut CellariumGui, ui: &mut Ui, action: ShellAction) {
+    let label = if action == ShellAction::ToggleRunning && app.running() {
+        "Pause"
+    } else if action == ShellAction::ToggleRunning {
+        "Run"
+    } else {
+        action.label()
+    };
+    let hint = match action.shortcut_text(ui.ctx()) {
+        Some(keys) => format!("{}  ({keys})", action.tooltip()),
+        None => action.tooltip().to_string(),
+    };
+    let button = match action_weight(action) {
+        Weight::Primary => style::primary(label),
+        Weight::Danger => style::danger(label),
+        Weight::Normal => style::secondary(label),
+    };
+    if ui
+        .add(button.min_size(egui::vec2(0.0, 26.0)))
+        .on_hover_text(hint)
+        .clicked()
+    {
+        app.dispatch(action);
+    }
 }
 
 fn navigation(app: &mut CellariumGui, ui: &mut Ui) {
     egui::Panel::left("navigation")
         .resizable(true)
-        .default_size(148.0)
-        .size_range(96.0..=280.0)
+        .default_size(164.0)
+        .size_range(120.0..=280.0)
         .show(ui, |ui| {
-            ui.add_space(4.0);
-            ui.label(RichText::new("Workspace").strong());
-            ui.separator();
+            ui.add_space(6.0);
+            style::group_caption(ui, "WORKSPACE");
+            ui.add_space(2.0);
             let selected = app.navigation().selected();
             for section in Section::ALL {
+                // Full width, so the whole row is the target rather than the
+                // few pixels the word happens to cover.
+                let width = ui.available_width();
                 let response = ui
-                    .selectable_label(selected == section, section.label())
+                    .add_sized(
+                        egui::vec2(width, 28.0),
+                        egui::Button::selectable(selected == section, section.label()),
+                    )
                     .on_hover_text(section.hint());
                 if response.clicked() {
                     app.navigation_mut().select(section);
@@ -64,17 +135,17 @@ fn navigation(app: &mut CellariumGui, ui: &mut Ui) {
 fn inspector(app: &mut CellariumGui, ui: &mut Ui) {
     egui::Panel::right("inspector")
         .resizable(true)
-        .default_size(260.0)
-        .size_range(180.0..=520.0)
+        .default_size(276.0)
+        .size_range(200.0..=520.0)
         .show(ui, |ui| {
-            ui.add_space(4.0);
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
                 for (tab, label) in [
                     (InspectorTab::Properties, "Properties"),
                     (InspectorTab::Help, "Help"),
                 ] {
                     if ui
-                        .selectable_label(app.inspector_tab() == tab, label)
+                        .add(egui::Button::selectable(app.inspector_tab() == tab, label))
                         .clicked()
                     {
                         app.set_inspector_tab(tab);
@@ -111,15 +182,176 @@ fn backend(app: &mut CellariumGui, ui: &mut Ui) {
     }
 }
 
+/// One fact, as a name and a value on the same line.
+///
+/// The value is monospaced and pushed to the right so a column of them can be
+/// read down rather than word by word, and so a number that changes every
+/// frame stops shifting the text beside it.
+fn fact(ui: &mut Ui, name: &str, value: impl Into<String>) {
+    let value = value.into();
+    ui.horizontal(|ui| {
+        ui.label(RichText::new(name).color(style::TEXT_DIM));
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            // Truncated, with the whole of it on hover. A value wider than the
+            // panel — "CUDA (NVIDIA GeForce RTX 2080 Ti)" is the one that
+            // caught this — otherwise grows leftwards until it is drawn on top
+            // of its own label, and two strings in the same pixels are less
+            // readable than either alone.
+            ui.add(egui::Label::new(style::readout(value.clone())).truncate())
+                .on_hover_text(value);
+        });
+    });
+}
+
+/// What the inspector says about the workspace you are in.
+///
+/// This panel used to hold three lines above an empty column the height of the
+/// window. Each workspace now answers the questions it is actually asked while
+/// it is open.
 fn properties(app: &CellariumGui, ui: &mut Ui) {
     let section = app.navigation().selected();
-    ui.label(RichText::new(section.label()).strong());
-    ui.label(section.hint());
+    style::section_header(ui, section.label());
+    ui.add(egui::Label::new(RichText::new(section.hint()).color(style::TEXT_DIM)).wrap());
     ui.separator();
+
     let spec = app.spec();
     let GeometrySpec::RasterGrid(grid) = &spec.geometry;
-    ui.label(format!("World: {} x {}", grid.width, grid.height));
-    ui.label(format!("Channels: {}", spec.channels.len()));
+    let status = app.status();
+    style::group_caption(ui, "EXPERIMENT");
+    fact(ui, "World", format!("{} x {}", grid.width, grid.height));
+    fact(ui, "Channels", spec.channels.len().to_string());
+    fact(ui, "Tick", status.tick.to_string());
+    // Not "Backend": that is the name of the toolbar button that opens the
+    // backend picker, and two nodes with one label is how a user — or a
+    // screen reader — reaches the wrong one.
+    fact(ui, "Runs on", status.backend.clone());
+    fact(
+        ui,
+        "Draft",
+        if status.draft_clean { "clean" } else { "dirty" },
+    );
+    ui.separator();
+
+    match section {
+        Section::Tiling => tiling_properties(app, ui),
+        Section::Channels => channel_properties(app, ui),
+        other => section_facts(app, ui, other),
+    }
+}
+
+/// The seam assistant's standing verdict, visible without pressing anything.
+fn tiling_properties(app: &CellariumGui, ui: &mut Ui) {
+    style::group_caption(ui, "SEAMS");
+    let Some(draft) = app.spec().tiling.as_ref() else {
+        ui.add(
+            egui::Label::new(
+                RichText::new("No tiling yet. Pick a preset or draw a polygon.")
+                    .color(style::TEXT_DIM),
+            )
+            .wrap(),
+        );
+        return;
+    };
+    match crate::sim::tiling::assess_seams(draft) {
+        Ok(assessment) => {
+            fact(ui, "Edges", assessment.edge_count.to_string());
+            for bucket in [
+                crate::sim::tiling::SeamBucket::Held,
+                crate::sim::tiling::SeamBucket::Ready,
+                crate::sim::tiling::SeamBucket::Near,
+            ] {
+                fact(ui, bucket.label(), assessment.count(bucket).to_string());
+            }
+            fact(ui, "unpaired", assessment.orphans.len().to_string());
+            fact(ui, "accepted", app.tiling_canvas().seams.len().to_string());
+        }
+        Err(reason) => {
+            ui.add(
+                egui::Label::new(
+                    RichText::new(reason).color(theme::state_color(theme::State::Invalid)),
+                )
+                .wrap(),
+            );
+        }
+    }
+}
+
+/// Facts about the channels that the card strip does not already show.
+///
+/// Deliberately not a list of names. The strip beside this panel is the list,
+/// and repeating each name here put two nodes with the same label on screen —
+/// the same "which one did I just reach" problem this pass removed from the
+/// toolbars. A summary answers a different question instead: how many of these
+/// are actually contributing to what I am looking at.
+fn channel_properties(app: &CellariumGui, ui: &mut Ui) {
+    style::group_caption(ui, "CHANNELS");
+    let channels = &app.spec().channels;
+    let hidden = channels
+        .iter()
+        .filter(|channel| !channel.display.visible)
+        .count();
+    let frozen = channels.iter().filter(|channel| channel.frozen).count();
+    fact(ui, "Total", channels.len().to_string());
+    fact(ui, "Visible", (channels.len() - hidden).to_string());
+    fact(ui, "Frozen", frozen.to_string());
+
+    ui.add_space(4.0);
+    // The palette as swatches, in the order the strip lays the cards out, so
+    // the composite view can be read back to the channel that painted it.
+    let palette = crate::render::channels::automatic_palette(channels.len());
+    ui.horizontal_wrapped(|ui| {
+        for (index, channel) in channels.iter().enumerate() {
+            let colour = palette
+                .get(index)
+                .copied()
+                .unwrap_or(crate::render::channels::Rgb8::new(255, 255, 255));
+            let (rect, response) =
+                ui.allocate_exact_size(egui::vec2(16.0, 16.0), egui::Sense::hover());
+            let fill = egui::Color32::from_rgb(colour.red, colour.green, colour.blue);
+            ui.painter().rect_filled(
+                rect,
+                3.0,
+                if channel.display.visible {
+                    fill
+                } else {
+                    fill.gamma_multiply(0.25)
+                },
+            );
+            response.on_hover_text(if channel.display.visible {
+                channel.name.clone()
+            } else {
+                format!("{} (hidden)", channel.name)
+            });
+        }
+    });
+}
+
+fn section_facts(app: &CellariumGui, ui: &mut Ui, section: Section) {
+    match section {
+        Section::Kernels => {
+            style::group_caption(ui, "KERNELS");
+            fact(ui, "Defined", app.spec().kernels.len().to_string());
+        }
+        Section::Growth => {
+            style::group_caption(ui, "GROWTH");
+            fact(ui, "Programs", app.spec().growth.len().to_string());
+            fact(ui, "Rule sets", app.spec().rules.sets.len().to_string());
+            fact(ui, "Bindings", app.spec().rules.bindings.len().to_string());
+        }
+        Section::Simulation => {
+            style::group_caption(ui, "RUN");
+            let status = app.status();
+            fact(ui, "Running", if app.running() { "yes" } else { "no" });
+            fact(
+                ui,
+                "Sim",
+                format!("{} Hz", format_rate(status.simulation_hz)),
+            );
+            fact(ui, "Frame", format!("{} Hz", format_rate(status.frame_hz)));
+            fact(ui, "Recorded", app.recording().frames().to_string());
+        }
+        _ => {}
+    }
 }
 
 fn help(app: &CellariumGui, ui: &mut Ui) {

@@ -60,7 +60,9 @@ pub fn run(options: GuiLaunchOptions) -> Result<(), GuiStartupError> {
     eframe::run_native(
         "Cellarium",
         native_options,
-        Box::new(move |_creation| {
+        Box::new(move |creation| {
+            // The workbench's own visuals, before the first frame is laid out.
+            crate::gui::style::install(&creation.egui_ctx);
             let mut app = CellariumGui::new(spec);
             // Safe mode never asks the driver anything, so a machine whose GPU
             // probe hangs can still reach the window and change the setting.

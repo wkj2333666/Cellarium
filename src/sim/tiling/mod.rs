@@ -5,6 +5,7 @@
 //! do not depend on a geometry crate's wire format.
 
 pub mod arrangement;
+pub mod assist;
 pub mod compile;
 pub mod constraints;
 pub mod copies;
@@ -21,6 +22,9 @@ pub mod solver;
 pub use arrangement::{
     ArrangementFace, AtomicEdge, HalfEdgeId, NeighborPlacement, PeriodicArrangement, ShapeEdgeRef,
     VertexId,
+};
+pub use assist::{
+    OrphanEdge, OrphanReason, SeamAssessment, SeamBucket, SeamCandidate, SeamScore, assess_seams,
 };
 pub use compile::{CompiledTiling, compile_tiling};
 pub use constraints::{SeamConstraint, SeamProposal, propose_full_edge_seams};

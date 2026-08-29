@@ -158,35 +158,115 @@ fn every_preset_card_installs_its_own_unit_cell() {
 fn a_preset_reports_that_it_tiles_the_plane() {
     let mut gui = tiling_gui_blank();
     click(&mut gui, "Hexagon");
-    // The coverage verdict is stated, not left for the user to infer.
-    let glyph = cellarium::gui::theme::state_glyph(cellarium::gui::theme::State::Live);
-    gui.get_by_label(format!("{glyph} tiles the plane").as_str());
+    // The coverage verdict is stated, not left for the user to infer, and it
+    // is stated in the same breath as the seam verdict so the two cannot look
+    // like they disagree.
+    let assessment = gui
+        .state()
+        .seam_assessment()
+        .expect("a preset is assessable");
+    let (state, line) = cellarium::gui::sections::tiling::verdict(&assessment, true);
+    assert_eq!(state, cellarium::gui::theme::State::Live);
+    assert!(line.contains("the plane is covered"), "{line}");
+    gui.get_by_label(line.as_str());
 }
 
 #[test]
-fn seams_are_proposed_with_a_residual_and_only_hold_once_accepted() {
+fn closing_the_seams_holds_them_and_moves_the_drawing() {
     let mut gui = tiling_gui_blank();
     click(&mut gui, "Square");
-    click(&mut gui, "Solve seams");
-    let proposed = gui
-        .state()
-        .seam_proposals()
-        .expect("solving must propose the pairs it found")
-        .len();
-    assert!(proposed > 0, "a square tiling has full-edge pairs");
 
-    click(&mut gui, "Cancel seams");
-    assert!(gui.state().seam_proposals().is_none());
+    // An exact preset already closes, so there is nothing to move and the
+    // control says so rather than pretending to work.
+    let assessment = gui
+        .state()
+        .seam_assessment()
+        .expect("a preset tiling must be assessable");
     assert!(
-        gui.state().tiling_canvas().seams.is_empty(),
-        "cancelling must not hold anything"
+        assessment.is_closed(),
+        "the square preset is exact: {}",
+        assessment.summary()
     );
 
-    click(&mut gui, "Solve seams");
-    click(&mut gui, "Accept seams");
-    assert_eq!(gui.state().tiling_canvas().seams.len(), proposed);
-    assert!(gui.state().seam_proposals().is_none());
-    gui.get_by_label(format!("{proposed} seams held").as_str());
+    // Pull it out of true the way a pointer would, then let the assistant
+    // close it again.
+    drag_vertex(&mut gui, world(1.0, 1.0), Vec2::new(1.04, 0.97));
+    let crooked = gui.state().seam_assessment().expect("still assessable");
+    assert!(
+        !crooked.is_closed(),
+        "a moved vertex must stop the drawing reading as finished"
+    );
+    assert!(
+        crooked.candidates.len() >= 2,
+        "the assistant must keep speaking about a rough drawing, said: {}",
+        crooked.summary()
+    );
+
+    let before = square_vertices(&gui);
+    click(&mut gui, "Close seams");
+    let after = square_vertices(&gui);
+    assert_ne!(
+        before, after,
+        "closing the seams has to move the drawing, not merely record an opinion about it"
+    );
+    assert!(
+        !gui.state().tiling_canvas().seams.is_empty(),
+        "closing the seams also holds them"
+    );
+    let closed = gui.state().seam_assessment().expect("still assessable");
+    assert!(
+        closed.is_closed(),
+        "after closing, every seam must meet: {}",
+        closed.summary()
+    );
+}
+
+/// The defect this whole feature exists to fix. A drawing that is off by less
+/// than a pointer can aim used to leave the assistant with nothing to say: the
+/// square lost both its seam pairs at one thousandth of a unit, and the
+/// interface offered an Accept button over an empty proposal.
+#[test]
+fn a_rough_drawing_is_never_answered_with_silence() {
+    let mut gui = tiling_gui_blank();
+    click(&mut gui, "Square");
+    drag_vertex(&mut gui, world(1.0, 1.0), Vec2::new(1.002, 0.999));
+
+    let assessment = gui.state().seam_assessment().expect("assessable");
+    assert!(
+        !assessment.candidates.is_empty() || !assessment.orphans.is_empty(),
+        "the assistant said nothing at all about a rough drawing"
+    );
+    assert_eq!(
+        assessment.candidates.len() * 2 + assessment.orphans.len(),
+        assessment.edge_count,
+        "every edge must be either paired or explained"
+    );
+    // And the verdict reaches the screen rather than staying in the model.
+    let tiles = gui
+        .state()
+        .spec()
+        .tiling
+        .as_ref()
+        .is_some_and(|draft| cellarium::sim::tiling::validate_coverage(draft).is_ok());
+    let (_, line) = cellarium::gui::sections::tiling::verdict(&assessment, tiles);
+    gui.get_by_label(line.as_str());
+}
+
+/// Releasing gives the vertices back, one at a time.
+#[test]
+fn releasing_the_seams_stops_them_being_held() {
+    let mut gui = tiling_gui_blank();
+    click(&mut gui, "Square");
+    drag_vertex(&mut gui, world(1.0, 1.0), Vec2::new(1.04, 0.97));
+    click(&mut gui, "Close seams");
+    let held = gui.state().tiling_canvas().seams.len();
+    assert!(held > 0, "closing must hold the seams it closed");
+
+    click(&mut gui, format!("Release {held}").as_str());
+    assert!(
+        gui.state().tiling_canvas().seams.is_empty(),
+        "releasing must let go of every seam"
+    );
 }
 
 #[test]
@@ -209,8 +289,7 @@ fn a_vertex_drag_moves_the_polygon_and_a_held_seam_moves_its_whole_class() {
     // Held seams: the drag moves the equivalence class the seams define.
     let mut gui = tiling_gui_blank();
     click(&mut gui, "Square");
-    click(&mut gui, "Solve seams");
-    click(&mut gui, "Accept seams");
+    click(&mut gui, "Close seams");
     drag_vertex(&mut gui, before[2], Vec2::new(1.3, 1.2));
     let held = square_vertices(&gui);
     let held_moved = held
