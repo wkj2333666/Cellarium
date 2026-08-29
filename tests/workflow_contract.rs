@@ -11,6 +11,7 @@ const INSTALL: &str = include_str!("../scripts/install-gui-local.sh");
 const DESKTOP: &str = include_str!("../packaging/cellarium.desktop");
 const CARGO: &str = include_str!("../Cargo.toml");
 const README: &str = include_str!("../README.md");
+const RELEASES: &str = include_str!("../docs/releases.md");
 
 /// Every target the product is released for.
 const TARGETS: [&str; 6] = [
@@ -89,6 +90,34 @@ fn linux_jobs_install_the_libraries_a_window_needs() {
     }
     for runtime in ["mesa-vulkan-drivers", "libgl1-mesa-dev"] {
         assert!(CI.contains(runtime), "CI is missing {runtime}");
+    }
+    // Opened at run time rather than linked, so nothing about the build says it
+    // is needed. This list said "the libraries a window needs" while missing the
+    // one whose absence panics the window before it appears, and the smoke job
+    // found it the first time it ever ran.
+    assert!(
+        CI.contains("libxkbcommon-x11-dev"),
+        "the smoke job must install libxkbcommon-x11, which winit opens for the keyboard on X11"
+    );
+}
+
+#[test]
+fn the_documented_runtime_libraries_are_enough_to_open_a_window() {
+    // A user who installs exactly what the release notes list has to end up with
+    // a program that starts. libxkbcommon-x11 is a different package from
+    // libxkbcommon and was absent here, so following the documentation to the
+    // letter produced a panic rather than a window.
+    for package in [
+        "libx11-6",
+        "libxkbcommon0",
+        "libxkbcommon-x11-0",
+        "libgl1",
+        "mesa-vulkan-drivers",
+    ] {
+        assert!(
+            RELEASES.contains(package),
+            "the documented runtime libraries are missing {package}"
+        );
     }
 }
 

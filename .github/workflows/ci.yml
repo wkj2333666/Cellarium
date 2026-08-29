@@ -54,12 +54,16 @@ jobs:
         run: |
           rustup toolchain install stable --profile minimal
           rustup default stable
+      # libxkbcommon-x11 is a separate package from libxkbcommon, and it is the
+      # one winit opens to read the keyboard on X11. Building never needs it —
+      # it is dlopened at run time — so its absence shows up only here, as the
+      # window panicking before it appears.
       - name: Install GUI runtime and test tools
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libx11-dev libxcursor-dev libxrandr-dev libxi-dev \
-            libxkbcommon-dev libwayland-dev \
+            libxkbcommon-dev libxkbcommon-x11-dev libwayland-dev \
             libgl1-mesa-dev mesa-vulkan-drivers libgl1-mesa-dri \
             xvfb xdotool x11-apps imagemagick
       - name: Build the release executable

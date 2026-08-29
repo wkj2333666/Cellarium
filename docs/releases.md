@@ -49,7 +49,7 @@ Debian and Ubuntu:
 
 ```sh
 sudo apt-get install libx11-6 libxcursor1 libxrandr2 libxi6 \
-  libxkbcommon0 libwayland-client0 libgl1 mesa-vulkan-drivers
+  libxkbcommon0 libxkbcommon-x11-0 libwayland-client0 libgl1 mesa-vulkan-drivers
 ```
 
 ## macOS
