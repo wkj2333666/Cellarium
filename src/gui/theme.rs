@@ -39,6 +39,15 @@ pub const NEIGHBOR_FILL: Color32 = Color32::from_rgba_premultiplied(20, 32, 62, 
 pub const NEIGHBOR_STROKE: Color32 = Color32::from_rgba_premultiplied(70, 92, 140, 170);
 pub const LATTICE_VECTOR: Color32 = Color32::from_rgb(226, 178, 66);
 
+/// A seam pairing the assistant believes in but which is a long way from
+/// closing — a guess worth checking rather than a slip of the pointer.
+///
+/// Deliberately not [`DRAFT`]. `DRAFT` and [`STALE`] are the same amber, so
+/// painting "ready" with one and "far apart" with the other left two states
+/// that mean different things looking identical on the canvas, and the user
+/// with no way to see which pairings a control was about to act on.
+pub const SEAM_DISTANT: Color32 = Color32::from_rgb(198, 132, 226);
+
 pub const SELECTION: Color32 = Color32::WHITE;
 pub const DRAFT: Color32 = Color32::from_rgb(226, 178, 66);
 pub const LIVE: Color32 = Color32::from_rgb(74, 206, 108);
@@ -116,5 +125,29 @@ mod tests {
         }
         assert_ne!(state_color(State::Draft), state_color(State::Live));
         assert_ne!(state_color(State::Live), state_color(State::Invalid));
+    }
+
+    /// Two states that drive different behaviour have to look different. This
+    /// caught `DRAFT` and `STALE` being the same amber while the tiling canvas
+    /// used them for "ready to close" and "far apart".
+    #[test]
+    fn a_distant_seam_does_not_wear_the_same_colour_as_a_ready_one() {
+        let distance = |left: Color32, right: Color32| {
+            (i32::from(left.r()) - i32::from(right.r())).abs()
+                + (i32::from(left.g()) - i32::from(right.g())).abs()
+                + (i32::from(left.b()) - i32::from(right.b())).abs()
+        };
+        assert!(
+            distance(SEAM_DISTANT, DRAFT) > 120,
+            "a distant seam is only {} away from a ready one",
+            distance(SEAM_DISTANT, DRAFT)
+        );
+        for (name, other) in [("live", LIVE), ("invalid", INVALID)] {
+            assert!(
+                distance(SEAM_DISTANT, other) > 120,
+                "a distant seam is only {} away from {name}",
+                distance(SEAM_DISTANT, other)
+            );
+        }
     }
 }

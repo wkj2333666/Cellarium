@@ -344,3 +344,116 @@ fn drag_vertex(gui: &mut Gui, from: Vec2, to: Vec2) {
     });
     gui.run();
 }
+
+/// The defect a user hit on v0.4.0: two edges visibly far apart, an enabled
+/// "Close seams", and pressing it changed nothing.
+///
+/// The cause was that closing only ever solved the pairs the assistant was
+/// confident about. A drawing with one already-closed pair and two distant
+/// ones therefore "closed" the pair that needed no work, moved the drawing by
+/// zero, and left the two the user was pointing at exactly where they were —
+/// which from the outside is a button that does not work.
+#[test]
+fn closing_acts_on_the_far_apart_pairs_the_user_can_see() {
+    let mut gui = tiling_gui_blank();
+    click(&mut gui, "Triangles");
+
+    // Pull a corner well past the point where a pairing stops being a slip of
+    // the pointer and becomes a deliberate distance.
+    let before = gui
+        .state()
+        .seam_assessment()
+        .expect("a preset is assessable");
+    let start = triangle_vertex(&gui, 0);
+    drag_vertex(&mut gui, start, Vec2::new(start.x + 0.45, start.y + 0.3));
+
+    let crooked = gui.state().seam_assessment().expect("still assessable");
+    assert!(
+        crooked.count(cellarium::sim::tiling::SeamBucket::Near) > 0,
+        "this test is only meaningful while some pair is far apart: {}",
+        crooked.summary()
+    );
+    assert!(
+        !crooked.is_closed(),
+        "the drawing must not read as finished: {}",
+        crooked.summary()
+    );
+    let _ = before;
+
+    let geometry_before = triangle_vertices(&gui);
+    click(&mut gui, "Close seams");
+    let geometry_after = triangle_vertices(&gui);
+    assert_ne!(
+        geometry_before, geometry_after,
+        "closing has to move the drawing; acting only on the pairs that already \
+         closed is indistinguishable from a button that does nothing"
+    );
+
+    let closed = gui.state().seam_assessment().expect("still assessable");
+    assert_eq!(
+        closed.count(cellarium::sim::tiling::SeamBucket::Near),
+        0,
+        "no pair may be left far apart after closing: {}",
+        closed.summary()
+    );
+}
+
+fn triangle_vertices(gui: &Gui) -> Vec<Vec2> {
+    let tiling = gui
+        .state()
+        .spec()
+        .tiling
+        .as_ref()
+        .expect("a preset was installed");
+    let PrototypeShape::SimplePolygon { vertices } = &tiling.prototypes[0].shape else {
+        panic!("a preset polygon is editable");
+    };
+    vertices.clone()
+}
+
+fn triangle_vertex(gui: &Gui, index: usize) -> Vec2 {
+    triangle_vertices(gui)[index]
+}
+
+/// Closing either moves the drawing or explains itself in terms of something
+/// on screen. Which of the two happens depends on how reachable the geometry
+/// is, and both are acceptable; silently doing neither is not.
+///
+/// The wording of a refusal is pinned directly in `gui::app`, where the state
+/// can be built rather than danced into through the pointer.
+#[test]
+fn closing_either_moves_the_drawing_or_explains_itself() {
+    let mut gui = tiling_gui_blank();
+    click(&mut gui, "Triangles");
+
+    // Fold a shared vertex deep into the cell: closing every pair from here
+    // would flatten a triangle, so the solve genuinely cannot succeed.
+    let start = triangle_vertex(&gui, 1);
+    drag_vertex(&mut gui, start, Vec2::new(start.x - 0.45, start.y - 0.55));
+
+    let before = triangle_vertices(&gui);
+    click(&mut gui, "Close seams");
+
+    let status = gui.state().status();
+    // A success also leaves a notice, so the level is what separates them.
+    if status.notice_level == cellarium::gui::app::NoticeLevel::Info {
+        assert_ne!(
+            before,
+            triangle_vertices(&gui),
+            "a reported success has to have moved the drawing"
+        );
+        return;
+    }
+    let notice = status
+        .notice
+        .clone()
+        .expect("a refusal has to say something");
+    assert!(
+        notice.contains("edge") && notice.contains("basis"),
+        "a refusal has to name an edge the user can see: {notice}"
+    );
+    assert!(
+        notice.contains("drag"),
+        "a refusal has to say what to do next: {notice}"
+    );
+}

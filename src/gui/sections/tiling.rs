@@ -166,20 +166,26 @@ fn assistant_bar(app: &mut CellariumGui, ui: &mut Ui) {
             .on_hover_text(hover_detail(&assessment, coverage.as_ref()));
 
         ui.separator();
-        // Enabled whenever there is anything to act on, including a drawing
-        // that is already exact: closing an exact seam moves nothing and holds
-        // it, which is the only way to ask for linked dragging. Gating this on
-        // "something is out of true" left a correct tiling with no way to be
-        // held together at all.
-        let closeable = assessment.acceptable().next().is_some();
+        // Enabled whenever there is any pairing at all — including a drawing
+        // that is already exact, where closing moves nothing and holds the
+        // seams, which is the only way to ask for linked dragging.
+        //
+        // It counts *every* candidate, not only the confident ones. Counting
+        // the confident ones alone was how a drawing with one already-closed
+        // pair and two distant ones offered a live button that closed the pair
+        // needing no work and left the two the user was pointing at exactly
+        // where they were.
+        let pairs = assessment.candidates.len();
+        let closeable = pairs > 0;
         if ui
             .add_enabled(closeable, style::primary("Close seams"))
-            .on_hover_text(
-                "Move the drawing the smallest amount that makes these edges meet, and hold \
-                 them together from now on",
-            )
+            .on_hover_text(format!(
+                "Move the drawing the smallest amount that makes {} meet, and hold them \
+                 together from now on",
+                theme::plural(pairs, "this edge pair", "these edge pairs")
+            ))
             .on_disabled_hover_text(
-                "nothing is near enough yet — drag an edge closer to the one it should meet",
+                "no two edges have been paired yet — the readout below says what is in the way",
             )
             .clicked()
         {

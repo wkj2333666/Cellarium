@@ -1484,37 +1484,77 @@ impl CellariumGui {
             self.set_notice(Some("the tiling could not be assessed".into()));
             return;
         };
-        let constraints = assessment
-            .acceptable()
+
+        let every = assessment
+            .candidates
+            .iter()
             .map(|candidate| candidate.constraint)
             .collect::<Vec<_>>();
-        if constraints.is_empty() {
+        if every.is_empty() {
             // Never a bare refusal: say what is in the way.
             self.set_notice(Some(match assessment.orphans.first() {
                 Some(orphan) => orphan.describe(),
-                None => format!(
-                    "nothing is close enough to close yet — {}",
-                    assessment.summary()
-                ),
+                None => "there are no edge pairs to close yet".to_string(),
             }));
             return;
         }
-        match crate::sim::tiling::solve_edge_constraints(&draft, &constraints, None) {
-            Ok(solved) => {
-                let moved = solved.max_displacement;
-                let held = constraints.len();
-                self.tiling_canvas.seams = constraints;
-                self.dispatch_document(DocumentCommand::SetTilingDraft(Box::new(solved.draft)));
-                // `set_info`, not `set_notice`: the status bar paints a notice
-                // in the problem colour, and reporting a success in red is a
-                // small lie told every time the feature works.
-                self.set_info(format!(
-                    "closed {held} {}, moving the drawing by at most {moved:.4}",
-                    if held == 1 { "seam" } else { "seams" }
-                ));
+
+        // Every pair the assistant can see, including the ones it only half
+        // believes in. Acting on the confident ones alone meant that a drawing
+        // whose visible problem was a distant pair got a control that closed
+        // the seam already closed, moved nothing, and left untouched the two
+        // edges the user was looking at — which is indistinguishable from a
+        // button that does not work.
+        match crate::sim::tiling::solve_edge_constraints(&draft, &every, None) {
+            Ok(solved) => self.commit_closed_seams(every, solved, 0),
+            Err(reason) => {
+                // A distant pairing can be a wrong guess, and forcing it can
+                // leave no consistent geometry at all. Fall back to the pairs
+                // that are certainly right rather than doing nothing, and say
+                // how many were left behind.
+                let confident = assessment
+                    .acceptable()
+                    .map(|candidate| candidate.constraint)
+                    .collect::<Vec<_>>();
+                if confident.is_empty() || confident.len() == every.len() {
+                    self.set_notice(Some(explain_close_failure(&assessment, reason)));
+                    return;
+                }
+                let left = every.len() - confident.len();
+                match crate::sim::tiling::solve_edge_constraints(&draft, &confident, None) {
+                    Ok(solved) => self.commit_closed_seams(confident, solved, left),
+                    Err(_) => self.set_notice(Some(explain_close_failure(&assessment, reason))),
+                }
             }
-            Err(reason) => self.set_notice(Some(reason.0)),
         }
+    }
+
+    /// Put a solved drawing in the document and hold what closed it.
+    fn commit_closed_seams(
+        &mut self,
+        constraints: Vec<crate::sim::tiling::SeamConstraint>,
+        solved: crate::sim::tiling::SolvedTiling,
+        left: usize,
+    ) {
+        let moved = solved.max_displacement;
+        let held = constraints.len();
+        self.tiling_canvas.seams = constraints;
+        self.dispatch_document(DocumentCommand::SetTilingDraft(Box::new(solved.draft)));
+        let remainder = if left == 0 {
+            String::new()
+        } else {
+            format!(
+                "; {left} further {} too far apart to reach in one move",
+                if left == 1 { "pair is" } else { "pairs are" }
+            )
+        };
+        // `set_info`, not `set_notice`: the status bar paints a notice in the
+        // problem colour, and reporting a success in red is a small lie told
+        // every time the feature works.
+        self.set_info(format!(
+            "closed {held} {}, moving the drawing by at most {moved:.4}{remainder}",
+            if held == 1 { "seam" } else { "seams" }
+        ));
     }
 
     /// Stop holding the seams, so vertices move one at a time again.
@@ -1738,8 +1778,98 @@ impl eframe::App for CellariumGui {
     }
 }
 
+/// Turn a solver refusal into something the user can act on.
+///
+/// The solver speaks in prototype ids and residuals — "solved polygon 1 is
+/// invalid: polygon contains a zero-length edge" — which names neither an edge
+/// the user can see nor anything they can do. A drawing can be far enough from
+/// a tiling that no single solve reaches one, and saying so is fine; saying so
+/// without naming the edge in the way is the failure this repairs.
+fn explain_close_failure(
+    assessment: &crate::sim::tiling::SeamAssessment,
+    reason: crate::sim::tiling::SolveDiagnostic,
+) -> String {
+    let furthest = assessment
+        .candidates
+        .iter()
+        .filter(|candidate| candidate.bucket != crate::sim::tiling::SeamBucket::Held)
+        .max_by(|left, right| left.score.endpoint_gap.total_cmp(&right.score.endpoint_gap));
+    match furthest {
+        Some(candidate) => format!(
+            "these edges cannot all be made to meet at once — drag edge {} of basis {} closer \
+             first, its ends are up to {:.3} from their partners ({})",
+            candidate.constraint.lhs.edge,
+            candidate.constraint.lhs.tile.0,
+            candidate.score.endpoint_gap,
+            reason.0,
+        ),
+        None => reason.0,
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// A refusal has to name something on screen. The solver's own wording —
+    /// "solved polygon 1 is invalid: polygon contains a zero-length edge" —
+    /// names a prototype id the interface never shows and gives no next step.
+    #[test]
+    fn a_close_refusal_names_an_edge_and_a_next_step() {
+        use crate::sim::tiling::{
+            PrototypeShape, SolveDiagnostic, TilingPreset, Vec2, assess_seams, build_preset,
+            polygon,
+        };
+
+        let mut draft = build_preset(TilingPreset::Square, 1.0);
+        for prototype in &mut draft.prototypes {
+            let vertices = polygon::prototype_vertices(&prototype.shape).unwrap();
+            prototype.shape = PrototypeShape::SimplePolygon { vertices };
+        }
+        if let PrototypeShape::SimplePolygon { vertices } = &mut draft.prototypes[0].shape {
+            vertices[0] = vertices[0] + Vec2::new(0.4, 0.3);
+        }
+        let assessment = assess_seams(&draft).unwrap();
+        assert!(
+            assessment
+                .candidates
+                .iter()
+                .any(|candidate| candidate.bucket != crate::sim::tiling::SeamBucket::Held),
+            "this test needs at least one pair that has not closed"
+        );
+
+        let raw = "solved polygon 1 is invalid: polygon contains a zero-length edge";
+        let explained = explain_close_failure(&assessment, SolveDiagnostic(raw.to_string()));
+
+        assert!(explained.contains("edge"), "{explained}");
+        assert!(explained.contains("basis"), "{explained}");
+        assert!(
+            explained.contains("drag"),
+            "a refusal must say what to do next: {explained}"
+        );
+        assert!(
+            explained.contains(raw),
+            "the underlying reason is kept for anyone who wants it: {explained}"
+        );
+        assert!(
+            !explained.starts_with(raw),
+            "the solver's wording must not be the first thing the user reads: {explained}"
+        );
+    }
+
+    /// With nothing left to name, there is nothing to add, and inventing an
+    /// instruction would be worse than passing the reason through.
+    #[test]
+    fn a_refusal_with_no_open_pair_passes_the_reason_through_unchanged() {
+        use crate::sim::tiling::{SolveDiagnostic, TilingPreset, assess_seams, build_preset};
+
+        let assessment = assess_seams(&build_preset(TilingPreset::Square, 1.0)).unwrap();
+        assert!(assessment.is_closed());
+        let raw = "edge constraints are rank deficient";
+        assert_eq!(
+            explain_close_failure(&assessment, SolveDiagnostic(raw.to_string())),
+            raw
+        );
+    }
+
     use super::*;
 
     #[test]

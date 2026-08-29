@@ -743,7 +743,7 @@ fn draw_seam_hints(
         };
         let colour = match candidate.bucket {
             crate::sim::tiling::SeamBucket::Ready => theme::state_color(theme::State::Draft),
-            _ => theme::state_color(theme::State::Stale).gamma_multiply(0.75),
+            _ => theme::SEAM_DISTANT,
         };
         // The edge itself is marked as well as the direction it must go. A
         // gap of a hundredth of a unit draws an arrow a couple of pixels long,

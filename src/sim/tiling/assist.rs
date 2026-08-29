@@ -62,7 +62,7 @@ impl SeamBucket {
         match self {
             SeamBucket::Held => "already closed",
             SeamBucket::Ready => "ready to close",
-            SeamBucket::Near => "still too far apart",
+            SeamBucket::Near => "far apart",
         }
     }
 }
