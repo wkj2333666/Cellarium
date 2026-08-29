@@ -237,3 +237,31 @@ fn the_terminal_and_remote_dependencies_are_gone() {
         "the GUI framework must be a dependency"
     );
 }
+
+/// The release notes name every asset by version, and a reader follows those
+/// names literally — into `tar -xzf` and into the installer's argument list. A
+/// documented version that is not the one being released sends them to a file
+/// that does not exist. The runtime-library list in this same document had
+/// already drifted out of truth once; this is the same failure waiting in the
+/// same file.
+#[test]
+fn the_release_notes_name_the_version_actually_being_released() {
+    let version = CARGO
+        .lines()
+        .find_map(|line| line.strip_prefix("version = "))
+        .expect("Cargo.toml declares a version")
+        .trim_matches('"');
+    let expected = format!("cellarium-v{version}-linux-x86_64.tar.gz");
+    assert!(
+        RELEASES.contains(&expected),
+        "docs/releases.md does not mention {expected}; it still documents an older release"
+    );
+    let stale = RELEASES
+        .lines()
+        .find(|line| line.contains("cellarium-v") && !line.contains(&format!("v{version}")));
+    assert!(
+        stale.is_none(),
+        "docs/releases.md still names an asset from another release: {}",
+        stale.unwrap_or_default()
+    );
+}
