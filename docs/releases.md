@@ -4,15 +4,15 @@ Each Cellarium release provides one executable per operating system and CPU
 architecture. There is one program and one mode: it opens a window and runs the
 simulation in the same process.
 
-The `v0.4.0` assets are:
+The `v0.4.1` assets are:
 
 ```text
-cellarium-v0.4.0-linux-x86_64.tar.gz
-cellarium-v0.4.0-linux-aarch64.tar.gz
-cellarium-v0.4.0-macos-x86_64.tar.gz
-cellarium-v0.4.0-macos-aarch64.tar.gz
-cellarium-v0.4.0-windows-x86_64.zip
-cellarium-v0.4.0-windows-aarch64.zip
+cellarium-v0.4.1-linux-x86_64.tar.gz
+cellarium-v0.4.1-linux-aarch64.tar.gz
+cellarium-v0.4.1-macos-x86_64.tar.gz
+cellarium-v0.4.1-macos-aarch64.tar.gz
+cellarium-v0.4.1-windows-x86_64.zip
+cellarium-v0.4.1-windows-aarch64.zip
 SHA256SUMS
 ```
 
@@ -20,7 +20,7 @@ Verify a downloaded archive against `SHA256SUMS` before installing it. The
 supplied installer does this for you:
 
 ```sh
-./scripts/install-gui-local.sh cellarium-v0.4.0-linux-x86_64.tar.gz SHA256SUMS
+./scripts/install-gui-local.sh cellarium-v0.4.1-linux-x86_64.tar.gz SHA256SUMS
 ```
 
 ## What each release contains
@@ -36,7 +36,7 @@ start with `--safe-mode` and change the setting from inside the window.
 ## Linux
 
 ```sh
-tar -xzf cellarium-v0.4.0-linux-x86_64.tar.gz
+tar -xzf cellarium-v0.4.1-linux-x86_64.tar.gz
 install -Dm755 cellarium "$HOME/.local/bin/cellarium"
 install -Dm644 cellarium.desktop "$HOME/.local/share/applications/cellarium.desktop"
 ```
@@ -58,7 +58,7 @@ Choose the x86_64 archive for Intel Macs or the aarch64 archive for Apple
 Silicon.
 
 ```sh
-tar -xzf cellarium-v0.4.0-macos-aarch64.tar.gz
+tar -xzf cellarium-v0.4.1-macos-aarch64.tar.gz
 chmod +x cellarium
 mkdir -p "$HOME/.local/bin"
 mv cellarium "$HOME/.local/bin/cellarium"

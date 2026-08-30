@@ -1,6 +1,7 @@
 //! Saving, opening and recovering local experiments through the GUI.
 
 use cellarium::gui::CellariumGui;
+use cellarium::sim::backend_selector::BackendPolicy;
 use cellarium::sim::experiment_model::ExperimentSpec;
 use std::path::PathBuf;
 
@@ -11,11 +12,23 @@ fn temp_root(name: &str) -> PathBuf {
     root
 }
 
+/// A workbench pinned to the CPU backend.
+///
+/// These tests are about files, not devices. `for_test` leaves the policy on
+/// `Auto`, and `open_experiment` restarts the simulation, so opening a file
+/// here built a real GPU device — several of them at once, because libtest
+/// runs these tests in parallel. Concurrent device creation deadlocks: the
+/// process parks every thread in `futex_wait_queue` alongside the driver's own
+/// `[vkrt]`/`[vkcf]`/`[vkps]` threads and never returns. It is a race, so it
+/// passes most of the time and then hangs a release gate for eighteen hours.
+///
+/// Pinning the CPU removes the device rather than serialising around it, which
+/// is also the honest configuration for a test that only saves and loads.
 fn app(root: &PathBuf) -> CellariumGui {
     let spec = ExperimentSpec::single_channel_lenia(16, 16)
         .normalize_rules()
         .expect("the fixture normalizes");
-    let mut app = CellariumGui::for_test(spec);
+    let mut app = CellariumGui::with_backend(spec, BackendPolicy::RequireCpu);
     app.use_data_root(root);
     app
 }
